@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import time
 import optimized_functions as f
-from mcts import MCTS
+from mcts import MCTS # ithinkbettermcts.py can be used here
 from resnet import ResNet
 import chess
 

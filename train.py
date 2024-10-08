@@ -137,8 +137,6 @@ class Train:
 
             epoch_log = f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Learning rate: {lr}, MSE Loss: {epoch_mse:.4f}, CE Loss: {epoch_ce:.4f}, Accuracy: {epoch_accuracy:.2f}%"
             print(epoch_log)
-            with open('log.txt', 'a') as f:
-                f.write(epoch_log + '\n')
             if train_loss_history[-1] == min(train_loss_history):
                 for file in os.listdir(checkpoint_dir):
                     if file.startswith('model_epoch_'):
