@@ -11,7 +11,7 @@ This project is an implementation based on the AlphaZero paper, featuring a bot 
 - **`mcts.py`**: Implements the Monte Carlo Tree Search (MCTS) algorithm.
 - **`resnet.py`**: Contains the ResNet architecture used for the model.
 
-## Model Weights and Evaluation Results
+## Model Weights and Training Data
 Due to the large size of the model, Lichess games, and evaluation result files (over 25MB), they are not included in this repository. You can download them from the following link:
 [Download Model Weights and Results](https://drive.google.com/drive/folders/12PGjUCOllXaKWY-uzP7fr_iY1kj9HhTz?usp=sharing)
 
