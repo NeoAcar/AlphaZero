@@ -1,0 +1,12 @@
+{
+    "batch_size": 256,
+    "learning_rate": 0.00001,
+    "l2_weight": 0,
+    "epochs": 10,
+    "max_steps":0,
+    "log_step": 1,
+    "log_dir": "logs",
+    "games_path":"lichess_elite_2024-06.pgn",
+    "evals_path":"stockfish_scores copy.npy",
+    "max_games": 1000
+}
