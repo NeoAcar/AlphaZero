@@ -13,7 +13,7 @@ This project is an implementation based on the AlphaZero paper, featuring a bot 
 
 ## Model Weights and Evaluation Results
 Due to the large size of the model, Lichess games, and evaluation result files (over 25MB), they are not included in this repository. You can download them from the following link:
-[Download Model Weights and Results](your-drive-link-here)
+[Download Model Weights and Results](https://drive.google.com/drive/folders/12PGjUCOllXaKWY-uzP7fr_iY1kj9HhTz?usp=sharing)
 
 Make sure to download these files before running the project.
 
