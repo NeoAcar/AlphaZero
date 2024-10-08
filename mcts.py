@@ -1,5 +1,5 @@
 import math
-import functions as gf
+import optimized_functions as gf
 import numpy as np
 import torch
 import chess
