@@ -27,4 +27,10 @@ The `chess` library currently has a known bug. To fix it, follow these steps:
 This will fix the issue and allow the code to run smoothly.
 
 ## Requirements
+### CUDA Sürümü İçin Talimatlar
+Eğer CUDA ile uyumlu bir PyTorch sürümü kullanmak istiyorsanız, lütfen sisteminizdeki CUDA sürümünü kontrol edin ve aşağıdaki komutlardan birini kullanarak PyTorch'u yükleyin:
+
+- **CUDA 12.1** için: `pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu121`
+- **CUDA 11.8** için: `pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu118`
+
 All dependencies can be found in the `requirements.txt` file.
