@@ -18,7 +18,7 @@ Due to the large size of the model, Lichess games, and evaluation result files (
 Make sure to download these files before running the project.
 
 ## Chess Library Bug Fix
-The `chess` library currently has a known bug. To fix it, follow these steps:
+The `chess` library currently has a bug. To fix it, follow these steps:
 
 1. Navigate to `your_env/Lib/chess/__init__.py`.
 2. At line 3067, delete the entire `if-else` block.
