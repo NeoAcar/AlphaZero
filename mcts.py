@@ -76,7 +76,7 @@ class Node:
         max_depth.add(self.depth+1)
         for i, state in enumerate(new_states):
             if state.is_checkmate():
-                values[i] = -1000
+                values[i] = -1
             child = Node(self.args, new_states[i], self.move_counter+1, self.depth+1, self, actions[i], probs[i], policies[i])
             self.children.append(child)
             child.backpropagation(-values[i])
@@ -123,7 +123,7 @@ class MCTS:
             current_node = current_node.best_child()
 
         if current_node.is_terminal():
-            value = -gf.game_result(current_node.state, current_node.move_counter, 1000)[0]*1000
+            value = -gf.game_result(current_node.state, current_node.move_counter, 1000)[0]*1
             current_node.backpropagation(value)
         else:
             current_node.expand(self.model)
