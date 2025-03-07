@@ -71,8 +71,8 @@ class Node:
                 probs.append(prob)
                 
                 
-        _,policies = self.value_policy_batch(new_states, self.move_counter+1, model)
-        values = [gf.board_value(new_states[i]) for i in range(len(new_states))]
+        values,policies = self.value_policy_batch(new_states, self.move_counter+1, model)
+        #values = [gf.board_value(new_states[i]) for i in range(len(new_states))]
         max_depth.add(self.depth+1)
         for i, state in enumerate(new_states):
             if state.is_checkmate():
@@ -102,17 +102,20 @@ class MCTS:
 
 
     @torch.no_grad()
-    def value_policy(self, state: 'chess.Board', move_counter: 'int') -> tuple[float, np.ndarray]:
+    def value_policy(self, state: 'chess.Board', move_counter: 'int', validate: 'bool|None'=True) -> tuple[float, np.ndarray]:
        
         self.model.eval()
-        _, policy = self.model(gf.prepare_input(state, move_counter).unsqueeze(0).to(self.args['device']))
-        value =gf.board_value(state)
+        value, policy = self.model(gf.prepare_input(state, move_counter).unsqueeze(0).to(self.args['device']))
+        #value =gf.board_value(state)
         
         #value = value.cpu().item()
         policy = torch.softmax(policy.squeeze(0), dim=0).cpu().numpy()
-       
-        valid_policy = gf.valid_policy(policy, state)
-        return value, valid_policy
+
+        if validate:
+            return gf.valid_policy(policy, state)
+        else:
+            return policy
+
 
 
 
@@ -123,7 +126,7 @@ class MCTS:
             current_node = current_node.best_child()
 
         if current_node.is_terminal():
-            value = -gf.game_result(current_node.state, current_node.move_counter, 1000)[0]*1
+            value = -gf.game_result(current_node.state, current_node.move_counter, 1000)[0]
             current_node.backpropagation(value)
         else:
             current_node.expand(self.model)
