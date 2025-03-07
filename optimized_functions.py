@@ -7,7 +7,7 @@ import chess.engine
 import math
 
 def board_to_matrix(board: chess.Board, move_counter:int) -> np.ndarray:
-    matrix = np.zeros((19, 8, 8), dtype=np.int32)
+    matrix = np.zeros((19, 8, 8), dtype=np.float32)
     for color in [True, False]:
         piece_offset = 0 if color else 6
         for piece_type in range(1, 7):  # pawn=1, knight=2, ..., king=6
