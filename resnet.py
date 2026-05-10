@@ -28,7 +28,9 @@ class ResNet(nn.Module):
             nn.BatchNorm2d(1),
             nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(64, 1),
+            nn.Linear(64, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
             nn.Tanh()
         )
         
