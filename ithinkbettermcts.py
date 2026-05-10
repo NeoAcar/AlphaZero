@@ -31,6 +31,10 @@ class Node:
         self.depth = depth
         self.move_counter = move_counter
 
+        # `raw_policy` = NN output masked to legal moves; immutable after expand.
+        # `policy` = `raw_policy` plus any Dirichlet noise (added only when this
+        # node is the root). Selection always reads from `policy`.
+        self.raw_policy: np.ndarray | None = None
         self.policy: np.ndarray | None = None
         self.children: dict[int, "Node"] = {}
         self.Q = 0.0
@@ -86,7 +90,8 @@ class Node:
         value_t, policy_t = model(inputs)
         value = float(value_t.cpu().item())
         policy = torch.softmax(policy_t.squeeze(0), dim=0).cpu().numpy()
-        self.policy = gf.valid_policy(policy, self.state)
+        self.raw_policy = gf.valid_policy(policy, self.state)
+        self.policy = self.raw_policy.copy()
         return value
 
 
@@ -148,11 +153,17 @@ class MCTS:
         else:
             min_depth = self.root.depth
 
+        # Dirichlet noise: mix into the *raw* (un-noised) NN policy each call,
+        # so that tree reuse doesn't cause noise to compound across moves.
         eps = self.args["dirichlet_epsilon"]
         if eps > 0:
             noise = np.random.dirichlet([self.args["dirichlet_alpha"]] * self.args["action_space"])
-            mixed = (1 - eps) * self.root.policy + eps * noise
+            mixed = (1 - eps) * self.root.raw_policy + eps * noise
             self.root.policy = gf.valid_policy(mixed, root_state)
+        else:
+            # Reset policy to raw in case this node previously served as root
+            # with noise applied.
+            self.root.policy = self.root.raw_policy.copy()
 
         max_depth.clear()
         for _ in range(self.args["num_simulation"]):
