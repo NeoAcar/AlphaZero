@@ -82,7 +82,7 @@ class Train:
         self.log_dir = args["log_dir"]
 
         self.model = ResNet().to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.l2_weight)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.l2_weight)
 
         if args.get("resume"):
             print(f"Resuming from {args['resume']}")
