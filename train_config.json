@@ -3,10 +3,11 @@
     "learning_rate": 0.00001,
     "l2_weight": 0,
     "epochs": 10,
-    "max_steps":0,
-    "log_step": 1,
-    "log_dir": "logs",
-    "games_path":"lichess_elite_2024-06.pgn",
-    "evals_path":"stockfish_scores copy.npy",
-    "max_games": 1000
+    "log_step": 50,
+    "label_smoothing": 0.1,
+    "games_path": "data/lichess_elite_2024-06.pgn",
+    "evals_path": "data/stockfish_scores copy.npy",
+    "max_games": 1000,
+    "checkpoint_dir": "./checkpoints",
+    "log_dir": "./logs"
 }
