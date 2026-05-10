@@ -212,7 +212,6 @@ class Train:
 
         val_loss_history = []
         iters = 0
-        best_epoch = 0
         for epoch in range(self.epochs):
             lr = self.optimizer.param_groups[0]["lr"]
             self.model.train()
@@ -278,39 +277,27 @@ class Train:
             with open(os.path.join(self.log_dir, "log.txt"), "a") as fh:
                 fh.write(log_line + "\n")
 
+            payload = {
+                "epoch": epoch + 1,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "train_loss": train_loss,
+                "train_mse": train_mse,
+                "train_ce": train_ce,
+                "train_acc": train_acc,
+                "val_loss": val["loss"],
+                "val_mse": val["mse"],
+                "val_ce": val["ce"],
+                "val_acc": val["acc"],
+                "label_smoothing": self.label_smoothing,
+            }
+            last_path = os.path.join(self.checkpoint_dir, "model_last.pth")
+            torch.save(payload, last_path)
+
             if val_loss_history[-1] == min(val_loss_history):
-                # New best: save checkpoint, retire older ones.
-                for old in os.listdir(self.checkpoint_dir):
-                    if old.startswith("model_epoch_") and old.endswith(".pth"):
-                        os.remove(os.path.join(self.checkpoint_dir, old))
-                best_epoch = epoch + 1
-                ckpt_path = os.path.join(self.checkpoint_dir, f"model_epoch_{best_epoch}.pth")
-                torch.save({
-                    "epoch": best_epoch,
-                    "model_state_dict": self.model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "train_loss": train_loss,
-                    "train_mse": train_mse,
-                    "train_ce": train_ce,
-                    "train_acc": train_acc,
-                    "val_loss": val["loss"],
-                    "val_mse": val["mse"],
-                    "val_ce": val["ce"],
-                    "val_acc": val["acc"],
-                    "label_smoothing": self.label_smoothing,
-                }, ckpt_path)
-                print(f"  -> new best, saved {ckpt_path}")
-            else:
-                # Reload best, decay LR by 0.3.
-                if best_epoch:
-                    ckpt_path = os.path.join(self.checkpoint_dir, f"model_epoch_{best_epoch}.pth")
-                    ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-                    self.model.load_state_dict(ckpt["model_state_dict"])
-                    self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                new_lr = lr * 0.3
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = new_lr
-                print(f"  -> no improvement, lr {lr:g} -> {new_lr:g}, reloaded best")
+                best_path = os.path.join(self.checkpoint_dir, "model_best.pth")
+                torch.save(payload, best_path)
+                print(f"  -> new best val_loss, saved {best_path}")
 
         writer.flush()
         writer.close()
