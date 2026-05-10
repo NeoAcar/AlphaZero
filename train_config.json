@@ -9,5 +9,7 @@
     "evals_path": "data/stockfish_scores copy.npy",
     "max_games": 1000,
     "checkpoint_dir": "./checkpoints",
-    "log_dir": "./logs"
+    "log_dir": "./logs",
+    "val_fraction": 0.1,
+    "split_seed": 137
 }
