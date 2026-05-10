@@ -20,7 +20,7 @@ class AlphaZero:
         """
         mcts_action_probs = self.mcts.search(state, move_counter)
         action = np.argmax(mcts_action_probs)
-        return f.alphazero_to_move(action), mcts_action_probs
+        return f.alphazero_to_move(action, state), mcts_action_probs
     @torch.no_grad()
     def self_play(self) -> list[chess.Board]:
         """

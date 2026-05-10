@@ -66,14 +66,15 @@ def move_to_alphazero(move: str) -> int:
 def moves_to_alphazero(moves: list[chess.Move]) -> list[int]:
     return [move_to_alphazero(move.uci()) for move in moves]
 
-def alphazero_to_move(action: int) -> str:
+def alphazero_to_move(action: int, board: chess.Board | None = None) -> str:
     start_idx = action % 64
     move_type_index = action // 64
     start_file = start_idx % 8
     start_rank = start_idx // 8
     start_square = chr(start_file + 97) + str(start_rank + 1)
 
-    # Promotion moves
+    # Underpromotions (knight / bishop / rook) -- queen promotions fall
+    # through to the sliding-move branch below by AlphaZero convention.
     if move_type_index >= 64:
         promotion_map = {0: 'n', 1: 'b', 2: 'r'}
         promotion_type_index = (move_type_index - 64) // 3
@@ -100,13 +101,19 @@ def alphazero_to_move(action: int) -> str:
         knight_moves = [(2, 1), (1, 2), (-1, 2), (-2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1)]
         file_diff, rank_diff = knight_moves[move_type_index - 56]
 
-    
-
     end_file = start_file + file_diff
     end_rank = start_rank + rank_diff
     end_square = chr(end_file + 97) + str(end_rank + 1)
+    uci = start_square + end_square
 
-    return start_square + end_square
+    # Queen-promotion disambiguation: if a pawn slides to the last rank,
+    # python-chess requires an explicit promotion piece in UCI.
+    if board is not None and end_rank == 7:
+        piece = board.piece_at(chess.square(start_file, start_rank))
+        if piece is not None and piece.piece_type == chess.PAWN:
+            uci += 'q'
+
+    return uci
 
 def game_result(board: chess.Board, move_counter: int, truncation:int) -> tuple[int, bool]:
     if board.is_checkmate():

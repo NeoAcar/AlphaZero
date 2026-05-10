@@ -63,7 +63,7 @@ class Node:
         for action, prob in top_actions_probs:
             if prob > 0:
                 new_state = self.state.copy()
-                move = gf.alphazero_to_move(action)
+                move = gf.alphazero_to_move(action, self.state)
                 new_state.push_uci(move)
                 new_state.apply_mirror()
                 new_states.append(new_state)
