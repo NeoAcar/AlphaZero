@@ -1,4 +1,5 @@
 {
+    "type": "mcts",
     "checkpoint": "models/PUT_OLD_CHECKPOINT_HERE.pth",
     "num_simulation": 200,
     "top_actions": 5,

@@ -1,4 +1,5 @@
 {
+    "type": "mcts",
     "checkpoint": "models/model_epoch_10.pth",
     "num_simulation": 200,
     "top_actions": 5,

@@ -1,4 +1,5 @@
 {
+    "type": "stockfish",
     "binary": "stockfish",
     "skill_level": null,
     "elo": 1500,

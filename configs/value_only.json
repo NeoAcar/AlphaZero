@@ -1,0 +1,4 @@
+{
+    "type": "value_only",
+    "checkpoint": "models/model_epoch_10.pth"
+}
