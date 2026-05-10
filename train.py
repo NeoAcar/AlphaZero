@@ -99,10 +99,14 @@ class Train:
         # tanh range so MSE has zero attainable error on mate positions.
         evals = np.clip(np.asarray(evals, dtype=np.float32), -1.0, 1.0).reshape(-1, 1)
         evals = torch.tensor(evals, dtype=torch.float32)
-        # The eval file may be longer than `boards` (per-position evals cover
-        # more games than max_games). Truncate to alignment.
-        evals = evals[: len(boards)]
-        return boards, evals, moves
+        # Trim everything to the shorter of (boards, evals). evals only covers
+        # the first N games' positions; if max_games asks for more positions
+        # than evals knows about, we drop the trailing un-evaluated portion.
+        n = min(len(boards), len(evals))
+        if n < len(boards):
+            print(f"Eval file covers {n}/{len(boards)} positions; "
+                  f"truncating training set to {n}.")
+        return boards[:n], evals[:n], moves[:n]
 
     def train(self, boards: torch.Tensor, evals: torch.Tensor, moves: torch.Tensor) -> None:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
