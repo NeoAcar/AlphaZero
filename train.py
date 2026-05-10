@@ -95,10 +95,12 @@ class Train:
         games = f.load_pgn(self.games_path, self.max_games)
         boards, moves, results = f.create_nn_input(games)
         evals = np.load(self.evals_path)
-        evals = np.array(evals, dtype=np.float32).reshape(-1, 1)
+        # Clip mate-encoded outliers (just past +/-1) to the value head's
+        # tanh range so MSE has zero attainable error on mate positions.
+        evals = np.clip(np.asarray(evals, dtype=np.float32), -1.0, 1.0).reshape(-1, 1)
         evals = torch.tensor(evals, dtype=torch.float32)
-        # The eval file may be longer than `boards` (the per-position evals
-        # cover more games than max_games). Truncate to alignment.
+        # The eval file may be longer than `boards` (per-position evals cover
+        # more games than max_games). Truncate to alignment.
         evals = evals[: len(boards)]
         return boards, evals, moves
 
