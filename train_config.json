@@ -1,7 +1,7 @@
 {
     "batch_size": 256,
     "learning_rate": 0.00001,
-    "l2_weight": 0,
+    "l2_weight": 1e-4,
     "epochs": 10,
     "log_step": 50,
     "label_smoothing": 0.1,
