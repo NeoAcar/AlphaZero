@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import os
-import functions as f
+import optimized_functions as f
 from resnet import ResNet
 from dataset import ChessDataset
 from torch.utils.data import DataLoader
@@ -34,7 +34,7 @@ class Train:
 
     def data_preparation(self: 'Train') -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         games = f.load_pgn(self.games_path, self.max_games)
-        boards,results,moves = f.create_nn_input(games)
+        boards,moves,results = f.create_nn_input(games)
         evals = np.load(self.evals_path)
         evals = np.array(evals,dtype=np.float32).reshape(-1,1)
         evals = torch.tensor(evals,dtype=torch.float32)
@@ -112,8 +112,8 @@ class Train:
 
 
                     log = f'iterasyon {iters}, epoch {(epoch+1)}/{self.epochs}, Loss: {loss / step:.4f}, Learning rate: {lr}, MSE Loss: {mse_loss / step:.4f}, CE Loss: {ce_loss / step:.4f}, Accuracy: {100 * correct / total:.2f}%'
-                    with open('log.txt', 'a') as f:
-                        f.write(log + '\n')
+                    with open('log.txt', 'a') as log_file:
+                        log_file.write(log + '\n')
                     writer.add_scalar('Loss', loss / step, iters)
                     writer.add_scalar('MSE Loss', mse_loss / step, iters)
                     writer.add_scalar('CE Loss', ce_loss / step, iters)

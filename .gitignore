@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# uv
+# (uv.lock is committed; .venv is not)
+
+# IDE / Editor
+.claude/
+.vscode/
+.idea/
+
+# Project artifacts
+checkpoints/
+logs/
+models/
+data/
+log.txt
+
+# Model weights / large binaries
+*.pth
+*.npy
+*.zip
+*.pgn
+
+# Old requirements (replaced by pyproject.toml + uv.lock)
+requirements-linux.txt

@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import time
 import optimized_functions as f
-from mcts import MCTS # ithinkbettermcts.py can be used here
+from ithinkbettermcts import MCTS # mcts.py can be used here
 from resnet import ResNet
 import chess
 
@@ -35,14 +35,14 @@ class AlphaZero:
         while not f.game_result(state, move_counter, self.args["truncation"])[1]:
             print(f"Move {move_counter + 1}")
             action, _ = self.game_policy(state, move_counter)
-            state.push_san(action)
+            state.push_uci(action)
             states.append(state.copy())
             state = state.mirror()
             move_counter += 1
             if move_counter % 2 == 1:
-                board.push_san(action)
+                board.push_uci(action)
             else:
-                board.push_san(f.mirror_move(action))
+                board.push_uci(f.mirror_move(action))
         print(f"Game result: {f.game_result(state, move_counter, self.args['truncation'])[0]}")
         return states, board
    

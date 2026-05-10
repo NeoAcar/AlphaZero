@@ -97,7 +97,7 @@ def alphazero_to_move(action: int) -> str:
             file_diff = diff * (1 if move_type_index < 35 or 42 <= move_type_index < 49 else -1)
             rank_diff = diff * (1 if 28 <= move_type_index < 42 else -1)
     elif 56 <= move_type_index < 64:
-        knight_moves = [(2, 1), (1, 2), (-1, 2), (-2, 1), (-2, -1), (-1, -2), (1, -2), (2, -1)]
+        knight_moves = [(2, 1), (1, 2), (-1, 2), (-2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1)]
         file_diff, rank_diff = knight_moves[move_type_index - 56]
 
     
@@ -156,7 +156,7 @@ def board_value(board: chess.Board) -> int:
 def mirror_move(move: str) -> str:
     if move is None:
         return None
-    return f"{move[0]}{9 - int(move[1])}{move[2]}{9 - int(move[3])}"
+    return f"{move[0]}{9 - int(move[1])}{move[2]}{9 - int(move[3])}{move[4:]}"
     
 def create_nn_input(games: list[chess.pgn.Game]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     X = []

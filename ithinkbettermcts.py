@@ -1,5 +1,5 @@
 import math
-import functions as gf
+import optimized_functions as gf
 import numpy as np
 import torch
 import chess
@@ -64,15 +64,15 @@ class Node:
             if prob > 0:
                 new_state = self.state.copy()
                 move = gf.alphazero_to_move(action)
-                new_state.push_san(move)
+                new_state.push_uci(move)
                 new_state.apply_mirror()
                 new_states.append(new_state)
                 actions.append(action)
                 probs.append(prob)
                 
                 
-        _,policies = self.value_policy_batch(new_states, self.move_counter+1, model)
-        values = [gf.board_value(new_states[i]) for i in range(len(new_states))]
+        values, policies = self.value_policy_batch(new_states, self.move_counter+1, model)
+        values = values.flatten().tolist()
         max_depth.add(self.depth+1)
         for i, state in enumerate(new_states):
             if state.is_checkmate():
@@ -119,10 +119,8 @@ class MCTS:
     def value_policy(self, state: 'chess.Board', move_counter: 'int') -> tuple[float, np.ndarray]:
        
         self.model.eval()
-        _, policy = self.model(gf.prepare_input(state, move_counter).unsqueeze(0).to(self.args['device']))
-        value =gf.board_value(state)
-        
-        #value = value.cpu().item()
+        value, policy = self.model(gf.prepare_input(state, move_counter).unsqueeze(0).to(self.args['device']))
+        value = value.cpu().item()
         policy = torch.softmax(policy.squeeze(0), dim=0).cpu().numpy()
        
         valid_policy = gf.valid_policy(policy, state)

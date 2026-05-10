@@ -64,7 +64,7 @@ class Node:
             if prob > 0:
                 new_state = self.state.copy()
                 move = gf.alphazero_to_move(action)
-                new_state.push_san(move)
+                new_state.push_uci(move)
                 new_state.apply_mirror()
                 new_states.append(new_state)
                 actions.append(action)
@@ -126,7 +126,7 @@ class MCTS:
             current_node = current_node.best_child()
 
         if current_node.is_terminal():
-            value = gf.game_result(current_node.state, current_node.move_counter, 1000)[0]
+            value = -gf.game_result(current_node.state, current_node.move_counter, 1000)[0]
             current_node.backpropagation(value)
         else:
             current_node.expand(self.model)
@@ -136,7 +136,7 @@ class MCTS:
     def search(self, state: 'chess.Board', move_counter: 'int') -> np.ndarray:
         max_depth.clear()
         root_state = state.copy()
-        value, policy = self.value_policy(root_state, move_counter, validate=False)
+        policy = self.value_policy(root_state, move_counter, validate=False)
      
         policy = (1 - self.args['dirichlet_epsilon']) * policy + self.args['dirichlet_epsilon'] * np.random.dirichlet(
             [self.args['dirichlet_alpha']] * self.args['action_space'])
