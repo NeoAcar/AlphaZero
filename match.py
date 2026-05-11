@@ -121,8 +121,9 @@ def main() -> None:
             else:
                 draws += 1; tag = "DRAW"
 
+            plies = len(board.move_stack)
             print(f"Game {i+1:>3}/{cli.games}: {cli.p1_name} as {color_str:>5} -> "
-                  f"{tag:<13} ({dt:5.1f}s) | running: {wins}W {draws}D {losses}L")
+                  f"{tag:<13} {plies:>3} plies ({dt:5.1f}s) | running: {wins}W {draws}D {losses}L")
 
             if cli.output:
                 pgns.append(board_to_pgn(board, p1_color, result, cli.p1_name, cli.p2_name))
