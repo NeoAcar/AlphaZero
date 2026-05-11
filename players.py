@@ -185,10 +185,20 @@ class ValueOnlyPlayer:
 
 
 class MctsPlayer:
+    """MCTS-driven player.
+
+    For game diversity in matches, the first `temperature_moves` plies of
+    each game are sampled from the MCTS visit-count distribution with the
+    given `temperature` (visits ** (1/T), renormalised). After that, the
+    move is chosen by argmax for strongest play.
+
+    Defaults: temperature_moves=0 (always argmax). Set temperature_moves=20
+    + temperature=1.0 for AlphaZero-style opening sampling.
+    """
     name = "mcts"
 
     def __init__(self, cfg: dict):
-        from match import DEFAULT_MCTS_ARGS  # reuse the same defaults
+        from match import DEFAULT_MCTS_ARGS
         if "checkpoint" not in cfg:
             raise ValueError("mcts config needs 'checkpoint'")
         args = dict(DEFAULT_MCTS_ARGS)
@@ -202,9 +212,27 @@ class MctsPlayer:
         self.mcts = MCTS(args, self.model)
         self.args = args
 
+        self.temperature_moves = int(cfg.get("temperature_moves", 0))
+        self.temperature = float(cfg.get("temperature", 1.0))
+        seed = cfg.get("sampling_seed")
+        self._rng = np.random.default_rng(seed)
+
+    def _sample_action(self, probs: np.ndarray) -> int:
+        if self.temperature <= 0:
+            return int(np.argmax(probs))
+        scaled = np.where(probs > 0, probs ** (1.0 / self.temperature), 0.0)
+        total = scaled.sum()
+        if total <= 0:
+            return int(np.argmax(probs))
+        scaled = scaled / total
+        return int(self._rng.choice(len(scaled), p=scaled))
+
     def select_move(self, real_board, mirrored_state, move_counter):
         probs = self.mcts.search(mirrored_state, move_counter)
-        action = int(probs.argmax())
+        if move_counter < self.temperature_moves:
+            action = self._sample_action(probs)
+        else:
+            action = int(probs.argmax())
         mir_uci = f.alphazero_to_move(action, mirrored_state)
         return _to_real(mir_uci, real_board.turn), mir_uci
 
