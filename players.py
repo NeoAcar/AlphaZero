@@ -10,7 +10,7 @@ Player types
 random        no NN, no eval -- uniform random over legal moves
 piece_value   no NN -- classical piece value sum, picks best
 value_only    NN value head only (one-ply lookahead), no policy / MCTS
-mcts          full MCTS + policy + value (ithinkbettermcts)
+mcts          full MCTS + policy + value
 stockfish     external UCI engine
 
 Each is constructed from a JSON config; see configs/ for templates.
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 import optimized_functions as f
-from ithinkbettermcts import MCTS
+from mcts import MCTS
 from resnet import ResNet
 
 

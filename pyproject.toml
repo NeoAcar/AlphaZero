@@ -9,7 +9,7 @@ dependencies = [
     "numpy>=2.0",
     "torch>=2.5",
     "tqdm>=4.66",
-    "tensorboard>=2.18",
+    "wandb>=0.18",
 ]
 
 [tool.uv.sources]

@@ -22,6 +22,8 @@ checkpoints/
 logs/
 models/
 data/
+runs/
+wandb/
 log.txt
 
 # Model weights / large binaries

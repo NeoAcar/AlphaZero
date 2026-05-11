@@ -31,9 +31,10 @@ from pathlib import Path
 import chess
 import numpy as np
 import torch
+from tqdm import tqdm  # type: ignore
 
 import optimized_functions as f
-from ithinkbettermcts import MCTS
+from mcts import MCTS
 from resnet import ResNet
 
 
@@ -41,19 +42,17 @@ DEFAULT_MCTS_ARGS = {
     "c_base": 19652,
     "c_init": 1.25,
     "dirichlet_epsilon": 0.25,
-    "dirichlet_alpha": 0.03,
+    "dirichlet_alpha": 0.3,
     "memory_size": 1000,
     "action_space": 4672,
-    "top_actions": 10,
     "t": 1,
 }
 
 
-def build_mcts(checkpoint: str, sims: int, top_actions: int,
+def build_mcts(checkpoint: str, sims: int,
                dirichlet_eps: float) -> tuple[MCTS, ResNet, dict]:
     args = dict(DEFAULT_MCTS_ARGS)
     args["num_simulation"] = sims
-    args["top_actions"] = top_actions
     args["dirichlet_epsilon"] = dirichlet_eps
     args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args["truncation"] = 300
@@ -125,7 +124,6 @@ def main() -> None:
     p.add_argument("--checkpoint", required=True, help="path to .pth model")
     p.add_argument("--games", type=int, default=100, help="games to generate")
     p.add_argument("--sims", type=int, default=200, help="MCTS simulations per move")
-    p.add_argument("--top-actions", type=int, default=10, help="MCTS expansion width")
     p.add_argument("--dirichlet-eps", type=float, default=0.25, help="exploration noise at root")
     p.add_argument("--temperature-moves", type=int, default=30, help="plies of stochastic sampling")
     p.add_argument("--temperature", type=float, default=1.0)
@@ -140,7 +138,7 @@ def main() -> None:
         print("Device: cpu")
 
     print(f"Loading {cli.checkpoint}")
-    mcts, _, args = build_mcts(cli.checkpoint, cli.sims, cli.top_actions, cli.dirichlet_eps)
+    mcts, _, args = build_mcts(cli.checkpoint, cli.sims, cli.dirichlet_eps)
     rng = np.random.default_rng(cli.seed)
 
     all_boards: list[np.ndarray] = []
@@ -151,7 +149,8 @@ def main() -> None:
     print(f"\nGenerating {cli.games} games (sims={cli.sims}, temp_moves={cli.temperature_moves})\n")
 
     t_total = time.time()
-    for g in range(cli.games):
+    pbar = tqdm(range(cli.games), desc="Self-play", unit="game")
+    for g in pbar:
         t0 = time.time()
         boards, pis, final_value, plies = play_one_game(
             mcts, cli.temperature_moves, cli.temperature, cli.truncation, rng
@@ -195,8 +194,15 @@ def main() -> None:
                 stats["draws"] += 1
         stats["total_plies"] += plies
 
-        print(f"Game {g+1:>3}/{cli.games}: {plies:>3} plies, "
-              f"final_value={final_value:+d}  ({dt:5.1f}s)")
+        tqdm.write(f"Game {g+1:>3}/{cli.games}: {plies:>3} plies, "
+                   f"final_value={final_value:+d}  ({dt:5.1f}s)")
+        completed = g + 1
+        pbar.set_postfix(
+            w=stats["wins_white"] + stats["wins_black"],
+            d=stats["draws"],
+            t=stats["truncated"],
+            avg_plies=f"{stats['total_plies'] / completed:.0f}",
+        )
 
     print(f"\nTotal: {time.time() - t_total:.1f}s for {cli.games} games "
           f"({stats['total_plies']} positions, "
@@ -231,6 +237,24 @@ def main() -> None:
     torch.save(payload, cli.output)
     print(f"Saved {len(all_boards)} positions to {cli.output} "
           f"({os.path.getsize(cli.output) / 1e6:.1f} MB)")
+
+    # Tiny side-car so downstream tools (e.g. runner.py / wandb logging) don't
+    # have to load the full .pt just for stats.
+    summary_path = os.path.splitext(cli.output)[0] + "_summary.json"
+    summary = {
+        "checkpoint": cli.checkpoint,
+        "games": cli.games,
+        "sims": cli.sims,
+        "temperature_moves": cli.temperature_moves,
+        "temperature": cli.temperature,
+        "dirichlet_eps": cli.dirichlet_eps,
+        "truncation": cli.truncation,
+        "positions": len(all_boards),
+        "avg_plies": stats["total_plies"] / cli.games if cli.games else 0,
+        **stats,
+    }
+    with open(summary_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
 
 
 if __name__ == "__main__":

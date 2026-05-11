@@ -28,10 +28,9 @@ DEFAULT_MCTS_ARGS = {
     "c_base": 19652,
     "c_init": 1.25,
     "dirichlet_epsilon": 0.0,
-    "dirichlet_alpha": 0.03,
+    "dirichlet_alpha": 0.3,
     "memory_size": 1000,
     "action_space": 4672,
-    "top_actions": 5,
     "t": 1,
 }
 

@@ -7,8 +7,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # type: ignore
+
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None  # type: ignore
 
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
@@ -33,7 +37,10 @@ def parse_args() -> dict:
     p.add_argument("--label-smoothing", type=float,
                    help="cross-entropy label smoothing factor (e.g. 0.1)")
     p.add_argument("--checkpoint-dir", help="directory for model checkpoints")
-    p.add_argument("--log-dir", help="directory for tensorboard logs")
+    p.add_argument("--log-dir", help="directory for plain-text logs")
+    p.add_argument("--wandb-project", help="wandb project name; if unset, wandb is disabled")
+    p.add_argument("--wandb-group", help="wandb group (for grouping runs from runner.py)")
+    p.add_argument("--wandb-name", help="wandb run name")
     p.add_argument("--resume", help="path to a .pth checkpoint to resume from")
     p.add_argument("--val-fraction", type=float,
                    help="fraction of games held out for validation (split by game, not position)")
@@ -58,6 +65,9 @@ def parse_args() -> dict:
     cfg.setdefault("split_seed", 137)
     cfg.setdefault("self_play_data", None)
     cfg.setdefault("data_mix", None)
+    cfg.setdefault("wandb_project", None)
+    cfg.setdefault("wandb_group", None)
+    cfg.setdefault("wandb_name", None)
 
     # CLI overrides (only when explicitly given).
     overrides = {
@@ -77,6 +87,9 @@ def parse_args() -> dict:
         "split_seed": cli.split_seed,
         "self_play_data": cli.self_play_data,
         "data_mix": cli.data_mix,
+        "wandb_project": cli.wandb_project,
+        "wandb_group": cli.wandb_group,
+        "wandb_name": cli.wandb_name,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -103,6 +116,9 @@ class Train:
         self.val_fraction = args["val_fraction"]
         self.split_seed = args["split_seed"]
         self.self_play_paths = args["self_play_data"] or []
+        self.wandb_project = args.get("wandb_project")
+        self.wandb_group = args.get("wandb_group")
+        self.wandb_name = args.get("wandb_name")
         # Resolve data_mix default
         mix = args.get("data_mix")
         if mix is None:
@@ -235,7 +251,24 @@ class Train:
     def train(self, train_dataset, val_dataset) -> None:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=self.log_dir, flush_secs=1)
+
+        use_wandb = wandb is not None and self.wandb_project is not None
+        if use_wandb:
+            wandb.init(
+                project=self.wandb_project,
+                group=self.wandb_group,
+                name=self.wandb_name,
+                job_type="train",
+                config={
+                    "epochs": self.epochs,
+                    "batch_size": self.batch_size,
+                    "lr": self.lr,
+                    "l2_weight": self.l2_weight,
+                    "label_smoothing": self.label_smoothing,
+                    "data_mix": self.data_mix,
+                    "resume": self.args.get("resume"),
+                },
+            )
 
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self.lr
@@ -287,11 +320,15 @@ class Train:
                 correct += (predicted == ce_target_label).sum().item()
 
                 if iters % self.log_step == 0:
-                    writer.add_scalar("Loss/iter", loss.item(), iters)
-                    writer.add_scalar("MSE/iter", loss_mse.item(), iters)
-                    writer.add_scalar("CE/iter", loss_ce.item(), iters)
-                    writer.add_scalar("Accuracy/iter", 100.0 * correct / total, iters)
-                    writer.add_scalar("LearningRate", lr, iters)
+                    if use_wandb:
+                        wandb.log({
+                            "train/loss": loss.item(),
+                            "train/value_mse": loss_mse.item(),
+                            "train/policy_ce": loss_ce.item(),
+                            "train/accuracy": 100.0 * correct / total,
+                            "train/lr": lr,
+                            "train/step": iters,
+                        })
                 iters += 1
 
             n_batches = len(train_loader)
@@ -302,18 +339,26 @@ class Train:
 
             val = self.evaluate(val_loader, criterion_mse) if val_loader is not None else None
 
-            writer.add_scalar("Loss/train_epoch", train_loss, epoch + 1)
-            writer.add_scalar("MSE/train_epoch", train_mse, epoch + 1)
-            writer.add_scalar("CE/train_epoch", train_ce, epoch + 1)
-            writer.add_scalar("Accuracy/train_epoch", train_acc, epoch + 1)
+            if use_wandb:
+                ep_log = {
+                    "epoch/train_loss": train_loss,
+                    "epoch/train_value_mse": train_mse,
+                    "epoch/train_policy_ce": train_ce,
+                    "epoch/train_accuracy": train_acc,
+                    "epoch/n": epoch + 1,
+                }
+                if val is not None:
+                    ep_log.update({
+                        "epoch/val_loss": val["loss"],
+                        "epoch/val_value_mse": val["mse"],
+                        "epoch/val_policy_ce": val["ce"],
+                        "epoch/val_accuracy": val["acc"],
+                    })
+                wandb.log(ep_log)
             if val is not None:
                 val_combined_history.append(val["loss"])
                 val_ce_history.append(val["ce"])
                 val_mse_history.append(val["mse"])
-                writer.add_scalar("Loss/val_epoch", val["loss"], epoch + 1)
-                writer.add_scalar("MSE/val_epoch", val["mse"], epoch + 1)
-                writer.add_scalar("CE/val_epoch", val["ce"], epoch + 1)
-                writer.add_scalar("Accuracy/val_epoch", val["acc"], epoch + 1)
 
             train_part = (f"train: loss {train_loss:.4f} mse {train_mse:.4f} "
                           f"ce {train_ce:.4f} acc {train_acc:.2f}%")
@@ -358,8 +403,8 @@ class Train:
                     torch.save(payload, best_path)
                     print(f"  -> new best val MSE, saved {best_path}")
 
-        writer.flush()
-        writer.close()
+        if use_wandb:
+            wandb.finish()
 
         analytics_path = os.path.join(self.checkpoint_dir, "training_analytics.pth")
         torch.save({

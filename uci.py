@@ -8,11 +8,10 @@ responses, debug logs to stderr.
 Configuration via UCI setoption:
     Checkpoint       (string)  path to .pth model       default: models/model_best.pth
     Sims             (spin)    MCTS sims per move       default: 200
-    TopActions       (spin)    MCTS expansion width     default: 10
     Temperature      (string)  >=0, 0 = argmax          default: 0.0
     TempMoves        (spin)    plies of stochastic play default: 0
     DirichletEps     (string)  root noise weight        default: 0.0
-    DirichletAlpha   (string)  Dirichlet concentration  default: 0.03
+    DirichletAlpha   (string)  Dirichlet concentration  default: 0.3
     CInit            (string)  PUCT exploration         default: 1.25
 
 Wire it up to a GUI: most GUIs let you "add an engine" by pointing
@@ -38,7 +37,7 @@ import numpy as np
 import torch
 
 import optimized_functions as f
-from ithinkbettermcts import MCTS
+from mcts import MCTS
 from resnet import ResNet
 
 
@@ -61,17 +60,15 @@ class UciEngine:
     DEFAULT_OPTS = {
         "Checkpoint": "models/model_best.pth",
         "Sims": 200,
-        "TopActions": 10,
         "Temperature": 0.0,
         "TempMoves": 0,
         "DirichletEps": 0.0,
-        "DirichletAlpha": 0.03,
+        "DirichletAlpha": 0.3,
         "CInit": 1.25,
     }
     OPT_TYPES = {
         "Checkpoint": ("string", None, None),
         "Sims": ("spin", 1, 100000),
-        "TopActions": ("spin", 1, 4672),
         "Temperature": ("string", None, None),
         "TempMoves": ("spin", 0, 200),
         "DirichletEps": ("string", None, None),
@@ -117,7 +114,6 @@ class UciEngine:
             "dirichlet_alpha": float(self.options["DirichletAlpha"]),
             "memory_size": 1000,
             "action_space": 4672,
-            "top_actions": int(self.options["TopActions"]),
             "t": 1,
             "device": self.device,
         }

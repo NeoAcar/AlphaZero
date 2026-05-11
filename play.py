@@ -6,7 +6,7 @@ import chess
 import torch
 
 import optimized_functions as f
-from ithinkbettermcts import MCTS
+from mcts import MCTS
 from resnet import ResNet
 
 
