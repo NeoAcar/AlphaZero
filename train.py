@@ -210,7 +210,9 @@ class Train:
         criterion_mse = nn.MSELoss()
         criterion_ce = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
 
-        val_loss_history = []
+        val_combined_history = []
+        val_ce_history = []
+        val_mse_history = []
         iters = 0
         for epoch in range(self.epochs):
             lr = self.optimizer.param_groups[0]["lr"]
@@ -257,7 +259,9 @@ class Train:
             train_acc = 100.0 * correct / total
 
             val = self.evaluate(val_loader, criterion_mse, criterion_ce)
-            val_loss_history.append(val["loss"])
+            val_combined_history.append(val["loss"])
+            val_ce_history.append(val["ce"])
+            val_mse_history.append(val["mse"])
 
             writer.add_scalar("Loss/train_epoch", train_loss, epoch + 1)
             writer.add_scalar("MSE/train_epoch", train_mse, epoch + 1)
@@ -294,16 +298,28 @@ class Train:
             last_path = os.path.join(self.checkpoint_dir, "model_last.pth")
             torch.save(payload, last_path)
 
-            if val_loss_history[-1] == min(val_loss_history):
-                best_path = os.path.join(self.checkpoint_dir, "model_best.pth")
+            if val_combined_history[-1] == min(val_combined_history):
+                best_path = os.path.join(self.checkpoint_dir, "model_best_combined.pth")
                 torch.save(payload, best_path)
-                print(f"  -> new best val_loss, saved {best_path}")
+                print(f"  -> new best combined val_loss, saved {best_path}")
+            if val_ce_history[-1] == min(val_ce_history):
+                best_path = os.path.join(self.checkpoint_dir, "model_best_policy.pth")
+                torch.save(payload, best_path)
+                print(f"  -> new best val CE, saved {best_path}")
+            if val_mse_history[-1] == min(val_mse_history):
+                best_path = os.path.join(self.checkpoint_dir, "model_best_value.pth")
+                torch.save(payload, best_path)
+                print(f"  -> new best val MSE, saved {best_path}")
 
         writer.flush()
         writer.close()
 
         analytics_path = os.path.join(self.checkpoint_dir, "training_analytics.pth")
-        torch.save({"val_loss_history": val_loss_history}, analytics_path)
+        torch.save({
+            "val_combined_history": val_combined_history,
+            "val_ce_history": val_ce_history,
+            "val_mse_history": val_mse_history,
+        }, analytics_path)
         print(f"Training analytics saved at {analytics_path}")
         print("Training finished!")
 
