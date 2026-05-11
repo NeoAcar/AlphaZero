@@ -16,6 +16,7 @@ import time
 import chess
 import chess.pgn
 import numpy as np
+import torch
 
 import optimized_functions as f
 from players import load_player
@@ -92,6 +93,11 @@ def main() -> None:
     p.add_argument("--p1-name", default="p1")
     p.add_argument("--p2-name", default="p2")
     cli = p.parse_args()
+
+    if torch.cuda.is_available():
+        print(f"Device: cuda ({torch.cuda.get_device_name(0)})")
+    else:
+        print("Device: cpu")
 
     print(f"Loading {cli.p1_name} from {cli.player1}")
     p1 = load_player(cli.player1)
