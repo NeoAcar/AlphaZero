@@ -107,7 +107,7 @@ def main() -> None:
     print(f"  type: {p2.name}")
 
     print(f"\nPlaying {cli.games} games (truncation={cli.truncation}). "
-          f"{cli.p1_name} plays white in even-indexed games.\n")
+          f"{cli.p1_name} plays white in odd-numbered games (1, 3, 5, ...).\n")
 
     wins = draws = losses = 0
     pgns = []
