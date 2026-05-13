@@ -24,6 +24,8 @@ class ChessDataset(Dataset):
 
     def __getitem__(self, idx):
         board = self.boards[idx]
+        if board.dtype == torch.uint8:
+            board = board.float() / 255.0
         value = self.values[idx]
         label = int(self.policy[idx].item())
         soft = torch.full((self.K,), self.smoothing / self.K, dtype=torch.float32)
@@ -44,4 +46,7 @@ class SelfPlayDataset(Dataset):
         return len(self.boards)
 
     def __getitem__(self, idx):
-        return self.boards[idx], self.values[idx], self.pis[idx]
+        board = self.boards[idx]
+        if board.dtype == torch.uint8:
+            board = board.float() / 255.0
+        return board, self.values[idx], self.pis[idx]

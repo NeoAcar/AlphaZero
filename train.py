@@ -26,9 +26,12 @@ def parse_args() -> dict:
     p = argparse.ArgumentParser(description="AlphaZero supervised pre-training on Lichess + Stockfish")
     p.add_argument("--config", default="train_config.json",
                    help="JSON config file. Any --flag below overrides its value.")
-    p.add_argument("--games-path", help="path to .pgn file")
-    p.add_argument("--evals-path", help="path to .npy stockfish-eval file (per-position)")
-    p.add_argument("--max-games", type=int, help="number of games to load from the pgn")
+    p.add_argument("--games-path", help="path to .pgn file (legacy single-file mode)")
+    p.add_argument("--evals-path", help="path to .npy stockfish-eval file (legacy single-file mode)")
+    p.add_argument("--shards-dir", help="directory of shard_NNNN.pt files from gen_sf_data.py "
+                   "(takes priority over --games-path/--evals-path if set)")
+    p.add_argument("--max-shards", type=int, help="when using --shards-dir, cap how many shards to load")
+    p.add_argument("--max-games", type=int, help="number of games to load from the pgn (legacy mode only)")
     p.add_argument("--epochs", type=int, help="number of training epochs")
     p.add_argument("--batch-size", type=int)
     p.add_argument("--learning-rate", type=float)
@@ -68,6 +71,8 @@ def parse_args() -> dict:
     cfg.setdefault("wandb_project", None)
     cfg.setdefault("wandb_group", None)
     cfg.setdefault("wandb_name", None)
+    cfg.setdefault("shards_dir", None)
+    cfg.setdefault("max_shards", None)
 
     # CLI overrides (only when explicitly given).
     overrides = {
@@ -90,6 +95,8 @@ def parse_args() -> dict:
         "wandb_project": cli.wandb_project,
         "wandb_group": cli.wandb_group,
         "wandb_name": cli.wandb_name,
+        "shards_dir": cli.shards_dir,
+        "max_shards": cli.max_shards,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -119,6 +126,8 @@ class Train:
         self.wandb_project = args.get("wandb_project")
         self.wandb_group = args.get("wandb_group")
         self.wandb_name = args.get("wandb_name")
+        self.shards_dir = args.get("shards_dir")
+        self.max_shards = args.get("max_shards")
         # Resolve data_mix default
         mix = args.get("data_mix")
         if mix is None:
@@ -147,7 +156,10 @@ class Train:
         val_dataset = None
 
         if self.data_mix in ("supervised", "both"):
-            sup_train, sup_val = self._load_supervised_split()
+            if self.shards_dir:
+                sup_train, sup_val = self._load_sharded_split()
+            else:
+                sup_train, sup_val = self._load_supervised_split()
             train_datasets.append(sup_train)
             val_dataset = sup_val
 
@@ -166,6 +178,71 @@ class Train:
         print(f"Combined training set: {len(train_dataset)} positions "
               f"from {len(train_datasets)} source(s).")
         return {"train": train_dataset, "val": val_dataset}
+
+    def _load_sharded_split(self) -> tuple[ChessDataset, ChessDataset]:
+        """Load shard_NNNN.pt files from --shards-dir, concatenate, split by game.
+
+        Each shard contains:
+          boards (N,19,8,8) float32
+          moves (N,) long
+          evals (N,1) float32 in [-1, 1]
+          positions_per_game (G,) int64
+        We concatenate across shards, then split GAMES (not positions) into
+        train/val using --val-fraction and --split-seed, so positions from a
+        single game stay together.
+        """
+        from pathlib import Path
+
+        # Match both flat layout (shard_*.pt at top) and multi-worker layout
+        # (worker_*/shard_*.pt). rglob handles both.
+        shard_paths = sorted(Path(self.shards_dir).rglob("shard_*.pt"))
+        if not shard_paths:
+            raise RuntimeError(f"No shard_*.pt files found in {self.shards_dir}")
+        if self.max_shards is not None:
+            shard_paths = shard_paths[: self.max_shards]
+        print(f"Loading {len(shard_paths)} shard(s) from {self.shards_dir}")
+
+        all_boards = []
+        all_moves = []
+        all_evals = []
+        all_ppg = []
+        for sp in shard_paths:
+            d = torch.load(sp, map_location="cpu", weights_only=False)
+            all_boards.append(d["boards"])
+            all_moves.append(d["moves"])
+            all_evals.append(d["evals"])
+            all_ppg.append(d["positions_per_game"])
+            print(f"  {sp.name}: {len(d['boards'])} positions, {len(d['positions_per_game'])} games")
+
+        boards = torch.cat(all_boards, dim=0)
+        moves = torch.cat(all_moves, dim=0)
+        evals = torch.cat(all_evals, dim=0)
+        evals = torch.clamp(evals, -1.0, 1.0)
+        positions_per_game = np.concatenate(all_ppg)
+        n_games = len(positions_per_game)
+        n_positions = int(positions_per_game.sum())
+        assert n_positions == len(boards), \
+            f"Position count mismatch: ppg sum = {n_positions}, boards = {len(boards)}"
+
+        rng = np.random.RandomState(self.split_seed)
+        shuffled = rng.permutation(n_games)
+        n_val_games = max(1, int(round(n_games * self.val_fraction)))
+        val_game_idx = np.zeros(n_games, dtype=bool)
+        val_game_idx[shuffled[:n_val_games]] = True
+
+        per_pos_is_val = np.repeat(val_game_idx, positions_per_game)
+        val_mask = torch.from_numpy(per_pos_is_val)
+        train_mask = ~val_mask
+
+        n_train_games = n_games - n_val_games
+        print(f"Sharded supervised: {n_train_games} train / {n_val_games} val games "
+              f"({int(train_mask.sum())} / {int(val_mask.sum())} positions).")
+
+        train_ds = ChessDataset(boards[train_mask], evals[train_mask], moves[train_mask],
+                                label_smoothing=self.label_smoothing)
+        val_ds = ChessDataset(boards[val_mask], evals[val_mask], moves[val_mask],
+                              label_smoothing=self.label_smoothing)
+        return train_ds, val_ds
 
     def _load_supervised_split(self) -> tuple[ChessDataset, ChessDataset]:
         games = f.load_pgn(self.games_path, self.max_games)
