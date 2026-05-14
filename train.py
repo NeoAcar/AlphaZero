@@ -17,7 +17,7 @@ except ImportError:
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
 
-from alphazero.dataset import ChessDataset, SelfPlayDataset
+from alphazero.dataset import ChessDataset, LazyShardDataset, SelfPlayDataset
 from alphazero.nn import ResNet
 
 
@@ -39,6 +39,9 @@ def parse_args() -> dict:
     p.add_argument("--vals-per-epoch", type=int, default=1,
                    help="how many validation passes to run per epoch (default: 1, "
                         "evenly spaced; the last one lands at the end of the epoch)")
+    p.add_argument("--num-workers", type=int, default=4,
+                   help="DataLoader worker processes (default 4). Set 0 to disable "
+                        "multiprocessing -- but with lazy/mmap shards, workers help.")
     p.add_argument("--wandb-project", help="wandb project name; if unset, wandb is disabled")
     p.add_argument("--wandb-group", help="wandb group (for grouping runs from runner.py)")
     p.add_argument("--wandb-name", help="wandb run name")
@@ -72,6 +75,7 @@ def parse_args() -> dict:
     cfg.setdefault("shards_dir", None)
     cfg.setdefault("max_shards", None)
     cfg.setdefault("vals_per_epoch", 1)
+    cfg.setdefault("num_workers", 4)
 
     # CLI overrides (only when explicitly given).
     overrides = {
@@ -94,6 +98,7 @@ def parse_args() -> dict:
         "shards_dir": cli.shards_dir,
         "max_shards": cli.max_shards,
         "vals_per_epoch": cli.vals_per_epoch,
+        "num_workers": cli.num_workers,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -123,6 +128,7 @@ class Train:
         self.shards_dir = args.get("shards_dir")
         self.max_shards = args.get("max_shards")
         self.vals_per_epoch = int(args.get("vals_per_epoch", 1) or 1)
+        self.num_workers = int(args.get("num_workers", 4) or 0)
         # Resolve data_mix default
         mix = args.get("data_mix")
         if mix is None:
@@ -175,17 +181,18 @@ class Train:
               f"from {len(train_datasets)} source(s).")
         return {"train": train_dataset, "val": val_dataset}
 
-    def _load_sharded_split(self) -> tuple[ChessDataset, ChessDataset]:
-        """Load shard_NNNN.pt files from --shards-dir, concatenate, split by game.
+    def _load_sharded_split(self):
+        """Build streaming train/val datasets over shard_*.pt files.
 
-        Each shard contains:
-          boards (N,19,8,8) float32
-          moves (N,) long
-          evals (N,1) float32 in [-1, 1]
-          positions_per_game (G,) int64
-        We concatenate across shards, then split GAMES (not positions) into
-        train/val using --val-fraction and --split-seed, so positions from a
-        single game stay together.
+        Each shard contains boards/moves/evals/legal_masks_packed/positions_per_game.
+        Shards stay on disk and are mmap'd lazily per DataLoader worker, so RAM
+        usage scales with the OS page cache rather than dataset size. The split
+        is game-level (positions from one game don't cross train/val) and is
+        determined by --val-fraction + --split-seed.
+
+        Returns (train_ds, val_ds) as ConcatDataset[LazyShardDataset]. Both can
+        be passed straight to a DataLoader with `shuffle=True, num_workers>0,
+        persistent_workers=True`.
         """
         from pathlib import Path
 
@@ -196,82 +203,66 @@ class Train:
             raise RuntimeError(f"No shard_*.pt files found in {self.shards_dir}")
         if self.max_shards is not None:
             shard_paths = shard_paths[: self.max_shards]
-        print(f"Loading {len(shard_paths)} shard(s) from {self.shards_dir}")
+        print(f"Scanning {len(shard_paths)} shard(s) from {self.shards_dir}")
 
-        all_boards = []
-        all_moves = []
-        all_evals = []
-        all_masks = []
+        # Pass 1: open each shard via mmap, read only positions_per_game and
+        # board count. No tensor storage actually loads into RAM thanks to mmap.
         all_ppg = []
+        n_positions_per_shard = []
         any_missing_masks = False
         for sp in shard_paths:
-            d = torch.load(sp, map_location="cpu", weights_only=False)
-            all_boards.append(d["boards"])
-            all_moves.append(d["moves"])
-            all_evals.append(d["evals"])
-            if "legal_masks_packed" in d:
-                all_masks.append(d["legal_masks_packed"])
-            else:
-                any_missing_masks = True
+            d = torch.load(sp, map_location="cpu", weights_only=False, mmap=True)
+            n = len(d["boards"])
             all_ppg.append(d["positions_per_game"])
-            print(f"  {sp.name}: {len(d['boards'])} positions, {len(d['positions_per_game'])} games")
+            n_positions_per_shard.append(n)
+            if "legal_masks_packed" not in d:
+                any_missing_masks = True
+            print(f"  {sp.name}: {n} positions, {len(d['positions_per_game'])} games")
+            del d
 
-        # Cat one tensor at a time and free the source list immediately, so we
-        # never hold {per-shard list} + {cat result} in memory simultaneously.
-        # On big runs (17M+ positions, ~30 GB of boards alone) the lazy doubling
-        # during cat + the splitting copies otherwise breach Colab's 85 GB cap.
-        boards = torch.cat(all_boards, dim=0);  del all_boards
-        moves = torch.cat(all_moves, dim=0);    del all_moves
-        evals = torch.cat(all_evals, dim=0);    del all_evals
-        evals = torch.clamp(evals, -1.0, 1.0)
         if any_missing_masks:
             print("  WARN: some shards lack 'legal_masks_packed' -- "
-                  "label smoothing will spread over all 4672 indices for this run.")
-            legal_masks_packed = None
-            del all_masks
-        else:
-            legal_masks_packed = torch.cat(all_masks, dim=0) if all_masks else None
-            del all_masks
-        positions_per_game = np.concatenate(all_ppg);  del all_ppg
+                  "label smoothing will spread over all 4672 indices for those shards.")
+        positions_per_game = np.concatenate(all_ppg)
         n_games = len(positions_per_game)
         n_positions = int(positions_per_game.sum())
-        assert n_positions == len(boards), \
-            f"Position count mismatch: ppg sum = {n_positions}, boards = {len(boards)}"
+        assert n_positions == sum(n_positions_per_shard), \
+            f"Position count mismatch: ppg sum = {n_positions}, " \
+            f"shard sum = {sum(n_positions_per_shard)}"
 
+        # Game-level train/val split.
         rng = np.random.RandomState(self.split_seed)
         shuffled = rng.permutation(n_games)
         n_val_games = max(1, int(round(n_games * self.val_fraction)))
         val_game_idx = np.zeros(n_games, dtype=bool)
         val_game_idx[shuffled[:n_val_games]] = True
-
         per_pos_is_val = np.repeat(val_game_idx, positions_per_game)
-        val_mask = torch.from_numpy(per_pos_is_val)
-        train_mask = ~val_mask
-
         n_train_games = n_games - n_val_games
+
+        # Pass 2: build per-shard LazyShardDataset for train & val, indexed by
+        # which positions in each shard fall on which side of the split.
+        train_datasets, val_datasets = [], []
+        cursor = 0
+        for sp, n in zip(shard_paths, n_positions_per_shard):
+            shard_is_val = per_pos_is_val[cursor:cursor + n]
+            train_local = np.nonzero(~shard_is_val)[0]
+            val_local = np.nonzero(shard_is_val)[0]
+            if len(train_local) > 0:
+                train_datasets.append(LazyShardDataset(
+                    sp, train_local, label_smoothing=self.label_smoothing))
+            if len(val_local) > 0:
+                val_datasets.append(LazyShardDataset(
+                    sp, val_local, label_smoothing=self.label_smoothing))
+            cursor += n
+        assert cursor == n_positions
+
         print(f"Sharded supervised: {n_train_games} train / {n_val_games} val games "
-              f"({int(train_mask.sum())} / {int(val_mask.sum())} positions).")
+              f"({int((~per_pos_is_val).sum())} / {int(per_pos_is_val.sum())} positions).")
 
-        # Split each tensor train/val, then drop the source immediately. Doing
-        # all four boolean-indexes inline (the previous code) kept `boards`
-        # alive for both the train and val copies, peaking at 3x the boards
-        # tensor size. Pattern below peaks at 2x.
-        train_boards = boards[train_mask]; val_boards = boards[val_mask]; del boards
-        train_moves  = moves[train_mask];  val_moves  = moves[val_mask];  del moves
-        train_evals  = evals[train_mask];  val_evals  = evals[val_mask];  del evals
-        if legal_masks_packed is not None:
-            train_masks_packed = legal_masks_packed[train_mask]
-            val_masks_packed   = legal_masks_packed[val_mask]
-            del legal_masks_packed
-        else:
-            train_masks_packed = val_masks_packed = None
-
-        train_ds = ChessDataset(train_boards, train_evals, train_moves,
-                                label_smoothing=self.label_smoothing,
-                                legal_masks_packed=train_masks_packed)
-        val_ds = ChessDataset(val_boards, val_evals, val_moves,
-                              label_smoothing=self.label_smoothing,
-                              legal_masks_packed=val_masks_packed)
+        train_ds = (train_datasets[0] if len(train_datasets) == 1
+                    else ConcatDataset(train_datasets))
+        val_ds = (val_datasets[0] if len(val_datasets) == 1
+                  else ConcatDataset(val_datasets))
         return train_ds, val_ds
 
     @staticmethod
@@ -333,14 +324,19 @@ class Train:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self.lr
 
-        train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, shuffle=True,
+        # persistent_workers=True keeps workers' mmap'd shard handles alive
+        # across epochs (cheap, no re-opens). pin_memory=True speeds up GPU
+        # transfers when running on CUDA.
+        loader_kwargs = dict(
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=(self.device.type == "cuda"),
+            persistent_workers=(self.num_workers > 0),
         )
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
         val_loader = None
         if val_dataset is not None:
-            val_loader = DataLoader(
-                val_dataset, batch_size=self.batch_size, shuffle=False,
-            )
+            val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
         criterion_mse = nn.MSELoss()
 

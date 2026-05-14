@@ -52,6 +52,73 @@ class ChessDataset(Dataset):
         return board, value, soft
 
 
+class LazyShardDataset(Dataset):
+    """One shard's positions, loaded lazily via mmap.
+
+    Designed to be wrapped in `ConcatDataset([LazyShardDataset(...), ...])` so
+    that the supervised training set can span hundreds of shards without ever
+    materialising them all in RAM. Each instance carries only the shard path
+    and a small int64 array of local indices (which positions in this shard
+    belong to its split, e.g. train or val). The shard itself is mmap'd on
+    first `__getitem__` and its tensor storages stay on disk -- the OS pages
+    in only what's read.
+
+    With DataLoader workers, each worker process re-loads the shard on its
+    first access (via `__getstate__` clearing the cached handle on pickle).
+    Across-epoch reuse benefits from OS page cache; persistent_workers=True
+    on the DataLoader keeps the worker's mmap binding alive between epochs.
+
+    Returns the same (board, value, soft_policy) tuple as ChessDataset, with
+    legal-mask-aware label smoothing when the shard has the `legal_masks_packed`
+    field.
+    """
+
+    def __init__(self, shard_path, local_indices, label_smoothing: float = 0.0,
+                 action_space: int = 4672):
+        self.shard_path = str(shard_path)
+        self.local_indices = np.asarray(local_indices, dtype=np.int64)
+        self.smoothing = float(label_smoothing)
+        self.K = action_space
+        self._d = None
+
+    def _ensure_loaded(self):
+        if self._d is None:
+            self._d = torch.load(self.shard_path, map_location="cpu",
+                                  weights_only=False, mmap=True)
+        return self._d
+
+    def __getstate__(self):
+        s = self.__dict__.copy()
+        s["_d"] = None   # don't try to pickle mmap'd tensors across workers
+        return s
+
+    def __len__(self):
+        return len(self.local_indices)
+
+    def __getitem__(self, idx):
+        d = self._ensure_loaded()
+        i = int(self.local_indices[idx])
+        board = d["boards"][i]
+        if board.dtype == torch.uint8:
+            board = board.float() / 255.0
+        value = d["evals"][i]
+        label = int(d["moves"][i].item())
+
+        masks_packed = d.get("legal_masks_packed")
+        if masks_packed is not None and self.smoothing > 0:
+            packed = masks_packed[i].numpy()
+            mask = np.unpackbits(packed, count=self.K).astype(bool)
+            n_legal = int(mask.sum())
+            soft = torch.zeros(self.K, dtype=torch.float32)
+            per_legal = self.smoothing / n_legal
+            soft[torch.from_numpy(mask)] = per_legal
+            soft[label] = 1.0 - self.smoothing + per_legal
+        else:
+            soft = torch.full((self.K,), self.smoothing / self.K, dtype=torch.float32)
+            soft[label] = 1.0 - self.smoothing + self.smoothing / self.K
+        return board, value, soft
+
+
 class SelfPlayDataset(Dataset):
     """Self-play dataset: soft policy targets (MCTS visit distribution) +
     value targets (actual game outcomes from each player's perspective)."""
