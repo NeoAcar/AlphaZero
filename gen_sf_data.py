@@ -1,9 +1,8 @@
 """
 Generate sharded supervised dataset: boards + policy targets + Stockfish evals.
 
-Walks each game in mirror-canonical frame (same loop structure as
-optimized_functions.create_nn_input) and calls Stockfish on each position to
-produce an eval aligned 1:1 with the boards.
+Walks each game in mirror-canonical frame and calls Stockfish on each
+position to produce an eval aligned 1:1 with the boards.
 
 Output layout (one directory, sharded files; with multiple workers each
 worker writes into its own subdir):
@@ -21,9 +20,19 @@ worker writes into its own subdir):
 Each shard is a dict with self-contained:
     boards (N,19,8,8) float32
     moves  (N,)       long
-    evals  (N,1)      float32 in [-1, 1]
+    evals  (N,1)      float32 in [-1, 1]   # scalar value target
+    wdls   (N,3)      float32              # (P(W), P(D), P(L)) from Stockfish
+    legal_masks_packed (N, 584) uint8      # bit-packed 4672-wide bool mask
     positions_per_game (G,) int64
     meta (dict)
+
+`wdls` is the raw per-position win/draw/loss probability triple from
+Stockfish's UCI_ShowWDL (SF 14+). It's always stored so the same shards
+can later train a 3-output WDL value head without regenerating data --
+even when the current run uses a single scalar tanh head. When `--formula
+wdl`, `evals` = wdls[:, 0] - wdls[:, 2] (the WDL-derived scalar). When
+`--formula lichess` or `arctan`, `evals` comes from cp+sigmoid; `wdls`
+is still stored for future use.
 
 Streaming design: only ONE shard is held in memory at a time during
 generation, so RAM is bounded regardless of total dataset size.
@@ -33,11 +42,16 @@ subprocess pairs, each handling a contiguous slice of games. This is the
 right way to use CPU when --depth is low (Stockfish's internal threading
 is useless at depth=0; you parallelize at the *game* level instead).
 
-The eval is taken from the player-to-move's perspective and mapped from
-centipawns to [-1, 1] via --formula:
+The scalar value target is taken from the player-to-move's perspective
+and produced via --formula:
 
-    lichess  (DEFAULT)   v = 2 / (1 + exp(-0.00368208 * cp)) - 1
-                         Empirical Lichess WDL fit.
+    wdl      (DEFAULT)   v = P(W) - P(L)   from Stockfish's UCI_ShowWDL.
+                         Position-aware (Stockfish's own win-rate model);
+                         strictly better calibration than cp+sigmoid.
+                         Requires Stockfish 14+ with UCI_ShowWDL support.
+
+    lichess              v = 2 / (1 + exp(-0.00368208 * cp)) - 1
+                         Empirical Lichess WDL fit. Position-agnostic.
 
     arctan               v = 0.64017665102 * atan(0.89513781885 * cp/100)
                          Older hand-tuned approximation.
@@ -67,7 +81,7 @@ import numpy as np
 import torch
 from tqdm import tqdm  # type: ignore
 
-import optimized_functions as f
+from alphazero import utils as f
 
 
 def lichess_sigmoid(cp: float) -> float:
@@ -78,17 +92,38 @@ def arctan_sigmoid(cp: float) -> float:
     return f.centipawn_to_prob(cp / 100.0)
 
 
-FORMULAS = {
+CP_FORMULAS = {
     "lichess": lichess_sigmoid,
     "arctan": arctan_sigmoid,
 }
+FORMULA_CHOICES = ["wdl", *CP_FORMULAS.keys()]
+NAN_WDL = (float("nan"), float("nan"), float("nan"))
 
 
-def safe_eval(engine, board, limit, engine_path, configure_kwargs, formula):
+def normalize_wdl(wdl_obj) -> tuple[float, float, float]:
+    """Stockfish Wdl (ints summing to ~1000) → (P(W), P(D), P(L)) in [0, 1]."""
+    total = wdl_obj.wins + wdl_obj.draws + wdl_obj.losses
+    if total <= 0:
+        return (0.0, 1.0, 0.0)
+    return (wdl_obj.wins / total, wdl_obj.draws / total, wdl_obj.losses / total)
+
+
+def safe_eval(engine, board, limit, engine_path, configure_kwargs, formula_name):
+    """Returns (value, wdl_tuple, engine, failed). wdl_tuple is (w, d, l) ∈ [0,1]."""
     try:
         info = engine.analyse(board, limit)
-        cp = info["score"].pov(board.turn).score(mate_score=100000)
-        return formula(cp), engine, False
+        wdl_raw = info.get("wdl")
+        wdl = normalize_wdl(wdl_raw.pov(board.turn)) if wdl_raw is not None else NAN_WDL
+        if formula_name == "wdl":
+            if wdl_raw is None:
+                raise RuntimeError(
+                    "--formula wdl requires Stockfish with UCI_ShowWDL (SF 14+)"
+                )
+            value = wdl[0] - wdl[2]
+        else:
+            cp = info["score"].pov(board.turn).score(mate_score=100000)
+            value = CP_FORMULAS[formula_name](cp)
+        return value, wdl, engine, False
     except (chess.engine.EngineError, chess.engine.EngineTerminatedError, BrokenPipeError):
         try:
             engine.quit()
@@ -100,21 +135,32 @@ def safe_eval(engine, board, limit, engine_path, configure_kwargs, formula):
                 engine.configure(configure_kwargs)
             except Exception:
                 pass
-        return 0.0, engine, True
+        return 0.0, (0.0, 1.0, 0.0), engine, True
 
 
-def save_shard(output_dir, shard_idx, boards, moves, evals, positions_per_game, meta):
-    boards_t = torch.from_numpy(np.stack(boards))
+def save_shard(output_dir, shard_idx, boards, moves, evals, wdls, legal_masks,
+               positions_per_game, meta):
+    # boards and legal_masks arrive pre-quantized/packed (uint8) -- the workers
+    # do this at append-time to keep per-shard memory low. See process_chunk.
+    boards_t = torch.from_numpy(np.stack(boards))                    # (N, 19, 8, 8) uint8
     moves_t = torch.tensor(moves, dtype=torch.long)
     evals_t = torch.tensor(evals, dtype=torch.float32).reshape(-1, 1)
+    wdls_t = torch.tensor(wdls, dtype=torch.float32)                  # (N, 3)
+    masks_packed = torch.from_numpy(np.stack(legal_masks))            # (N, 584) uint8
+    shard_meta = dict(meta)
+    shard_meta.setdefault("boards_dtype", "uint8")
+    shard_meta.setdefault("boards_scale", 255)
+    shard_meta.setdefault("action_space", 4672)
     path = os.path.join(output_dir, f"shard_{shard_idx:04d}.pt")
     tmp = path + ".tmp"
     torch.save({
         "boards": boards_t,
         "moves": moves_t,
         "evals": evals_t,
+        "wdls": wdls_t,
+        "legal_masks_packed": masks_packed,
         "positions_per_game": np.asarray(positions_per_game, dtype=np.int64),
-        "meta": meta,
+        "meta": shard_meta,
     }, tmp)
     os.replace(tmp, path)
 
@@ -157,17 +203,36 @@ def process_chunk(cfg: dict) -> dict:
         resumed = 0
 
     configure_kwargs = {"Threads": cfg["threads"], "Hash": cfg["hash_mb"]}
-    formula = FORMULAS[cfg["formula"]]
+    formula_name = cfg["formula"]
     engine = chess.engine.SimpleEngine.popen_uci(cfg["engine"])
     try:
         engine.configure(configure_kwargs)
     except chess.engine.EngineError:
         pass
+    # Enable WDL output. Required when --formula wdl; harmless (just makes the
+    # field available) otherwise. Add to configure_kwargs so engine restarts
+    # re-enable it.
+    try:
+        engine.configure({"UCI_ShowWDL": True})
+        configure_kwargs["UCI_ShowWDL"] = True
+    except chess.engine.EngineError:
+        if formula_name == "wdl":
+            print(f"[worker {cfg.get('worker_id', 0)}] FATAL: Stockfish at "
+                  f"{cfg['engine']} doesn't support UCI_ShowWDL; can't use "
+                  f"--formula wdl. Use a newer Stockfish (14+) or pick "
+                  f"--formula lichess.", flush=True)
+            try:
+                engine.quit()
+            except Exception:
+                pass
+            return {"games": 0, "positions": 0, "shards": 0, "failures": 0}
     limit = chess.engine.Limit(depth=cfg["depth"])
 
     shard_boards: list[np.ndarray] = []
     shard_moves: list[int] = []
     shard_evals: list[float] = []
+    shard_wdls: list[tuple[float, float, float]] = []
+    shard_masks: list[np.ndarray] = []
     shard_ppg: list[int] = []
     shard_games_done = 0
 
@@ -228,17 +293,24 @@ def process_chunk(cfg: dict) -> dict:
 
             for move_counter, move in enumerate(game.mainline_moves()):
                 move_str = move.uci()
-                val, engine, failed = safe_eval(
-                    engine, real_board, limit, cfg["engine"], configure_kwargs, formula
+                val, wdl, engine, failed = safe_eval(
+                    engine, real_board, limit, cfg["engine"], configure_kwargs,
+                    formula_name,
                 )
                 if failed:
                     total_failures += 1
 
-                shard_boards.append(f.board_to_matrix(mirror_board, move_counter))
+                # Quantize to uint8 and bit-pack the mask immediately, so per-shard
+                # accumulation memory stays ~5x smaller (uint8 boards + packed
+                # masks instead of float32 + bool arrays in Python lists).
+                b = f.board_to_matrix(mirror_board, move_counter)
+                shard_boards.append((np.clip(b, 0.0, 1.0) * 255.0).round().astype(np.uint8))
+                shard_masks.append(np.packbits(f.legal_mask(mirror_board)))
                 mover_was_white = (move_counter % 2 == 0)
                 mir_move_str = move_str if mover_was_white else f.mirror_move(move_str)
                 shard_moves.append(f.move_to_alphazero(mir_move_str))
                 shard_evals.append(val)
+                shard_wdls.append(wdl)
 
                 real_board.push(move)
                 mirror_board.push_uci(mir_move_str)
@@ -268,8 +340,10 @@ def process_chunk(cfg: dict) -> dict:
 
             if shard_games_done >= cfg["shard_games"]:
                 save_shard(output_dir, shard_idx, shard_boards, shard_moves,
-                           shard_evals, shard_ppg, shard_meta)
-                shard_boards, shard_moves, shard_evals, shard_ppg = [], [], [], []
+                           shard_evals, shard_wdls, shard_masks, shard_ppg,
+                           shard_meta)
+                shard_boards, shard_moves, shard_evals, shard_wdls = [], [], [], []
+                shard_masks, shard_ppg = [], []
                 shard_games_done = 0
                 shard_idx += 1
 
@@ -278,7 +352,7 @@ def process_chunk(cfg: dict) -> dict:
 
     if shard_games_done > 0:
         save_shard(output_dir, shard_idx, shard_boards, shard_moves,
-                   shard_evals, shard_ppg, shard_meta)
+                   shard_evals, shard_wdls, shard_masks, shard_ppg, shard_meta)
         shard_idx += 1
 
     try:
@@ -303,7 +377,7 @@ def main() -> None:
     p.add_argument("--max-games", type=int, default=None,
                    help="max games to process across all workers (default: count PGN)")
     p.add_argument("--depth", type=int, default=0)
-    p.add_argument("--engine", default="stockfish")
+    p.add_argument("--engine", default=os.path.expanduser("~/bin/stockfish18"))
     p.add_argument("--threads", type=int, default=None,
                    help="Stockfish UCI Threads option per worker. Default: 1 if --workers>1 else 4.")
     p.add_argument("--hash-mb", type=int, default=128)
@@ -311,7 +385,7 @@ def main() -> None:
     p.add_argument("--shard-games", type=int, default=5000)
     p.add_argument("--workers", type=int, default=1,
                    help="parallel worker processes (default: 1)")
-    p.add_argument("--formula", choices=list(FORMULAS), default="lichess")
+    p.add_argument("--formula", choices=FORMULA_CHOICES, default="wdl")
     p.add_argument("--output-dir", required=True)
     cli = p.parse_args()
 

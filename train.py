@@ -17,21 +17,16 @@ except ImportError:
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
 
-import optimized_functions as f
-from dataset import ChessDataset, SelfPlayDataset
-from resnet import ResNet
+from alphazero.dataset import ChessDataset, SelfPlayDataset
+from alphazero.nn import ResNet
 
 
 def parse_args() -> dict:
     p = argparse.ArgumentParser(description="AlphaZero supervised pre-training on Lichess + Stockfish")
     p.add_argument("--config", default="train_config.json",
                    help="JSON config file. Any --flag below overrides its value.")
-    p.add_argument("--games-path", help="path to .pgn file (legacy single-file mode)")
-    p.add_argument("--evals-path", help="path to .npy stockfish-eval file (legacy single-file mode)")
-    p.add_argument("--shards-dir", help="directory of shard_NNNN.pt files from gen_sf_data.py "
-                   "(takes priority over --games-path/--evals-path if set)")
+    p.add_argument("--shards-dir", help="directory of shard_NNNN.pt files from gen_sf_data.py")
     p.add_argument("--max-shards", type=int, help="when using --shards-dir, cap how many shards to load")
-    p.add_argument("--max-games", type=int, help="number of games to load from the pgn (legacy mode only)")
     p.add_argument("--epochs", type=int, help="number of training epochs")
     p.add_argument("--batch-size", type=int)
     p.add_argument("--learning-rate", type=float)
@@ -41,6 +36,9 @@ def parse_args() -> dict:
                    help="cross-entropy label smoothing factor (e.g. 0.1)")
     p.add_argument("--checkpoint-dir", help="directory for model checkpoints")
     p.add_argument("--log-dir", help="directory for plain-text logs")
+    p.add_argument("--vals-per-epoch", type=int, default=1,
+                   help="how many validation passes to run per epoch (default: 1, "
+                        "evenly spaced; the last one lands at the end of the epoch)")
     p.add_argument("--wandb-project", help="wandb project name; if unset, wandb is disabled")
     p.add_argument("--wandb-group", help="wandb group (for grouping runs from runner.py)")
     p.add_argument("--wandb-name", help="wandb run name")
@@ -73,12 +71,10 @@ def parse_args() -> dict:
     cfg.setdefault("wandb_name", None)
     cfg.setdefault("shards_dir", None)
     cfg.setdefault("max_shards", None)
+    cfg.setdefault("vals_per_epoch", 1)
 
     # CLI overrides (only when explicitly given).
     overrides = {
-        "games_path": cli.games_path,
-        "evals_path": cli.evals_path,
-        "max_games": cli.max_games,
         "epochs": cli.epochs,
         "batch_size": cli.batch_size,
         "learning_rate": cli.learning_rate,
@@ -97,6 +93,7 @@ def parse_args() -> dict:
         "wandb_name": cli.wandb_name,
         "shards_dir": cli.shards_dir,
         "max_shards": cli.max_shards,
+        "vals_per_epoch": cli.vals_per_epoch,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -114,9 +111,6 @@ class Train:
         self.log_step = args["log_step"]
         self.epochs = args["epochs"]
         self.batch_size = args["batch_size"]
-        self.games_path = args["games_path"]
-        self.evals_path = args["evals_path"]
-        self.max_games = args["max_games"]
         self.label_smoothing = args["label_smoothing"]
         self.checkpoint_dir = args["checkpoint_dir"]
         self.log_dir = args["log_dir"]
@@ -128,6 +122,7 @@ class Train:
         self.wandb_name = args.get("wandb_name")
         self.shards_dir = args.get("shards_dir")
         self.max_shards = args.get("max_shards")
+        self.vals_per_epoch = int(args.get("vals_per_epoch", 1) or 1)
         # Resolve data_mix default
         mix = args.get("data_mix")
         if mix is None:
@@ -156,10 +151,11 @@ class Train:
         val_dataset = None
 
         if self.data_mix in ("supervised", "both"):
-            if self.shards_dir:
-                sup_train, sup_val = self._load_sharded_split()
-            else:
-                sup_train, sup_val = self._load_supervised_split()
+            if not self.shards_dir:
+                raise RuntimeError(
+                    "Supervised data requires --shards-dir pointing at gen_sf_data.py output."
+                )
+            sup_train, sup_val = self._load_sharded_split()
             train_datasets.append(sup_train)
             val_dataset = sup_val
 
@@ -205,12 +201,18 @@ class Train:
         all_boards = []
         all_moves = []
         all_evals = []
+        all_masks = []
         all_ppg = []
+        any_missing_masks = False
         for sp in shard_paths:
             d = torch.load(sp, map_location="cpu", weights_only=False)
             all_boards.append(d["boards"])
             all_moves.append(d["moves"])
             all_evals.append(d["evals"])
+            if "legal_masks_packed" in d:
+                all_masks.append(d["legal_masks_packed"])
+            else:
+                any_missing_masks = True
             all_ppg.append(d["positions_per_game"])
             print(f"  {sp.name}: {len(d['boards'])} positions, {len(d['positions_per_game'])} games")
 
@@ -218,6 +220,12 @@ class Train:
         moves = torch.cat(all_moves, dim=0)
         evals = torch.cat(all_evals, dim=0)
         evals = torch.clamp(evals, -1.0, 1.0)
+        if any_missing_masks:
+            print("  WARN: some shards lack 'legal_masks_packed' -- "
+                  "label smoothing will spread over all 4672 indices for this run.")
+            legal_masks_packed = None
+        else:
+            legal_masks_packed = torch.cat(all_masks, dim=0) if all_masks else None
         positions_per_game = np.concatenate(all_ppg)
         n_games = len(positions_per_game)
         n_positions = int(positions_per_game.sum())
@@ -238,57 +246,14 @@ class Train:
         print(f"Sharded supervised: {n_train_games} train / {n_val_games} val games "
               f"({int(train_mask.sum())} / {int(val_mask.sum())} positions).")
 
+        train_masks_packed = legal_masks_packed[train_mask] if legal_masks_packed is not None else None
+        val_masks_packed = legal_masks_packed[val_mask] if legal_masks_packed is not None else None
         train_ds = ChessDataset(boards[train_mask], evals[train_mask], moves[train_mask],
-                                label_smoothing=self.label_smoothing)
+                                label_smoothing=self.label_smoothing,
+                                legal_masks_packed=train_masks_packed)
         val_ds = ChessDataset(boards[val_mask], evals[val_mask], moves[val_mask],
-                              label_smoothing=self.label_smoothing)
-        return train_ds, val_ds
-
-    def _load_supervised_split(self) -> tuple[ChessDataset, ChessDataset]:
-        games = f.load_pgn(self.games_path, self.max_games)
-        boards, moves, _ = f.create_nn_input(games)
-        evals = np.load(self.evals_path)
-        evals = np.clip(np.asarray(evals, dtype=np.float32), -1.0, 1.0).reshape(-1, 1)
-        evals = torch.tensor(evals, dtype=torch.float32)
-
-        positions_per_game = np.array(
-            [sum(1 for _ in g.mainline_moves()) for g in games], dtype=np.int64
-        )
-        cumsum = np.cumsum(positions_per_game)
-        n_evals = len(evals)
-        games_covered = int(np.searchsorted(cumsum, n_evals, side="right"))
-        if games_covered > 0 and cumsum[games_covered - 1] > n_evals:
-            games_covered -= 1
-        n_effective = int(cumsum[games_covered - 1]) if games_covered > 0 else 0
-        if n_effective == 0:
-            raise RuntimeError("Eval file is too short to cover even one game.")
-        if n_effective < len(boards):
-            print(f"Eval file covers {games_covered} games ({n_effective} positions); "
-                  f"dropping {len(games) - games_covered} games / "
-                  f"{len(boards) - n_effective} positions from the tail.")
-        boards = boards[:n_effective]
-        moves = moves[:n_effective]
-        evals = evals[:n_effective]
-        positions_per_game = positions_per_game[:games_covered]
-
-        rng = np.random.RandomState(self.split_seed)
-        shuffled = rng.permutation(games_covered)
-        n_val_games = max(1, int(round(games_covered * self.val_fraction)))
-        val_game_idx = np.zeros(games_covered, dtype=bool)
-        val_game_idx[shuffled[:n_val_games]] = True
-
-        per_pos_is_val = np.repeat(val_game_idx, positions_per_game)
-        val_mask = torch.from_numpy(per_pos_is_val)
-        train_mask = ~val_mask
-
-        n_train_games = games_covered - n_val_games
-        print(f"Supervised: {n_train_games} train games / {n_val_games} val games "
-              f"({int(train_mask.sum())} / {int(val_mask.sum())} positions).")
-
-        train_ds = ChessDataset(boards[train_mask], evals[train_mask], moves[train_mask],
-                                label_smoothing=self.label_smoothing)
-        val_ds = ChessDataset(boards[val_mask], evals[val_mask], moves[val_mask],
-                              label_smoothing=self.label_smoothing)
+                              label_smoothing=self.label_smoothing,
+                              legal_masks_packed=val_masks_packed)
         return train_ds, val_ds
 
     @staticmethod
@@ -364,7 +329,51 @@ class Train:
         val_combined_history = []
         val_ce_history = []
         val_mse_history = []
+        latest_val_dict: dict | None = None
         iters = 0
+
+        def run_validation(label: str, epoch_one_idx: int, fraction: float) -> dict | None:
+            """Run one val pass, log to wandb, save best-by-metric checkpoints.
+            `fraction` is how far through the current epoch we are (1.0 = end)."""
+            if val_loader is None:
+                return None
+            v = self.evaluate(val_loader, criterion_mse)
+            val_combined_history.append(v["loss"])
+            val_ce_history.append(v["ce"])
+            val_mse_history.append(v["mse"])
+            if use_wandb:
+                wandb.log({
+                    "val/loss": v["loss"],
+                    "val/value_mse": v["mse"],
+                    "val/policy_ce": v["ce"],
+                    "val/accuracy": v["acc"],
+                    "val/epoch_progress": epoch_one_idx - 1 + fraction,
+                    "val/global_step": iters,
+                })
+            # Snapshot the model under best-by-metric (uses the same payload schema
+            # as the end-of-epoch save -- safe because we're in a contiguous train).
+            payload = {
+                "epoch": epoch_one_idx,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "val_loss": v["loss"], "val_mse": v["mse"],
+                "val_ce": v["ce"], "val_acc": v["acc"],
+                "label_smoothing": self.label_smoothing,
+                "val_label": label,
+            }
+            if v["loss"] == min(val_combined_history):
+                torch.save(payload, os.path.join(self.checkpoint_dir, "model_best_combined.pth"))
+                print(f"  -> [{label}] new best combined val_loss {v['loss']:.4f}")
+            if v["ce"] == min(val_ce_history):
+                torch.save(payload, os.path.join(self.checkpoint_dir, "model_best_policy.pth"))
+                print(f"  -> [{label}] new best val CE {v['ce']:.4f}")
+            if v["mse"] == min(val_mse_history):
+                torch.save(payload, os.path.join(self.checkpoint_dir, "model_best_value.pth"))
+                print(f"  -> [{label}] new best val MSE {v['mse']:.4f}")
+            # Restore train mode for the loop to continue.
+            self.model.train()
+            return v
+
         for epoch in range(self.epochs):
             lr = self.optimizer.param_groups[0]["lr"]
             self.model.train()
@@ -374,7 +383,18 @@ class Train:
             correct = 0
             total = 1
 
-            for data, labels_mse, labels_ce in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{self.epochs}"):
+            n_batches = len(train_loader)
+            # Evenly spaced val triggers within the epoch. The Nth trigger lands
+            # on the last batch (so end-of-epoch val is implicit). vals_per_epoch=1
+            # reproduces the old behaviour exactly.
+            vpe = max(1, self.vals_per_epoch)
+            val_trigger_batches = set(
+                max(1, (i + 1) * n_batches // vpe) - 1 for i in range(vpe)
+            )
+
+            for batch_idx, (data, labels_mse, labels_ce) in enumerate(
+                tqdm(train_loader, desc=f"Epoch {epoch + 1}/{self.epochs}")
+            ):
                 data = data.to(self.device)
                 labels_mse = labels_mse.to(self.device)
                 labels_ce = labels_ce.to(self.device)
@@ -408,13 +428,26 @@ class Train:
                         })
                 iters += 1
 
-            n_batches = len(train_loader)
+                if batch_idx in val_trigger_batches and val_loader is not None:
+                    fraction = (batch_idx + 1) / n_batches
+                    label = f"epoch{epoch+1}_val{sorted(val_trigger_batches).index(batch_idx)+1}of{vpe}"
+                    val_intra = run_validation(label, epoch + 1, fraction)
+                    if val_intra is not None:
+                        latest_val_dict = val_intra
+                        print(f"  [{label} @ {fraction*100:.0f}%] "
+                              f"val: loss {val_intra['loss']:.4f} "
+                              f"mse {val_intra['mse']:.4f} "
+                              f"ce {val_intra['ce']:.4f} "
+                              f"acc {val_intra['acc']:.2f}%")
+
             train_loss = running_loss / n_batches
             train_mse = running_mse_loss / n_batches
             train_ce = running_ce_loss / n_batches
             train_acc = 100.0 * correct / total
 
-            val = self.evaluate(val_loader, criterion_mse) if val_loader is not None else None
+            # The end-of-epoch val was already run by the trigger landing on
+            # the final batch; `latest_val_dict` holds its full result.
+            val = latest_val_dict if (val_loader is not None and latest_val_dict) else None
 
             if use_wandb:
                 ep_log = {
@@ -429,13 +462,8 @@ class Train:
                         "epoch/val_loss": val["loss"],
                         "epoch/val_value_mse": val["mse"],
                         "epoch/val_policy_ce": val["ce"],
-                        "epoch/val_accuracy": val["acc"],
                     })
                 wandb.log(ep_log)
-            if val is not None:
-                val_combined_history.append(val["loss"])
-                val_ce_history.append(val["ce"])
-                val_mse_history.append(val["mse"])
 
             train_part = (f"train: loss {train_loss:.4f} mse {train_mse:.4f} "
                           f"ce {train_ce:.4f} acc {train_acc:.2f}%")
@@ -465,20 +493,9 @@ class Train:
             }
             last_path = os.path.join(self.checkpoint_dir, "model_last.pth")
             torch.save(payload, last_path)
-
-            if val is not None:
-                if val_combined_history[-1] == min(val_combined_history):
-                    best_path = os.path.join(self.checkpoint_dir, "model_best_combined.pth")
-                    torch.save(payload, best_path)
-                    print(f"  -> new best combined val_loss, saved {best_path}")
-                if val_ce_history[-1] == min(val_ce_history):
-                    best_path = os.path.join(self.checkpoint_dir, "model_best_policy.pth")
-                    torch.save(payload, best_path)
-                    print(f"  -> new best val CE, saved {best_path}")
-                if val_mse_history[-1] == min(val_mse_history):
-                    best_path = os.path.join(self.checkpoint_dir, "model_best_value.pth")
-                    torch.save(payload, best_path)
-                    print(f"  -> new best val MSE, saved {best_path}")
+            # Note: best-by-val-metric checkpoints are saved inside
+            # run_validation(), which is called by every trigger (including the
+            # end-of-epoch trigger), so no separate save needed here.
 
         if use_wandb:
             wandb.finish()

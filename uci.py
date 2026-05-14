@@ -25,20 +25,19 @@ bot always thinks for the configured number of simulations. Add
 time-aware behaviour later if you want clocked games.
 """
 import contextlib
-import math
 import sys
-import threading
 import traceback
-from pathlib import Path
-from typing import Iterable
 
 import chess
 import numpy as np
 import torch
 
-import optimized_functions as f
-from mcts import MCTS
-from resnet import ResNet
+from alphazero import utils as f
+from alphazero.mcts import MCTS
+from alphazero.nn import ResNet
+
+
+torch.set_float32_matmul_precision("high")
 
 
 ENGINE_NAME = "AlphaZeroBot"
@@ -58,8 +57,8 @@ def send(msg: str) -> None:
 
 class UciEngine:
     DEFAULT_OPTS = {
-        "Checkpoint": "models/model_best.pth",
-        "Sims": 200,
+        "Checkpoint": "models/model_5.pth",
+        "Sims": 300,
         "Temperature": 0.0,
         "TempMoves": 0,
         "DirichletEps": 0.0,
@@ -100,6 +99,13 @@ class UciEngine:
         state = torch.load(ckpt, map_location=self.device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         model.eval()
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            with torch.no_grad():
+                _ = model(torch.zeros(1, 19, 8, 8, device=self.device))
+            log("torch.compile + warm-up done")
+        except Exception as e:
+            log(f"torch.compile skipped: {e}")
         self.model = model
         self.loaded_checkpoint = ckpt
         self._refresh_mcts()
@@ -244,6 +250,10 @@ class UciEngine:
             else:
                 send("bestmove 0000")
             return
+
+        if getattr(self.mcts, "last_was_proven_mate", False):
+            send("info string proven forced mate")
+            log("proven forced mate")
 
         action = self._select_action(probs)
         mir_uci = f.alphazero_to_move(action, self.mirror_state)

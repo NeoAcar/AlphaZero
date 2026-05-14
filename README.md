@@ -5,11 +5,21 @@ This project is an implementation based on the AlphaZero paper, featuring a bot 
 
 ## File Structure
 
-- **`train.py`**: Script responsible for training the model according to a configuration file.
-- **`function.py`**: Contains various utility functions used across the project.
-- **`main.py`**: Runs the bot, allowing it to play games against itself using the MCTS algorithm.
-- **`mcts.py`**: Implements the Monte Carlo Tree Search (MCTS) algorithm.
-- **`resnet.py`**: Contains the ResNet architecture used for the model.
+- **`train.py`**: Trains the model from a config file + sharded supervised data.
+- **`gen_sf_data.py`**: Builds Stockfish-labelled training shards from a PGN.
+- **`selfplay.py`**: Generates self-play games for AlphaZero-style training.
+- **`runner.py`**: Orchestrates the self-play → train → match-gate loop.
+- **`match.py`**: Plays two players against each other (any combination of NN/MCTS/Stockfish/baselines).
+- **`play.py`**: Local terminal UI for human vs bot or bot vs bot.
+- **`uci.py`**: UCI protocol wrapper so any chess GUI (or lichess-bot) can drive the engine.
+- **`alphazero/`**: Library package.
+  - **`mcts.py` / `batched_mcts.py`**: Sequential and batched MCTS.
+  - **`resnet.py`**: ResNet body + policy/value heads.
+  - **`utils.py`**: Board / move / policy encoding helpers.
+  - **`dataset.py`**: PyTorch datasets for supervised shards and self-play `.pt` files.
+  - **`players.py`**: Player abstractions (random / piece_value / value_only / policy_only / mcts / stockfish) used by `match.py` and `runner.py`.
+
+See `CLAUDE.md` for conventions (mirror-canonical state, 4672 action space, value perspective, proven-value semantics) and `RECIPE.md` for the comparison vs the AlphaGo Zero / AlphaZero papers.
 
 ## Model Weights and Training Data
 Due to the large size of the model, Lichess games, and evaluation result files (over 25MB), they are not included in this repository. You can download them from the following link:

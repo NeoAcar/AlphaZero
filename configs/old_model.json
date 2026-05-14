@@ -1,12 +1,13 @@
 {
-    "type": "mcts",
-    "checkpoint": "models/model_epoch_10.pth",
+    "type": "value_only",
+    "checkpoint": "models/model_sf2000lsf7.pth",
     "num_simulation": 200,
+    "discount": 1,
     "c_init": 1.25,
     "c_base": 19652,
-    "dirichlet_epsilon": 0.0,
+    "dirichlet_epsilon": 0.25,
     "dirichlet_alpha": 0.3,
     "t": 1,
-    "temperature_moves": 20,
+    "temperature_moves": 15,
     "temperature": 1.0
 }

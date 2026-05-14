@@ -10,6 +10,7 @@ Player types
 random        no NN, no eval -- uniform random over legal moves
 piece_value   no NN -- classical piece value sum, picks best
 value_only    NN value head only (one-ply lookahead), no policy / MCTS
+policy_only   NN policy head only (argmax over legal moves), no MCTS
 mcts          full MCTS + policy + value
 stockfish     external UCI engine
 
@@ -26,9 +27,11 @@ import chess.engine
 import numpy as np
 import torch
 
-import optimized_functions as f
-from mcts import MCTS
-from resnet import ResNet
+torch.set_float32_matmul_precision("high")
+
+from . import utils as f
+from .mcts import MCTS
+from .nn import ResNet
 
 
 PIECE_VALUES = {
@@ -40,6 +43,18 @@ PIECE_VALUES = {
     chess.KING: 0.0,
 }
 INF = 1e9
+
+DEFAULT_MCTS_ARGS = {
+    "num_simulation": 200,
+    "truncation": 200,
+    "c_base": 19652,
+    "c_init": 1.25,
+    "dirichlet_epsilon": 0.0,
+    "dirichlet_alpha": 0.3,
+    "memory_size": 1000,
+    "action_space": 4672,
+    "t": 1,
+}
 
 
 class Player(Protocol):
@@ -143,6 +158,10 @@ class ValueOnlyPlayer:
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
+        try:
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+        except Exception:
+            pass
 
     @torch.no_grad()
     def _batch_values(self, mirrored_states: list[chess.Board], move_counter: int) -> np.ndarray:
@@ -184,6 +203,41 @@ class ValueOnlyPlayer:
     def close(self): pass
 
 
+class PolicyOnlyPlayer:
+    """Use the NN policy head only -- one forward pass per move, argmax over
+    legal-move probabilities. No lookahead, no MCTS."""
+    name = "policy_only"
+
+    def __init__(self, cfg: dict):
+        if "checkpoint" not in cfg:
+            raise ValueError("policy_only config needs 'checkpoint'")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = ResNet().to(self.device)
+        state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
+        self.model.load_state_dict(state["model_state_dict"])
+        self.model.eval()
+        try:
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            with torch.no_grad():
+                _ = self.model(torch.zeros(1, 19, 8, 8, device=self.device))
+        except Exception:
+            pass
+
+    @torch.no_grad()
+    def select_move(self, real_board, mirrored_state, move_counter):
+        inputs = f.prepare_input(mirrored_state, move_counter).unsqueeze(0).to(self.device)
+        _value, policy_logits = self.model(inputs)
+        mask = torch.from_numpy(f.legal_mask(mirrored_state)).to(self.device)
+        masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
+        policy = torch.softmax(masked_logits, dim=0).cpu().numpy()
+        action = int(np.argmax(policy))
+        mir_uci = f.alphazero_to_move(action, mirrored_state)
+        return _to_real(mir_uci, real_board.turn), mir_uci
+
+    def reset(self): pass
+    def close(self): pass
+
+
 class MctsPlayer:
     """MCTS-driven player.
 
@@ -198,7 +252,6 @@ class MctsPlayer:
     name = "mcts"
 
     def __init__(self, cfg: dict):
-        from match import DEFAULT_MCTS_ARGS
         if "checkpoint" not in cfg:
             raise ValueError("mcts config needs 'checkpoint'")
         args = dict(DEFAULT_MCTS_ARGS)
@@ -209,7 +262,29 @@ class MctsPlayer:
         state = torch.load(args["checkpoint"], map_location=args["device"], weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
-        self.mcts = MCTS(args, self.model)
+
+        # Optional optimizations. compile is on by default; batched is opt-in.
+        use_compile = bool(cfg.get("compile", True))
+        use_batched = bool(cfg.get("batched", False))
+        batch_size = int(cfg.get("batch_size", 8))
+
+        if use_compile:
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                warm_bs = batch_size if use_batched else 1
+                with torch.no_grad():
+                    _ = self.model(torch.zeros(warm_bs, 19, 8, 8, device=args["device"]))
+                    if use_batched and warm_bs != 1:
+                        _ = self.model(torch.zeros(1, 19, 8, 8, device=args["device"]))
+            except Exception:
+                pass
+
+        if use_batched:
+            from .batched_mcts import BatchedMCTS
+            args["batch_size"] = batch_size
+            self.mcts = BatchedMCTS(args, self.model)
+        else:
+            self.mcts = MCTS(args, self.model)
         self.args = args
 
         self.temperature_moves = int(cfg.get("temperature_moves", 0))
@@ -229,6 +304,9 @@ class MctsPlayer:
 
     def select_move(self, real_board, mirrored_state, move_counter):
         probs = self.mcts.search(mirrored_state, move_counter)
+        depth = getattr(self.mcts, "last_max_depth", 0)
+        name = getattr(self, "display_name", self.name)
+        print(f"  [{name}] max_depth {depth}", flush=True)
         if move_counter < self.temperature_moves:
             action = self._sample_action(probs)
         else:
@@ -282,6 +360,7 @@ PLAYER_TYPES = {
     "random": RandomPlayer,
     "piece_value": PieceValuePlayer,
     "value_only": ValueOnlyPlayer,
+    "policy_only": PolicyOnlyPlayer,
     "mcts": MctsPlayer,
     "stockfish": StockfishPlayer,
 }

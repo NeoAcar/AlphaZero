@@ -160,7 +160,7 @@ def main() -> None:
     else:
         # No checkpoint given -- create a fresh, randomly-initialised ResNet.
         import torch
-        from resnet import ResNet
+        from alphazero.nn import ResNet
         m = ResNet()
         torch.save({"model_state_dict": m.state_dict()}, best_path)
         print(f"Seeded best with fresh random ResNet ({sum(p.numel() for p in m.parameters())} params) -> {best_path}")

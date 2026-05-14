@@ -2,7 +2,7 @@
     "type": "stockfish",
     "binary": "stockfish",
     "skill_level": null,
-    "elo": 1500,
+    "elo": 2000,
     "limit_strength": true,
     "depth": null,
     "time_ms": null

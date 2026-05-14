@@ -18,25 +18,35 @@ import chess.pgn
 import numpy as np
 import torch
 
-import optimized_functions as f
-from players import load_player
+from alphazero import utils as f
+from alphazero.players import load_player
 
 
-DEFAULT_MCTS_ARGS = {
-    "num_simulation": 200,
-    "truncation": 200,
-    "c_base": 19652,
-    "c_init": 1.25,
-    "dirichlet_epsilon": 0.0,
-    "dirichlet_alpha": 0.3,
-    "memory_size": 1000,
-    "action_space": 4672,
-    "t": 1,
-}
+def termination_reason(board: chess.Board, move_counter: int, truncation: int) -> str:
+    """Identify why the game ended. Truncation takes priority because the
+    real_board may not actually be terminal under chess rules."""
+    if move_counter >= truncation:
+        return "truncation"
+    if board.is_checkmate():
+        return "checkmate"
+    if board.is_stalemate():
+        return "stalemate"
+    if board.is_insufficient_material():
+        return "insufficient_material"
+    if board.is_fivefold_repetition():
+        return "5-fold_repetition"
+    if board.is_seventyfive_moves():
+        return "75-move_rule"
+    if board.can_claim_threefold_repetition():
+        return "3-fold_repetition"
+    if board.can_claim_fifty_moves():
+        return "50-move_rule"
+    return "unknown"
 
 
-def play_game(p1, p2, p1_color: chess.Color, truncation: int) -> tuple[int, chess.Board]:
-    """Returns (result_for_p1, final_board). +1 win, -1 loss, 0 draw."""
+def play_game(p1, p2, p1_color: chess.Color, truncation: int) -> tuple[int, chess.Board, str]:
+    """Returns (result_for_p1, final_board, termination_reason).
+    result: +1 win, -1 loss, 0 draw."""
     p1.reset()
     p2.reset()
 
@@ -52,10 +62,11 @@ def play_game(p1, p2, p1_color: chess.Color, truncation: int) -> tuple[int, ches
         mirrored_state = mirrored_state.mirror()
         move_counter += 1
 
+    reason = termination_reason(real_board, move_counter, truncation)
     if real_board.is_checkmate():
         loser_color = real_board.turn
-        return (+1 if loser_color != p1_color else -1), real_board
-    return 0, real_board
+        return (+1 if loser_color != p1_color else -1), real_board, reason
+    return 0, real_board, reason
 
 
 def board_to_pgn(board: chess.Board, p1_color: chess.Color, result_for_p1: int,
@@ -100,9 +111,11 @@ def main() -> None:
 
     print(f"Loading {cli.p1_name} from {cli.player1}")
     p1 = load_player(cli.player1)
+    p1.display_name = cli.p1_name
     print(f"  type: {p1.name}")
     print(f"Loading {cli.p2_name} from {cli.player2}")
     p2 = load_player(cli.player2)
+    p2.display_name = cli.p2_name
     print(f"  type: {p2.name}")
 
     print(f"\nPlaying {cli.games} games (truncation={cli.truncation}). "
@@ -116,7 +129,7 @@ def main() -> None:
             color_str = "white" if p1_color == chess.WHITE else "black"
 
             t0 = time.time()
-            result, board = play_game(p1, p2, p1_color, cli.truncation)
+            result, board, reason = play_game(p1, p2, p1_color, cli.truncation)
             dt = time.time() - t0
 
             if result > 0:
@@ -128,7 +141,9 @@ def main() -> None:
 
             plies = len(board.move_stack)
             print(f"Game {i+1:>3}/{cli.games}: {cli.p1_name} as {color_str:>5} -> "
-                  f"{tag:<13} {plies:>3} plies ({dt:5.1f}s) | running: {wins}W {draws}D {losses}L")
+                  f"{tag:<13} {plies:>3} plies ({dt:5.1f}s) | {reason:<22} | "
+                  f"running: {wins}W {draws}D {losses}L")
+            print(f"  final FEN: {board.fen()}")
 
             if cli.output:
                 pgns.append(board_to_pgn(board, p1_color, result, cli.p1_name, cli.p2_name))

@@ -1,0 +1,16 @@
+{
+    "type": "mcts",
+    "checkpoint": "models/model_5.pth",
+    "num_simulation": 200,
+    "discount": 1,
+    "c_init": 1.25,
+    "c_base": 19652,
+    "dirichlet_epsilon": 0.1,
+    "dirichlet_alpha": 0.3,
+    "t": 1,
+    "temperature_moves": 1,
+    "temperature": 1.0,
+    "compile": true,
+    "batched": true,
+    "batch_size": 8
+}

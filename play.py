@@ -5,9 +5,9 @@ import time
 import chess
 import torch
 
-import optimized_functions as f
-from mcts import MCTS
-from resnet import ResNet
+from alphazero import utils as f
+from alphazero.mcts import MCTS
+from alphazero.nn import ResNet
 
 
 DEFAULT_ARGS = {
@@ -16,10 +16,9 @@ DEFAULT_ARGS = {
     "c_base": 19652,
     "c_init": 1.25,
     "dirichlet_epsilon": 0.0,
-    "dirichlet_alpha": 0.03,
+    "dirichlet_alpha": 0.3,
     "memory_size": 1000,
     "action_space": 4672,
-    "top_actions": 5,
     "t": 1,
 }
 
@@ -165,7 +164,7 @@ def play_bot_vs_bot(checkpoint: str, sims: int, truncation: int, delay: float) -
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("mode", choices=["human", "bot"], help="human = you vs bot; bot = bot vs bot")
-    p.add_argument("--checkpoint", default="model_epoch_1.pth")
+    p.add_argument("--checkpoint", default="models/model_5.pth")
     p.add_argument("--sims", type=int, default=200, help="MCTS simulations per move")
     p.add_argument("--color", choices=["white", "black"], default="white", help="(human mode) which color you play")
     p.add_argument("--truncation", type=int, default=200, help="max plies before draw")

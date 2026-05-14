@@ -33,9 +33,9 @@ import numpy as np
 import torch
 from tqdm import tqdm  # type: ignore
 
-import optimized_functions as f
-from mcts import MCTS
-from resnet import ResNet
+from alphazero import utils as f
+from alphazero.mcts import MCTS
+from alphazero.nn import ResNet
 
 
 DEFAULT_MCTS_ARGS = {
