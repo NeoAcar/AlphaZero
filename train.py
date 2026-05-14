@@ -216,17 +216,23 @@ class Train:
             all_ppg.append(d["positions_per_game"])
             print(f"  {sp.name}: {len(d['boards'])} positions, {len(d['positions_per_game'])} games")
 
-        boards = torch.cat(all_boards, dim=0)
-        moves = torch.cat(all_moves, dim=0)
-        evals = torch.cat(all_evals, dim=0)
+        # Cat one tensor at a time and free the source list immediately, so we
+        # never hold {per-shard list} + {cat result} in memory simultaneously.
+        # On big runs (17M+ positions, ~30 GB of boards alone) the lazy doubling
+        # during cat + the splitting copies otherwise breach Colab's 85 GB cap.
+        boards = torch.cat(all_boards, dim=0);  del all_boards
+        moves = torch.cat(all_moves, dim=0);    del all_moves
+        evals = torch.cat(all_evals, dim=0);    del all_evals
         evals = torch.clamp(evals, -1.0, 1.0)
         if any_missing_masks:
             print("  WARN: some shards lack 'legal_masks_packed' -- "
                   "label smoothing will spread over all 4672 indices for this run.")
             legal_masks_packed = None
+            del all_masks
         else:
             legal_masks_packed = torch.cat(all_masks, dim=0) if all_masks else None
-        positions_per_game = np.concatenate(all_ppg)
+            del all_masks
+        positions_per_game = np.concatenate(all_ppg);  del all_ppg
         n_games = len(positions_per_game)
         n_positions = int(positions_per_game.sum())
         assert n_positions == len(boards), \
@@ -246,12 +252,24 @@ class Train:
         print(f"Sharded supervised: {n_train_games} train / {n_val_games} val games "
               f"({int(train_mask.sum())} / {int(val_mask.sum())} positions).")
 
-        train_masks_packed = legal_masks_packed[train_mask] if legal_masks_packed is not None else None
-        val_masks_packed = legal_masks_packed[val_mask] if legal_masks_packed is not None else None
-        train_ds = ChessDataset(boards[train_mask], evals[train_mask], moves[train_mask],
+        # Split each tensor train/val, then drop the source immediately. Doing
+        # all four boolean-indexes inline (the previous code) kept `boards`
+        # alive for both the train and val copies, peaking at 3x the boards
+        # tensor size. Pattern below peaks at 2x.
+        train_boards = boards[train_mask]; val_boards = boards[val_mask]; del boards
+        train_moves  = moves[train_mask];  val_moves  = moves[val_mask];  del moves
+        train_evals  = evals[train_mask];  val_evals  = evals[val_mask];  del evals
+        if legal_masks_packed is not None:
+            train_masks_packed = legal_masks_packed[train_mask]
+            val_masks_packed   = legal_masks_packed[val_mask]
+            del legal_masks_packed
+        else:
+            train_masks_packed = val_masks_packed = None
+
+        train_ds = ChessDataset(train_boards, train_evals, train_moves,
                                 label_smoothing=self.label_smoothing,
                                 legal_masks_packed=train_masks_packed)
-        val_ds = ChessDataset(boards[val_mask], evals[val_mask], moves[val_mask],
+        val_ds = ChessDataset(val_boards, val_evals, val_moves,
                               label_smoothing=self.label_smoothing,
                               legal_masks_packed=val_masks_packed)
         return train_ds, val_ds

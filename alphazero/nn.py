@@ -91,7 +91,7 @@ class SEResBlock(nn.Module):
 
     def forward(self, x):
         residual = x
-        out = F.silu(self.bn1(self.conv1(x)))wa
+        out = F.silu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = self.se(out)
         out = out + residual
