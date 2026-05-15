@@ -98,7 +98,7 @@ def main() -> None:
     p.add_argument("--player1", required=True, help="JSON config for player 1")
     p.add_argument("--player2", required=True, help="JSON config for player 2")
     p.add_argument("--games", type=int, default=20)
-    p.add_argument("--truncation", type=int, default=200)
+    p.add_argument("--truncation", type=int, default=300)
     p.add_argument("--output", help="optional multi-game PGN output file")
     p.add_argument("--p1-name", default="p1")
     p.add_argument("--p2-name", default="p2")

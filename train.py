@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
 
 from alphazero.dataset import ChessDataset, SelfPlayDataset
-from alphazero.nn import ResNet
+from alphazero.nn import SEResNet, SEResNetWDL
 
 
 def parse_args() -> dict:
@@ -36,6 +36,9 @@ def parse_args() -> dict:
                    help="cross-entropy label smoothing factor (e.g. 0.1)")
     p.add_argument("--checkpoint-dir", help="directory for model checkpoints")
     p.add_argument("--log-dir", help="directory for plain-text logs")
+    p.add_argument("--value-head", choices=["scalar", "wdl"],
+                   help="value head + target type. 'scalar': SEResNet + MSE on evals "
+                        "(default). 'wdl': SEResNetWDL + soft-CE on wdls (N,3) targets.")
     p.add_argument("--vals-per-epoch", type=int, default=1,
                    help="how many validation passes to run per epoch (default: 1, "
                         "evenly spaced; the last one lands at the end of the epoch)")
@@ -71,6 +74,7 @@ def parse_args() -> dict:
     cfg.setdefault("wandb_name", None)
     cfg.setdefault("shards_dir", None)
     cfg.setdefault("max_shards", None)
+    cfg.setdefault("value_head", "scalar")
     cfg.setdefault("vals_per_epoch", 1)
 
     # CLI overrides (only when explicitly given).
@@ -93,6 +97,7 @@ def parse_args() -> dict:
         "wandb_name": cli.wandb_name,
         "shards_dir": cli.shards_dir,
         "max_shards": cli.max_shards,
+        "value_head": cli.value_head,
         "vals_per_epoch": cli.vals_per_epoch,
     }
     for k, v in overrides.items():
@@ -122,6 +127,9 @@ class Train:
         self.wandb_name = args.get("wandb_name")
         self.shards_dir = args.get("shards_dir")
         self.max_shards = args.get("max_shards")
+        self.value_head = args.get("value_head", "scalar") or "scalar"
+        if self.value_head not in ("scalar", "wdl"):
+            raise ValueError(f"value_head must be 'scalar' or 'wdl', got {self.value_head!r}")
         self.vals_per_epoch = int(args.get("vals_per_epoch", 1) or 1)
         # Resolve data_mix default
         mix = args.get("data_mix")
@@ -129,7 +137,9 @@ class Train:
             mix = "both" if self.self_play_paths else "supervised"
         self.data_mix = mix
 
-        self.model = ResNet().to(self.device)
+        model_cls = SEResNetWDL if self.value_head == "wdl" else SEResNet
+        self.model = model_cls().to(self.device)
+        print(f"Model: {model_cls.__name__} (value_head={self.value_head})")
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.l2_weight)
 
         if args.get("resume"):
@@ -200,15 +210,25 @@ class Train:
 
         all_boards = []
         all_moves = []
-        all_evals = []
+        all_values = []      # holds either evals (scalar) or wdls (3-vec) depending on value_head
         all_masks = []
         all_ppg = []
         any_missing_masks = False
+        wdl_key = "wdls"
         for sp in shard_paths:
             d = torch.load(sp, map_location="cpu", weights_only=False)
             all_boards.append(d["boards"])
             all_moves.append(d["moves"])
-            all_evals.append(d["evals"])
+            if self.value_head == "wdl":
+                if wdl_key not in d:
+                    raise RuntimeError(
+                        f"Shard {sp.name} lacks '{wdl_key}' field. Regenerate shards "
+                        f"with gen_sf_data.py (recent versions store wdls), or train "
+                        f"with --value-head scalar."
+                    )
+                all_values.append(d[wdl_key])
+            else:
+                all_values.append(d["evals"])
             if "legal_masks_packed" in d:
                 all_masks.append(d["legal_masks_packed"])
             else:
@@ -221,9 +241,10 @@ class Train:
         # On big runs (17M+ positions, ~30 GB of boards alone) the lazy doubling
         # during cat + the splitting copies otherwise breach Colab's 85 GB cap.
         boards = torch.cat(all_boards, dim=0);  del all_boards
-        moves = torch.cat(all_moves, dim=0);    del all_moves
-        evals = torch.cat(all_evals, dim=0);    del all_evals
-        evals = torch.clamp(evals, -1.0, 1.0)
+        moves  = torch.cat(all_moves,  dim=0);  del all_moves
+        values = torch.cat(all_values, dim=0);  del all_values
+        if self.value_head == "scalar":
+            values = torch.clamp(values, -1.0, 1.0)
         if any_missing_masks:
             print("  WARN: some shards lack 'legal_masks_packed' -- "
                   "label smoothing will spread over all 4672 indices for this run.")
@@ -250,7 +271,8 @@ class Train:
 
         n_train_games = n_games - n_val_games
         print(f"Sharded supervised: {n_train_games} train / {n_val_games} val games "
-              f"({int(train_mask.sum())} / {int(val_mask.sum())} positions).")
+              f"({int(train_mask.sum())} / {int(val_mask.sum())} positions). "
+              f"value_head={self.value_head}, target shape={tuple(values.shape[1:])}")
 
         # Split each tensor train/val, then drop the source immediately. Doing
         # all four boolean-indexes inline (the previous code) kept `boards`
@@ -258,7 +280,7 @@ class Train:
         # tensor size. Pattern below peaks at 2x.
         train_boards = boards[train_mask]; val_boards = boards[val_mask]; del boards
         train_moves  = moves[train_mask];  val_moves  = moves[val_mask];  del moves
-        train_evals  = evals[train_mask];  val_evals  = evals[val_mask];  del evals
+        train_values = values[train_mask]; val_values = values[val_mask]; del values
         if legal_masks_packed is not None:
             train_masks_packed = legal_masks_packed[train_mask]
             val_masks_packed   = legal_masks_packed[val_mask]
@@ -266,10 +288,10 @@ class Train:
         else:
             train_masks_packed = val_masks_packed = None
 
-        train_ds = ChessDataset(train_boards, train_evals, train_moves,
+        train_ds = ChessDataset(train_boards, train_values, train_moves,
                                 label_smoothing=self.label_smoothing,
                                 legal_masks_packed=train_masks_packed)
-        val_ds = ChessDataset(val_boards, val_evals, val_moves,
+        val_ds = ChessDataset(val_boards, val_values, val_moves,
                               label_smoothing=self.label_smoothing,
                               legal_masks_packed=val_masks_packed)
         return train_ds, val_ds
@@ -277,6 +299,13 @@ class Train:
     @staticmethod
     def _soft_ce(logits: torch.Tensor, soft_target: torch.Tensor) -> torch.Tensor:
         return -(soft_target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+    def _value_loss(self, outputs: torch.Tensor, targets: torch.Tensor,
+                    criterion_mse: nn.MSELoss) -> torch.Tensor:
+        """MSE on tanh-scalar (B,1) targets, soft-CE on WDL (B,3) probability targets."""
+        if self.value_head == "wdl":
+            return self._soft_ce(outputs, targets)
+        return criterion_mse(outputs, targets)
 
     @torch.no_grad()
     def evaluate(self, val_loader, criterion_mse):
@@ -286,15 +315,15 @@ class Train:
         running_ce_loss = 0.0
         correct = 0
         total = 1
-        for data, labels_mse, labels_ce in val_loader:
+        for data, labels_value, labels_ce in val_loader:
             data = data.to(self.device)
-            labels_mse = labels_mse.to(self.device)
+            labels_value = labels_value.to(self.device)
             labels_ce = labels_ce.to(self.device)
-            outputs_mse, outputs_ce = self.model(data)
-            loss_mse = criterion_mse(outputs_mse, labels_mse)
+            outputs_value, outputs_ce = self.model(data)
+            loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
             loss_ce = self._soft_ce(outputs_ce, labels_ce)
-            running_loss += (loss_mse + loss_ce).item()
-            running_mse_loss += loss_mse.item()
+            running_loss += (loss_value + loss_ce).item()
+            running_mse_loss += loss_value.item()
             running_ce_loss += loss_ce.item()
             predicted = outputs_ce.argmax(dim=1)
             target = labels_ce.argmax(dim=1)
@@ -410,23 +439,23 @@ class Train:
                 max(1, (i + 1) * n_batches // vpe) - 1 for i in range(vpe)
             )
 
-            for batch_idx, (data, labels_mse, labels_ce) in enumerate(
+            for batch_idx, (data, labels_value, labels_ce) in enumerate(
                 tqdm(train_loader, desc=f"Epoch {epoch + 1}/{self.epochs}")
             ):
                 data = data.to(self.device)
-                labels_mse = labels_mse.to(self.device)
+                labels_value = labels_value.to(self.device)
                 labels_ce = labels_ce.to(self.device)
                 self.optimizer.zero_grad()
 
-                outputs_mse, outputs_ce = self.model(data)
-                loss_mse = criterion_mse(outputs_mse, labels_mse)
+                outputs_value, outputs_ce = self.model(data)
+                loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
                 loss_ce = self._soft_ce(outputs_ce, labels_ce)
-                loss = loss_mse + loss_ce
+                loss = loss_value + loss_ce
                 loss.backward()
                 self.optimizer.step()
 
                 running_loss += loss.item()
-                running_mse_loss += loss_mse.item()
+                running_mse_loss += loss_value.item()
                 running_ce_loss += loss_ce.item()
 
                 predicted = outputs_ce.argmax(dim=1)
@@ -438,7 +467,7 @@ class Train:
                     if use_wandb:
                         wandb.log({
                             "train/loss": loss.item(),
-                            "train/value_mse": loss_mse.item(),
+                            "train/value_loss": loss_value.item(),
                             "train/policy_ce": loss_ce.item(),
                             "train/accuracy": 100.0 * correct / total,
                             "train/lr": lr,

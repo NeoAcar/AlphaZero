@@ -34,7 +34,7 @@ import torch
 
 from alphazero import utils as f
 from alphazero.mcts import MCTS
-from alphazero.nn import ResNet
+from alphazero.nn import SEResNet as ResNet
 
 
 torch.set_float32_matmul_precision("high")
@@ -57,7 +57,7 @@ def send(msg: str) -> None:
 
 class UciEngine:
     DEFAULT_OPTS = {
-        "Checkpoint": "models/model_5.pth",
+        "Checkpoint": "models/model_best_combined_5.pth",
         "Sims": 300,
         "Temperature": 0.0,
         "TempMoves": 0,

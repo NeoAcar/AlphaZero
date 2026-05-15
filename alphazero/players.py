@@ -31,7 +31,17 @@ torch.set_float32_matmul_precision("high")
 
 from . import utils as f
 from .mcts import MCTS
-from .nn import ResNet
+from .nn import ResNet, SEResNet
+
+
+def build_model(cfg: dict):
+    """Instantiate the NN architecture named in cfg['architecture'] (default 'resnet')."""
+    name = cfg.get("architecture", "resnet").lower()
+    if name == "resnet":
+        return ResNet()
+    if name == "seresnet":
+        return SEResNet()
+    raise ValueError(f"unknown architecture: {name!r}; expected 'resnet' or 'seresnet'")
 
 
 PIECE_VALUES = {
@@ -154,7 +164,7 @@ class ValueOnlyPlayer:
         if "checkpoint" not in cfg:
             raise ValueError("value_only config needs 'checkpoint'")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = ResNet().to(self.device)
+        self.model = build_model(cfg).to(self.device)
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
@@ -162,6 +172,12 @@ class ValueOnlyPlayer:
             self.model = torch.compile(self.model, mode="reduce-overhead")
         except Exception:
             pass
+        # For game diversity in matches, the first `temperature_moves` plies are
+        # sampled from softmax(value/T) over the legal-move values. After that,
+        # pure argmax. Defaults: temperature_moves=0 -> always argmax.
+        self.temperature_moves = int(cfg.get("temperature_moves", 0))
+        self.temperature = float(cfg.get("temperature", 1.0))
+        self._rng = np.random.default_rng(cfg.get("sampling_seed"))
 
     @torch.no_grad()
     def _batch_values(self, mirrored_states: list[chess.Board], move_counter: int) -> np.ndarray:
@@ -194,7 +210,17 @@ class ValueOnlyPlayer:
             if ps.is_checkmate():
                 mover_values[i] = INF
 
-        best_idx = int(np.argmax(mover_values))
+        # If a mate-in-1 is available, take it deterministically -- temperature
+        # shouldn't ever risk drawing/losing in front of a forced mate.
+        if self.temperature > 0 and move_counter < self.temperature_moves \
+                and not np.isinf(mover_values).any():
+            scaled = mover_values / max(self.temperature, 1e-6)
+            scaled = scaled - scaled.max()         # numerical stability
+            probs = np.exp(scaled)
+            probs = probs / probs.sum()
+            best_idx = int(self._rng.choice(len(legal), p=probs))
+        else:
+            best_idx = int(np.argmax(mover_values))
         best_move = legal[best_idx]
         real_uci = best_move.uci()
         return real_uci, _to_mirrored(real_uci, real_board.turn)
@@ -212,7 +238,7 @@ class PolicyOnlyPlayer:
         if "checkpoint" not in cfg:
             raise ValueError("policy_only config needs 'checkpoint'")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = ResNet().to(self.device)
+        self.model = build_model(cfg).to(self.device)
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
@@ -222,6 +248,11 @@ class PolicyOnlyPlayer:
                 _ = self.model(torch.zeros(1, 19, 8, 8, device=self.device))
         except Exception:
             pass
+        # Temperature controls policy sampling for the first temperature_moves plies;
+        # after that, pure argmax. Same semantics as ValueOnlyPlayer / MctsPlayer.
+        self.temperature_moves = int(cfg.get("temperature_moves", 0))
+        self.temperature = float(cfg.get("temperature", 1.0))
+        self._rng = np.random.default_rng(cfg.get("sampling_seed"))
 
     @torch.no_grad()
     def select_move(self, real_board, mirrored_state, move_counter):
@@ -230,7 +261,16 @@ class PolicyOnlyPlayer:
         mask = torch.from_numpy(f.legal_mask(mirrored_state)).to(self.device)
         masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
         policy = torch.softmax(masked_logits, dim=0).cpu().numpy()
-        action = int(np.argmax(policy))
+
+        if self.temperature > 0 and move_counter < self.temperature_moves:
+            scaled = np.where(policy > 0, policy ** (1.0 / self.temperature), 0.0)
+            total = scaled.sum()
+            if total > 0:
+                action = int(self._rng.choice(len(scaled), p=scaled / total))
+            else:
+                action = int(np.argmax(policy))
+        else:
+            action = int(np.argmax(policy))
         mir_uci = f.alphazero_to_move(action, mirrored_state)
         return _to_real(mir_uci, real_board.turn), mir_uci
 
@@ -258,7 +298,7 @@ class MctsPlayer:
         args.update(cfg)
         args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = ResNet().to(args["device"])
+        self.model = build_model(cfg).to(args["device"])
         state = torch.load(args["checkpoint"], map_location=args["device"], weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()

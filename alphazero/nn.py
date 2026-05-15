@@ -139,3 +139,50 @@ class SEResNet(nn.Module):
         policy = self.policyHead(x)
         value = self.valueHead(x)
         return value, policy
+
+
+class SEResNetWDL(nn.Module):
+    """SEResNet variant with a 3-output WDL value head (Win/Draw/Loss logits).
+
+    Same body + SE blocks + policy head as SEResNet. Only the value head
+    differs: outputs raw (B, 3) logits, no activation. Apply softmax at the
+    call site (loss uses cross-entropy; MCTS converts via P(W) - P(L) to get
+    a scalar in [-1, +1]).
+    """
+
+    def __init__(self, channels: int = 256, n_blocks: int = 19, reduction: int = 16):
+        super().__init__()
+        self.startBlock = nn.Sequential(
+            nn.Conv2d(19, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(),
+        )
+
+        self.backBone = nn.Sequential(
+            *[SEResBlock(channels, reduction) for _ in range(n_blocks)]
+        )
+
+        self.policyHead = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, 73, kernel_size=1, padding=0, bias=True),
+            nn.Flatten(),
+        )
+
+        self.valueHead = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(1),
+            nn.SiLU(),
+            nn.Flatten(),
+            nn.Linear(64, 256),
+            nn.SiLU(),
+            nn.Linear(256, 3),     # WDL logits; softmax applied externally
+        )
+
+    def forward(self, x):
+        x = self.startBlock(x)
+        x = self.backBone(x)
+        policy = self.policyHead(x)
+        value = self.valueHead(x)
+        return value, policy

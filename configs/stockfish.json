@@ -1,8 +1,8 @@
 {
     "type": "stockfish",
-    "binary": "stockfish",
+    "binary": "/home/neo/bin/stockfish18",
     "skill_level": null,
-    "elo": 2000,
+    "elo": 2700,
     "limit_strength": true,
     "depth": null,
     "time_ms": null

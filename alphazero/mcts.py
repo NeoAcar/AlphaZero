@@ -262,6 +262,7 @@ class MCTS:
             if child.proven_value == -1 and child.N > 0
         ]
         if proven_winners:
+            print(f"Proven win found among {len(proven_winners)} children; picking best Q/N")
             best_action, _ = max(proven_winners, key=lambda ac: ac[1].Q / ac[1].N)
             action_probs[best_action] = 1.0
             self.last_was_proven_mate = True

@@ -1,0 +1,7 @@
+{
+    "type": "value_only",
+    "architecture": "seresnet",
+    "checkpoint": "models/model_best_combined_2.pth",
+    "temperature": 1.0,
+    "temperature_moves": 10
+}

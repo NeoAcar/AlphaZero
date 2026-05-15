@@ -1,0 +1,16 @@
+{
+    "type": "mcts",
+    "architecture": "seresnet",
+    "checkpoint": "models/model_best_combined_4.pth",
+    "num_simulation": 300,
+    "discount": 1,
+    "c_init": 1.25,
+    "c_base": 19652,
+    "dirichlet_epsilon": 0.0,
+    "dirichlet_alpha": 0.3,
+    "t": 1,
+    "temperature_moves": 1,
+    "temperature": 1.0,
+    "compile": true,
+    "batched": false
+}

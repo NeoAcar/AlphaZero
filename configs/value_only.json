@@ -1,4 +1,6 @@
 {
     "type": "value_only",
-    "checkpoint": "models/model_e6.pth"
+    "checkpoint": "models/model_6.pth",
+    "temperature": 1.0,
+    "temperature_moves": 10
 }
