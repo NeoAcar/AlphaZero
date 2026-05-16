@@ -31,7 +31,7 @@ torch.set_float32_matmul_precision("high")
 
 from . import utils as f
 from .mcts import MCTS
-from .nn import ResNet, SEResNet
+from .nn import ResNet, SEResNet, SEResNetWDL, value_to_scalar
 
 
 def build_model(cfg: dict):
@@ -41,7 +41,11 @@ def build_model(cfg: dict):
         return ResNet()
     if name == "seresnet":
         return SEResNet()
-    raise ValueError(f"unknown architecture: {name!r}; expected 'resnet' or 'seresnet'")
+    if name == "seresnetwdl":
+        return SEResNetWDL()
+    raise ValueError(
+        f"unknown architecture: {name!r}; expected 'resnet', 'seresnet', or 'seresnetwdl'"
+    )
 
 
 PIECE_VALUES = {
@@ -169,7 +173,7 @@ class ValueOnlyPlayer:
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
         try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.model = torch.compile(self.model)
         except Exception:
             pass
         # For game diversity in matches, the first `temperature_moves` plies are
@@ -178,6 +182,9 @@ class ValueOnlyPlayer:
         self.temperature_moves = int(cfg.get("temperature_moves", 0))
         self.temperature = float(cfg.get("temperature", 1.0))
         self._rng = np.random.default_rng(cfg.get("sampling_seed"))
+        # WDL-only knob: how to collapse (P(W), P(D), P(L)) -> scalar.
+        # "expected" = P(W) - P(L) (default). "win_only" = P(W) (ignores draw rate).
+        self.value_scalar = cfg.get("value_scalar", "expected")
 
     @torch.no_grad()
     def _batch_values(self, mirrored_states: list[chess.Board], move_counter: int) -> np.ndarray:
@@ -185,7 +192,7 @@ class ValueOnlyPlayer:
             [f.prepare_input(s, move_counter) for s in mirrored_states]
         ).to(self.device)
         values, _ = self.model(inputs)
-        return values.cpu().numpy().flatten()
+        return value_to_scalar(values, mode=self.value_scalar).cpu().numpy().flatten()
 
     def select_move(self, real_board, mirrored_state, move_counter):
         mover_was_white = real_board.turn == chess.WHITE
@@ -243,7 +250,7 @@ class PolicyOnlyPlayer:
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
         try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.model = torch.compile(self.model)
             with torch.no_grad():
                 _ = self.model(torch.zeros(1, 19, 8, 8, device=self.device))
         except Exception:
@@ -310,7 +317,7 @@ class MctsPlayer:
 
         if use_compile:
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
+                self.model = torch.compile(self.model)
                 warm_bs = batch_size if use_batched else 1
                 with torch.no_grad():
                     _ = self.model(torch.zeros(warm_bs, 19, 8, 8, device=args["device"]))

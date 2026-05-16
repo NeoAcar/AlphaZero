@@ -1,0 +1,9 @@
+{
+    "type": "value_only",
+    "architecture": "seresnetwdl",
+    "checkpoint": "models/model_best_combined_wdl.pth",
+    "value_scalar": "win_only",
+    "temperature": 1.0,
+    "temperature_moves": 10,
+    "CInit": 1.0
+}

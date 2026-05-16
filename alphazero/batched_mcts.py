@@ -41,6 +41,7 @@ import torch
 
 from . import utils as f
 from .mcts import Node
+from .nn import value_to_scalar
 
 
 class BatchedMCTS:
@@ -194,7 +195,9 @@ class BatchedMCTS:
             ]).to(self.args["device"])
             with torch.no_grad():
                 value_t, policy_t = self.model(inputs)
-            values = value_t.cpu().numpy().flatten()
+            values = value_to_scalar(
+                value_t, mode=self.args.get("value_scalar", "expected")
+            ).cpu().numpy().flatten()
             masks_np = np.stack([f.legal_mask(leaf.state) for _, leaf in unique_eval])
             masks_t = torch.from_numpy(masks_np).to(policy_t.device)
             masked_logits = policy_t.masked_fill(~masks_t, float("-inf"))

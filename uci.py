@@ -34,7 +34,16 @@ import torch
 
 from alphazero import utils as f
 from alphazero.mcts import MCTS
-from alphazero.nn import SEResNet as ResNet
+from alphazero.nn import ResNet, SEResNet, SEResNetWDL, value_to_scalar
+
+
+ARCHITECTURES = {
+    "resnet": ResNet,
+    "seresnet": SEResNet,
+    "seresnetwdl": SEResNetWDL,
+}
+
+PLAYER_TYPES = {"mcts", "policy_only", "value_only"}
 
 
 torch.set_float32_matmul_precision("high")
@@ -57,16 +66,22 @@ def send(msg: str) -> None:
 
 class UciEngine:
     DEFAULT_OPTS = {
-        "Checkpoint": "models/model_best_combined_5.pth",
-        "Sims": 300,
-        "Temperature": 0.0,
-        "TempMoves": 0,
+        "Type": "policy_only",              # one of: mcts | policy_only | value_only
+        "Checkpoint": "models/model_best_combined_wdl.pth",
+        "Architecture": "seresnetwdl",
+        "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
+        "Sims": 1200,
+        "Temperature": 1.0,
+        "TempMoves": 6,
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
         "CInit": 1.25,
     }
     OPT_TYPES = {
+        "Type": ("string", None, None),
         "Checkpoint": ("string", None, None),
+        "Architecture": ("string", None, None),
+        "ValueScalar": ("string", None, None),
         "Sims": ("spin", 1, 100000),
         "Temperature": ("string", None, None),
         "TempMoves": ("spin", 0, 200),
@@ -78,7 +93,8 @@ class UciEngine:
     def __init__(self) -> None:
         self.options = dict(self.DEFAULT_OPTS)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model: ResNet | None = None
+        self.model = None
+        self.loaded_arch: str | None = None
         self.loaded_checkpoint: str | None = None
         self.mcts: MCTS | None = None
         self.real_board = chess.Board()
@@ -91,11 +107,14 @@ class UciEngine:
 
     def _ensure_loaded(self) -> None:
         ckpt = str(self.options["Checkpoint"])
-        if self.model is not None and self.loaded_checkpoint == ckpt:
+        arch = str(self.options["Architecture"]).lower()
+        if self.model is not None and self.loaded_checkpoint == ckpt and self.loaded_arch == arch:
             self._refresh_mcts()
             return
-        log(f"Loading checkpoint {ckpt}")
-        model = ResNet().to(self.device)
+        if arch not in ARCHITECTURES:
+            raise ValueError(f"Architecture must be one of {list(ARCHITECTURES)}, got {arch!r}")
+        log(f"Loading checkpoint {ckpt} (architecture: {arch})")
+        model = ARCHITECTURES[arch]().to(self.device)
         state = torch.load(ckpt, map_location=self.device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         model.eval()
@@ -108,6 +127,7 @@ class UciEngine:
             log(f"torch.compile skipped: {e}")
         self.model = model
         self.loaded_checkpoint = ckpt
+        self.loaded_arch = arch
         self._refresh_mcts()
 
     def _refresh_mcts(self) -> None:
@@ -122,6 +142,7 @@ class UciEngine:
             "action_space": 4672,
             "t": 1,
             "device": self.device,
+            "value_scalar": str(self.options["ValueScalar"]),
         }
         assert self.model is not None
         self.mcts = MCTS(args, self.model)
@@ -200,10 +221,11 @@ class UciEngine:
         else:
             self.options[name] = value
         log(f"set {name} = {self.options[name]!r}")
-        # If model checkpoint changed, force reload on next isready/go
-        if name == "Checkpoint":
+        # If model checkpoint or architecture changed, force reload on next isready/go
+        if name in ("Checkpoint", "Architecture"):
             self.model = None
             self.loaded_checkpoint = None
+            self.loaded_arch = None
 
     def cmd_position(self, args: list[str]) -> None:
         moves: list[str] = []
@@ -236,39 +258,98 @@ class UciEngine:
     def cmd_go(self, _args: list[str]) -> None:
         # Time controls are ignored for now; we just use configured Sims.
         self._ensure_loaded()
-        assert self.mcts is not None
+        assert self.model is not None
+        ptype = str(self.options["Type"]).lower()
+        if ptype not in PLAYER_TYPES:
+            log(f"unknown Type {ptype!r}; falling back to mcts")
+            ptype = "mcts"
 
         try:
-            with contextlib.redirect_stdout(sys.stderr):
-                probs = self.mcts.search(self.mirror_state, self.move_counter)
+            if ptype == "mcts":
+                real_uci = self._go_mcts()
+            elif ptype == "policy_only":
+                real_uci = self._go_policy_only()
+            else:  # value_only
+                real_uci = self._go_value_only()
         except Exception as e:
-            log(f"search failed: {e}\n{traceback.format_exc()}")
-            # Pick any legal move so the GUI doesn't hang
+            log(f"search failed ({ptype}): {e}\n{traceback.format_exc()}")
             legal = list(self.real_board.legal_moves)
-            if legal:
-                send(f"bestmove {legal[0].uci()}")
-            else:
-                send("bestmove 0000")
-            return
+            real_uci = legal[0].uci() if legal else "0000"
 
-        if getattr(self.mcts, "last_was_proven_mate", False):
-            send("info string proven forced mate")
-            log("proven forced mate")
-
-        action = self._select_action(probs)
-        mir_uci = f.alphazero_to_move(action, self.mirror_state)
-        real_uci = mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
-        # Sanity: verify it's a legal real-board move; if not, fall back.
+        # Sanity: verify legal on real board; fall back to any legal otherwise.
         try:
             move = chess.Move.from_uci(real_uci)
             if move not in self.real_board.legal_moves:
                 log(f"chose illegal {real_uci}; falling back to a legal move")
-                move = next(iter(self.real_board.legal_moves))
-                real_uci = move.uci()
+                real_uci = next(iter(self.real_board.legal_moves)).uci()
         except Exception:
             log(f"chose unparseable {real_uci}; bailing")
-            real_uci = next(iter(self.real_board.legal_moves)).uci()
+            legal = list(self.real_board.legal_moves)
+            real_uci = legal[0].uci() if legal else "0000"
         send(f"bestmove {real_uci}")
+
+    # ---------- per-Type search backends ----------
+
+    def _go_mcts(self) -> str:
+        assert self.mcts is not None
+        with contextlib.redirect_stdout(sys.stderr):
+            probs = self.mcts.search(self.mirror_state, self.move_counter)
+        if getattr(self.mcts, "last_was_proven_mate", False):
+            send("info string proven forced mate")
+            log("proven forced mate")
+        action = self._select_action(probs)
+        mir_uci = f.alphazero_to_move(action, self.mirror_state)
+        return mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
+
+    @torch.no_grad()
+    def _go_policy_only(self) -> str:
+        assert self.model is not None
+        inputs = f.prepare_input(self.mirror_state, self.move_counter).unsqueeze(0).to(self.device)
+        _value, policy_logits = self.model(inputs)
+        mask = torch.from_numpy(f.legal_mask(self.mirror_state)).to(self.device)
+        masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
+        probs = torch.softmax(masked_logits, dim=0).cpu().numpy()
+        action = self._select_action(probs)
+        mir_uci = f.alphazero_to_move(action, self.mirror_state)
+        return mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
+
+    @torch.no_grad()
+    def _go_value_only(self) -> str:
+        assert self.model is not None
+        mover_was_white = self.real_board.turn == chess.WHITE
+        legal = list(self.real_board.legal_moves)
+        post_states = []
+        for move in legal:
+            real_uci = move.uci()
+            mir_uci = real_uci if mover_was_white else f.mirror_move(real_uci)
+            post = self.mirror_state.copy()
+            post.push_uci(mir_uci)
+            post.apply_mirror()
+            post_states.append(post)
+        inputs = torch.stack(
+            [f.prepare_input(s, self.move_counter + 1) for s in post_states]
+        ).to(self.device)
+        values_t, _ = self.model(inputs)
+        mode = str(self.options["ValueScalar"])
+        # NN values are from post-move state's player-to-move perspective = opponent. Negate.
+        opp_values = value_to_scalar(values_t, mode=mode).cpu().numpy().flatten()
+        mover_values = -opp_values
+        # Mate-in-1 wins outright.
+        for i, ps in enumerate(post_states):
+            if ps.is_checkmate():
+                mover_values[i] = float("inf")
+        # Opening-phase sampling: softmax(values / T) for first TempMoves plies.
+        temperature = float(self.options["Temperature"])
+        temp_moves = int(self.options["TempMoves"])
+        if (temperature > 0 and self.move_counter < temp_moves
+                and not np.isinf(mover_values).any()):
+            scaled = mover_values / max(temperature, 1e-6)
+            scaled = scaled - scaled.max()
+            probs = np.exp(scaled); probs /= probs.sum()
+            best_idx = int(self._rng.choice(len(legal), p=probs))
+        else:
+            best_idx = int(np.argmax(mover_values))
+        return legal[best_idx].uci()
 
     def _select_action(self, probs: np.ndarray) -> int:
         temperature = float(self.options["Temperature"])

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from . import utils as f
-from .nn import ResNet
+from .nn import ResNet, value_to_scalar
 
 
 class Node:
@@ -101,7 +101,9 @@ class Node:
         model.eval()
         inputs = f.prepare_input(self.state, self.move_counter).unsqueeze(0).to(self.args["device"])
         value_t, policy_t = model(inputs)
-        value = float(value_t.cpu().item())
+        value = float(value_to_scalar(
+            value_t, mode=self.args.get("value_scalar", "expected")
+        ).cpu().item())
         mask = torch.from_numpy(f.legal_mask(self.state)).to(policy_t.device)
         masked_logits = policy_t.squeeze(0).masked_fill(~mask, float("-inf"))
         self.raw_policy = torch.softmax(masked_logits, dim=0).cpu().numpy()

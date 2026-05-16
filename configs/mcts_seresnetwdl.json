@@ -1,8 +1,9 @@
 {
     "type": "mcts",
-    "architecture": "seresnet",
-    "checkpoint": "models/model_best_combined_4.pth",
+    "architecture": "seresnetwdl",
+    "checkpoint": "models/model_best_combined_wdl.pth",
     "num_simulation": 200,
+    "value_scalar": "win_only",
     "discount": 1,
     "c_init": 1.25,
     "c_base": 19652,
