@@ -61,6 +61,11 @@ class ResNet(nn.Module):
         value = self.valueHead(x)
         return value, policy
 
+    def forward_policy(self, x):
+        x = self.startBlock(x)
+        x = self.backBone(x)
+        return self.policyHead(x)
+
 
 class ResBlock(nn.Module):
     def __init__(self):
@@ -161,6 +166,11 @@ class SEResNet(nn.Module):
         value = self.valueHead(x)
         return value, policy
 
+    def forward_policy(self, x):
+        x = self.startBlock(x)
+        x = self.backBone(x)
+        return self.policyHead(x)
+
 
 class SEResNetWDL(nn.Module):
     """SEResNet variant with a 3-output WDL value head (Win/Draw/Loss logits).
@@ -207,3 +217,8 @@ class SEResNetWDL(nn.Module):
         policy = self.policyHead(x)
         value = self.valueHead(x)
         return value, policy
+
+    def forward_policy(self, x):
+        x = self.startBlock(x)
+        x = self.backBone(x)
+        return self.policyHead(x)

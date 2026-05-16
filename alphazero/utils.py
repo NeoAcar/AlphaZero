@@ -5,30 +5,84 @@ import numpy as np
 import torch
 
 
-def board_to_matrix(board: chess.Board, move_counter: int) -> np.ndarray:
-    matrix = np.zeros((19, 8, 8), dtype=np.float32)
-    for color in [True, False]:
-        piece_offset = 0 if color else 6
-        for piece_type in range(1, 7):  # pawn=1, knight=2, ..., king=6
-            for square in board.pieces(piece_type, color):
-                row, col = divmod(square, 8)
-                piece_index = piece_offset + (piece_type - 1)
-                matrix[piece_index, row, col] = 1
+# Per-square bit masks for vectorised bitboard -> plane conversion. Square `i`
+# in python-chess corresponds to bit `i` of any bitboard, with rank = i // 8 and
+# file = i % 8. Flat index `i` of the resulting (8, 8) reshape lands at
+# (rank=i//8, file=i%8), matching the existing matrix[plane, row, col] layout.
+_BIT_MASKS = (np.uint64(1) << np.arange(64, dtype=np.uint64))  # shape (64,)
 
+
+def board_to_matrix(board: chess.Board, move_counter: int) -> np.ndarray:
+    # Pull all 12 piece bitboards at once (white pawns..kings, then black).
+    bbs = np.fromiter(
+        (board.pieces_mask(pt, color)
+         for color in (True, False)
+         for pt in range(1, 7)),
+        dtype=np.uint64,
+        count=12,
+    )
+    # Broadcast bit-AND: (12, 1) & (1, 64) -> (12, 64). Boolean -> float32.
+    pieces = ((bbs[:, None] & _BIT_MASKS[None, :]) > np.uint64(0)).astype(np.float32)
+
+    matrix = np.empty((19, 8, 8), dtype=np.float32)
+    matrix[:12] = pieces.reshape(12, 8, 8)
     # "Colour" plane (AZ S1): real side-to-move (player-to-move's actual color
     # in the un-mirrored game), NOT the canonical board.turn (always True here).
-    matrix[12, :, :] = 1.0 if (move_counter % 2 == 0) else 0.0
+    matrix[12].fill(1.0 if (move_counter % 2 == 0) else 0.0)
     # Move-counter normalisations: keep values in [0, 1] before save_shard's
     # clamp+uint8 quantisation. halfmove_clock can reach 99 before the 50-move
     # rule forces a draw; total move counter is capped at ~300 plies which
     # matches our self-play truncation and covers the bulk of real games.
-    matrix[13, :, :] = move_counter / 300
-    matrix[14, :, :] = board.has_kingside_castling_rights(True)
-    matrix[15, :, :] = board.has_queenside_castling_rights(True)
-    matrix[16, :, :] = board.has_kingside_castling_rights(False)
-    matrix[17, :, :] = board.has_queenside_castling_rights(False)
-    matrix[18, :, :] = board.halfmove_clock / 100
+    matrix[13].fill(move_counter / 300)
+    matrix[14].fill(float(board.has_kingside_castling_rights(True)))
+    matrix[15].fill(float(board.has_queenside_castling_rights(True)))
+    matrix[16].fill(float(board.has_kingside_castling_rights(False)))
+    matrix[17].fill(float(board.has_queenside_castling_rights(False)))
+    matrix[18].fill(board.halfmove_clock / 100)
     return matrix
+
+
+# python-chess piece-type constants -> AZ underpromotion slot.
+_UNDERPROMO = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}
+
+
+def move_obj_to_alphazero(move: chess.Move) -> int:
+    """Encode a chess.Move directly to the 4672 AlphaZero action index.
+
+    Equivalent to move_to_alphazero(move.uci()) but skips the string
+    round-trip (~30-100us per move at typical legal-move counts).
+    """
+    fs = move.from_square
+    ts = move.to_square
+    start_file = fs & 7
+    start_rank = fs >> 3
+    end_file = ts & 7
+    end_rank = ts >> 3
+    file_diff = end_file - start_file
+    rank_diff = end_rank - start_rank
+
+    promo = move.promotion
+    if promo is not None and promo != chess.QUEEN:
+        move_type_index = 64 + _UNDERPROMO[promo] * 3 + (file_diff + 1)
+    elif file_diff == 0:                                      # vertical
+        move_type_index = 14 + rank_diff - 1 if rank_diff > 0 else 21 + (-rank_diff) - 1
+    elif rank_diff == 0:                                      # horizontal
+        move_type_index = file_diff - 1 if file_diff > 0 else 7 + (-file_diff) - 1
+    elif abs(file_diff) == abs(rank_diff):                    # diagonal
+        if file_diff > 0 and rank_diff > 0:
+            move_type_index = 28 + rank_diff - 1              # NE
+        elif file_diff < 0 and rank_diff > 0:
+            move_type_index = 35 + rank_diff - 1              # NW
+        elif file_diff > 0 and rank_diff < 0:
+            move_type_index = 42 + (-rank_diff) - 1           # SE
+        else:
+            move_type_index = 49 + (-rank_diff) - 1           # SW
+    else:                                                     # knight
+        move_type_index = 56 + (file_diff == 2) * 0 + (file_diff == 1) * 1 \
+                             + (file_diff == -1) * 2 + (file_diff == -2) * 3
+        if rank_diff < 0:
+            move_type_index += 4
+    return move_type_index * 64 + fs
 
 
 def move_to_alphazero(move: str) -> int:
@@ -69,7 +123,7 @@ def move_to_alphazero(move: str) -> int:
 
 
 def moves_to_alphazero(moves: list[chess.Move]) -> list[int]:
-    return [move_to_alphazero(move.uci()) for move in moves]
+    return [move_obj_to_alphazero(move) for move in moves]
 
 
 def alphazero_to_move(action: int, board: chess.Board | None = None) -> str:

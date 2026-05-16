@@ -1,0 +1,8 @@
+{
+    "type": "policy_only",
+    "backend": "onnx",
+    "onnx_path": "models/policy_seresnetwdl.fp16.onnx",
+    "onnx_fp16": true,
+    "temperature": 1.0,
+    "temperature_moves": 15
+}

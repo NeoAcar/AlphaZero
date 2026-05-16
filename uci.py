@@ -67,6 +67,8 @@ def send(msg: str) -> None:
 class UciEngine:
     DEFAULT_OPTS = {
         "Type": "policy_only",              # one of: mcts | policy_only | value_only
+        "Backend": "onnx",                  # policy_only-only: "torch" or "onnx"
+        "OnnxPath": "models/policy_seresnetwdl.fp16.onnx",  # required if Backend=onnx
         "Checkpoint": "models/model_best_combined_wdl.pth",
         "Architecture": "seresnetwdl",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
@@ -79,6 +81,8 @@ class UciEngine:
     }
     OPT_TYPES = {
         "Type": ("string", None, None),
+        "Backend": ("string", None, None),
+        "OnnxPath": ("string", None, None),
         "Checkpoint": ("string", None, None),
         "Architecture": ("string", None, None),
         "ValueScalar": ("string", None, None),
@@ -96,6 +100,11 @@ class UciEngine:
         self.model = None
         self.loaded_arch: str | None = None
         self.loaded_checkpoint: str | None = None
+        self.loaded_profile: str | None = None
+        self._policy_fn = None
+        self._policy_fast = False
+        self._ort_runner = None              # OnnxPolicyRunner when Backend=onnx
+        self._ort_path: str | None = None
         self.mcts: MCTS | None = None
         self.real_board = chess.Board()
         self.mirror_state = chess.Board()
@@ -106,28 +115,79 @@ class UciEngine:
     # ---------- model / mcts plumbing ----------
 
     def _ensure_loaded(self) -> None:
+        ptype = str(self.options["Type"]).lower()
+        backend = str(self.options.get("Backend", "torch")).lower()
+        onnx_path = str(self.options.get("OnnxPath", ""))
+
+        # ONNX policy backend: load an ORT session, no torch model needed.
+        if ptype == "policy_only" and backend == "onnx":
+            if self._ort_runner is not None and self._ort_path == onnx_path:
+                return
+            if not onnx_path:
+                raise ValueError("Backend=onnx requires OnnxPath to be set")
+            from alphazero.onnx_io import OnnxPolicyRunner
+            log(f"Loading ONNX policy graph {onnx_path}")
+            self._ort_runner = OnnxPolicyRunner(
+                onnx_path,
+                device="cuda" if self.device.type == "cuda" else "cpu",
+                fp16=True,
+            )
+            self._ort_path = onnx_path
+            self.loaded_profile = "onnx"
+            self.model = None
+            self.mcts = None
+            self.loaded_checkpoint = None
+            self.loaded_arch = None
+            return
+
+        # Torch backend (any Type): drop any ORT state from a prior switch.
+        self._ort_runner = None
+        self._ort_path = None
+
         ckpt = str(self.options["Checkpoint"])
         arch = str(self.options["Architecture"]).lower()
-        if self.model is not None and self.loaded_checkpoint == ckpt and self.loaded_arch == arch:
+        # policy_only on CUDA gets a fp16 + channels_last + max-autotune model;
+        # other Types need fp32 since MCTS/value paths run the full forward.
+        profile = "policy_fast" if (ptype == "policy_only" and self.device.type == "cuda") else "default"
+        if (self.model is not None and self.loaded_checkpoint == ckpt
+                and self.loaded_arch == arch and self.loaded_profile == profile):
             self._refresh_mcts()
             return
         if arch not in ARCHITECTURES:
             raise ValueError(f"Architecture must be one of {list(ARCHITECTURES)}, got {arch!r}")
-        log(f"Loading checkpoint {ckpt} (architecture: {arch})")
+        log(f"Loading checkpoint {ckpt} (architecture: {arch}, profile: {profile})")
         model = ARCHITECTURES[arch]().to(self.device)
         state = torch.load(ckpt, map_location=self.device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         model.eval()
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            with torch.no_grad():
-                _ = model(torch.zeros(1, 19, 8, 8, device=self.device))
-            log("torch.compile + warm-up done")
-        except Exception as e:
-            log(f"torch.compile skipped: {e}")
+
+        self._policy_fn = None
+        self._policy_fast = profile == "policy_fast"
+        if self._policy_fast:
+            model = model.half().to(memory_format=torch.channels_last)
+            try:
+                self._policy_fn = torch.compile(model.forward_policy, mode="max-autotune")
+                warm = torch.zeros(
+                    1, 19, 8, 8, device=self.device, dtype=torch.float16,
+                ).to(memory_format=torch.channels_last)
+                with torch.inference_mode():
+                    _ = self._policy_fn(warm)
+                log("fp16/channels_last/max-autotune policy_fn warmed")
+            except Exception as e:
+                log(f"policy fast-path compile skipped: {e}")
+                self._policy_fn = model.forward_policy
+        else:
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+                with torch.no_grad():
+                    _ = model(torch.zeros(1, 19, 8, 8, device=self.device))
+                log("torch.compile + warm-up done")
+            except Exception as e:
+                log(f"torch.compile skipped: {e}")
         self.model = model
         self.loaded_checkpoint = ckpt
         self.loaded_arch = arch
+        self.loaded_profile = profile
         self._refresh_mcts()
 
     def _refresh_mcts(self) -> None:
@@ -144,7 +204,10 @@ class UciEngine:
             "device": self.device,
             "value_scalar": str(self.options["ValueScalar"]),
         }
-        assert self.model is not None
+        if self.model is None:
+            # ONNX backend: MCTS isn't used for policy_only ONNX path.
+            self.mcts = None
+            return
         self.mcts = MCTS(args, self.model)
 
     # ---------- position tracking ----------
@@ -221,11 +284,16 @@ class UciEngine:
         else:
             self.options[name] = value
         log(f"set {name} = {self.options[name]!r}")
-        # If model checkpoint or architecture changed, force reload on next isready/go
-        if name in ("Checkpoint", "Architecture"):
+        # Anything that changes which model/graph we run forces a reload.
+        if name in ("Checkpoint", "Architecture", "Type", "Backend", "OnnxPath"):
             self.model = None
             self.loaded_checkpoint = None
             self.loaded_arch = None
+            self.loaded_profile = None
+            self._policy_fn = None
+            self._policy_fast = False
+            self._ort_runner = None
+            self._ort_path = None
 
     def cmd_position(self, args: list[str]) -> None:
         moves: list[str] = []
@@ -258,7 +326,8 @@ class UciEngine:
     def cmd_go(self, _args: list[str]) -> None:
         # Time controls are ignored for now; we just use configured Sims.
         self._ensure_loaded()
-        assert self.model is not None
+        # Either a torch model OR an ORT runner must be ready by now.
+        assert self.model is not None or self._ort_runner is not None
         ptype = str(self.options["Type"]).lower()
         if ptype not in PLAYER_TYPES:
             log(f"unknown Type {ptype!r}; falling back to mcts")
@@ -301,15 +370,41 @@ class UciEngine:
         mir_uci = f.alphazero_to_move(action, self.mirror_state)
         return mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
 
-    @torch.no_grad()
     def _go_policy_only(self) -> str:
-        assert self.model is not None
-        inputs = f.prepare_input(self.mirror_state, self.move_counter).unsqueeze(0).to(self.device)
-        _value, policy_logits = self.model(inputs)
-        mask = torch.from_numpy(f.legal_mask(self.mirror_state)).to(self.device)
-        masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
-        probs = torch.softmax(masked_logits, dim=0).cpu().numpy()
-        action = self._select_action(probs)
+        legal_idx = np.fromiter(
+            (f.move_obj_to_alphazero(m) for m in self.mirror_state.legal_moves),
+            dtype=np.int64,
+        )
+        if self._ort_runner is not None:
+            planes = f.board_to_matrix(self.mirror_state, self.move_counter)
+            policy_logits = self._ort_runner(planes)  # (4672,) numpy
+            legal_logits = policy_logits[legal_idx]
+        else:
+            assert self.model is not None
+            with torch.inference_mode():
+                inputs = f.prepare_input(self.mirror_state, self.move_counter).unsqueeze(0).to(self.device)
+                if self._policy_fast:
+                    inputs = inputs.half().to(memory_format=torch.channels_last)
+                fn = self._policy_fn if self._policy_fn is not None else self.model.forward_policy
+                policy_logits_t = fn(inputs).squeeze(0)
+                idx_t = torch.tensor(legal_idx, device=self.device, dtype=torch.long)
+                legal_logits = policy_logits_t.index_select(0, idx_t).float().cpu().numpy()
+
+        temperature = float(self.options["Temperature"])
+        temp_moves = int(self.options["TempMoves"])
+        if temperature > 0 and self.move_counter < temp_moves:
+            shifted = legal_logits - legal_logits.max()
+            legal_probs = np.exp(shifted, dtype=np.float64)
+            legal_probs /= legal_probs.sum()
+            scaled = legal_probs ** (1.0 / temperature)
+            total = scaled.sum()
+            if total > 0:
+                pos = int(self._rng.choice(len(scaled), p=scaled / total))
+            else:
+                pos = int(np.argmax(legal_probs))
+        else:
+            pos = int(np.argmax(legal_logits))
+        action = int(legal_idx[pos])
         mir_uci = f.alphazero_to_move(action, self.mirror_state)
         return mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
 
