@@ -80,7 +80,7 @@ def main():
     model.eval()
     try:
         model = torch.compile(model, mode="reduce-overhead")
-        with torch.no_grad():
+        with torch.inference_mode():
             _ = model(torch.zeros(1, 19, 8, 8, device=device))
         print("torch.compile + warm-up done")
     except Exception as e:

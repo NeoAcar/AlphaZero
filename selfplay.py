@@ -33,9 +33,18 @@ import numpy as np
 import torch
 from tqdm import tqdm  # type: ignore
 
+torch.set_float32_matmul_precision("high")    # TF32 on Ampere+ GPUs
+
 from alphazero import utils as f
-from alphazero.mcts import MCTS
-from alphazero.nn import ResNet
+from alphazero.batched_mcts import BatchedMCTS as MCTS  # TEMP: profile batched path
+from alphazero.nn import ResNet, SEResNet, SEResNetWDL
+
+
+ARCHITECTURES = {
+    "resnet": ResNet,
+    "seresnet": SEResNet,
+    "seresnetwdl": SEResNetWDL,
+}
 
 
 DEFAULT_MCTS_ARGS = {
@@ -49,18 +58,33 @@ DEFAULT_MCTS_ARGS = {
 }
 
 
-def build_mcts(checkpoint: str, sims: int,
-               dirichlet_eps: float) -> tuple[MCTS, ResNet, dict]:
+def build_mcts(checkpoint: str, sims: int, dirichlet_eps: float,
+               architecture: str = "seresnet") -> tuple[MCTS, torch.nn.Module, dict]:
     args = dict(DEFAULT_MCTS_ARGS)
     args["num_simulation"] = sims
     args["dirichlet_epsilon"] = dirichlet_eps
     args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args["truncation"] = 300
+    args["batch_size"] = 8   # TEMP: for batched profile run
 
-    model = ResNet().to(args["device"])
+    arch = architecture.lower()
+    if arch not in ARCHITECTURES:
+        raise ValueError(f"architecture must be one of {list(ARCHITECTURES)}, got {arch!r}")
+    model = ARCHITECTURES[arch]().to(args["device"])
     state = torch.load(checkpoint, map_location=args["device"], weights_only=False)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
+    # mode="reduce-overhead" — empirically ~50% faster per-ply than default
+    # on this workload (batched MCTS, batch=8, 22M-param SEResNet, 3050 Ti).
+    # The .to() sync overhead (visible at 34% wall-clock in profile) is the
+    # cost of CUDA-graph kernel fusion, which more than pays for itself by
+    # eliminating per-launch overhead on the thousands of small forwards.
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        with torch.inference_mode():
+            _ = model(torch.zeros(1, 19, 8, 8, device=args["device"]))
+    except Exception as e:
+        print(f"torch.compile skipped: {e}")
     return MCTS(args, model), model, args
 
 
@@ -105,6 +129,10 @@ def play_one_game(mcts: MCTS, temperature_moves: int, temperature: float,
         mirrored_state.push_uci(uci_mirrored)
         mirrored_state = mirrored_state.mirror()
         move_counter += 1
+        # O(1) tree walk by the action we just took. Without this, the next
+        # search()'s update_root walks the children list and state-compares
+        # (slow). With it, the chosen child is the new root immediately.
+        mcts.apply_action(action)
 
     # game_result()[0] is from the perspective of the player to move in
     # mirrored_state right now (i.e. the next-to-move at the time the loop
@@ -122,10 +150,12 @@ def play_one_game(mcts: MCTS, temperature_moves: int, temperature: float,
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", required=True, help="path to .pth model")
+    p.add_argument("--architecture", choices=list(ARCHITECTURES), default="seresnet",
+                   help="NN class to instantiate before loading checkpoint")
     p.add_argument("--games", type=int, default=100, help="games to generate")
     p.add_argument("--sims", type=int, default=200, help="MCTS simulations per move")
     p.add_argument("--dirichlet-eps", type=float, default=0.25, help="exploration noise at root")
-    p.add_argument("--temperature-moves", type=int, default=30, help="plies of stochastic sampling")
+    p.add_argument("--temperature-moves", type=int, default=15, help="plies of stochastic sampling")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--truncation", type=int, default=300, help="max plies before draw")
     p.add_argument("--seed", type=int, default=None, help="RNG seed for action sampling")
@@ -138,7 +168,7 @@ def main() -> None:
         print("Device: cpu")
 
     print(f"Loading {cli.checkpoint}")
-    mcts, _, args = build_mcts(cli.checkpoint, cli.sims, cli.dirichlet_eps)
+    mcts, _, args = build_mcts(cli.checkpoint, cli.sims, cli.dirichlet_eps, cli.architecture)
     rng = np.random.default_rng(cli.seed)
 
     all_boards: list[np.ndarray] = []

@@ -56,11 +56,40 @@ class BatchedMCTS:
         # Per-search set of leaf depths; cleared at the start of `search`.
         self._visited_depths: set[int] = set()
 
-    def update_root(self, state: chess.Board, move_counter: int | None = None) -> None:
-        """Walk to the child whose position matches `state`. Reset if no match.
-        Optional move_counter check prevents reusing subtrees with stale counters."""
+    def apply_action(self, action: int) -> None:
+        """O(1) walk by known action -- see mcts.MCTS.apply_action."""
         if self.root is None:
             return
+        child = self.root.children.get(action)
+        if child is None:
+            self.root = None
+            return
+        self.root = child
+        self.root.parent = None
+
+    def update_root(self, state: chess.Board, move_counter: int | None = None) -> None:
+        """Walk to the descendant whose position matches `state` (within two
+        levels) and make it the new root. Reset if no match.
+
+        Depth 1: self-play (search called every half-move). Depth 2:
+        match.py / uci.py / lichess-bot, where search runs only on our turn
+        and the new state is a grandchild of the previous root (our move +
+        opp's reply). Without the depth-2 walk, the entire tree was being
+        discarded every move in those contexts.
+
+        Idempotent: if root already matches `state`, no-op (allows callers
+        to pre-walk via `apply_action`).
+
+        See mcts.py:MCTS.update_root for full rationale.
+        """
+        if self.root is None:
+            return
+        # Already at the right state.
+        if self.root.state == state and (
+            move_counter is None or self.root.move_counter == move_counter
+        ):
+            return
+        # Depth 1: direct child (self-play half-move transition).
         for child in self.root.children.values():
             if child.state == state and (
                 move_counter is None or child.move_counter == move_counter
@@ -68,45 +97,89 @@ class BatchedMCTS:
                 self.root = child
                 self.root.parent = None
                 return
+        # Depth 2: grandchild (bot's move + opp's reply between searches).
+        for child in self.root.children.values():
+            for grandchild in child.children.values():
+                if grandchild.state == state and (
+                    move_counter is None or grandchild.move_counter == move_counter
+                ):
+                    self.root = grandchild
+                    self.root.parent = None
+                    return
         self.root = None
 
     # ---------- selection with virtual loss ----------
 
     @staticmethod
-    def _select_action_with_vloss(node: Node) -> int:
-        """PUCT with LC0-style 'unscored virtual visit' in-flight accounting.
+    def _select_action_with_vloss(node: Node) -> tuple[int, float]:
+        """PUCT with μ-FPU and Virtual Mean (Cazenave 2021 "Batch MCTS").
 
-        Differs from classic AlphaZero virtual loss (which treated in-flight
-        sims as fake -1 outcomes, distorting Q during search): we leave Q
-        untouched and only inflate the U-term denominator via N + vloss.
-        This still deters duplicate paths (via the 1/(1+N+vloss) factor)
-        without biasing the value estimate.
+        Two refinements over the plain "unscored virtual visit" scheme:
+          * μ-FPU: legal moves with no real or in-flight visits are NOT scored
+            as Q=0 (which is pessimistic for the side to move). Instead, they
+            get FPU = mean Q of explored children at this node (`mu_fpu`).
+            Cazenave §3.3: "set [FPU] to the average mean of the node".
+          * Virtual Mean: each child's effective Q in UCB blends real and
+            virtual statistics:
+                Q_eff = (Q + virtual_Q) / (N + virtual_loss)
+            Cazenave §4.2: "the Virtual Mean ... adds the mean of the move to
+            the sum of its evaluations in order to have more realistic
+            statistics for the next descent."
 
-        Parent side uses real N (matches sequential PUCT)."""
-        c_base = node.args["c_base"]
-        c_init = node.args["c_init"]
-        t = node.args["t"]
-        c_puct = math.log((1 + node.N + c_base) / c_base) + c_init
-        sqrt_parent_N = math.sqrt(max(node.N, 1))
+        Returns:
+            (action, mu_used) where `mu_used` is the Q value treated as this
+            move's evaluation for purposes of UCB. The caller MUST add
+            `mu_used` to the chosen child's `virtual_Q` (and 1 to its
+            `virtual_loss`) so subsequent sims in the same batch see the
+            Virtual-Mean-updated statistics, and revert both on undo.
+        """
+        c_base: float = node.args["c_base"]
+        c_init: float = node.args["c_init"]
+        t: float = node.args["t"]
+        # PUCT invariant: N(parent) = sum_a N(parent, a). With virtual loss
+        # inflating child denominators, the parent numerator must inflate too
+        # so the exploration term scales correctly with in-flight visits.
+        parent_N_eff: int = node.N + node.virtual_loss
+        c_puct: float = math.log((1 + parent_N_eff + c_base) / c_base) + c_init
+        sqrt_parent_N: float = math.sqrt(max(parent_N_eff, 1))
 
         assert node.policy is not None
-        legal = np.nonzero(node.policy)[0]
-        priors = node.policy[legal]
+        legal: np.ndarray = np.nonzero(node.policy)[0]
+        priors: np.ndarray = node.policy[legal]
 
-        child_Q = np.zeros(len(legal), dtype=np.float64)
-        # `child_N_started` = real visits + in-flight (vloss). Used in U denom only.
-        child_N_started = np.zeros(len(legal), dtype=np.int64)
+        # μ-FPU: visit-weighted mean Q over children with at least one real
+        # visit. Σ Q / Σ N treats every observation equally rather than every
+        # child equally, so a 1-visit outlier can't yank the FPU around.
+        # Excludes virtual-only contributions (we want a stable signal here,
+        # not one that drifts with the in-flight batch).
+        explored_Q_sum: float = 0.0
+        explored_N_sum: int = 0
+        for c in node.children.values():
+            if c.N > 0:
+                explored_Q_sum += c.Q
+                explored_N_sum += c.N
+        mu_fpu: float = (explored_Q_sum / explored_N_sum) if explored_N_sum > 0 else 0.0
+
+        # Per-action effective Q: combine real + virtual when there are any
+        # visits, else fall back to mu_fpu.
+        child_Q: np.ndarray = np.full(len(legal), mu_fpu, dtype=np.float64)
+        child_N_started: np.ndarray = np.zeros(len(legal), dtype=np.int64)
         for i, a in enumerate(legal):
             child = node.children.get(int(a))
             if child is None:
                 continue
-            if child.N > 0:
-                child_Q[i] = child.Q / child.N  # unbiased: only real visits
-            child_N_started[i] = child.N + child.virtual_loss
+            total_n: int = child.N + child.virtual_loss
+            child_N_started[i] = total_n
+            if total_n > 0:
+                child_Q[i] = (child.Q + child.virtual_Q) / total_n
 
-        ucb = child_Q + c_puct * (priors ** (1.0 / t)) * sqrt_parent_N / (1 + child_N_started)
-        best_local = int(np.argmax(ucb))
-        return int(legal[best_local])
+        ucb: np.ndarray = (
+            child_Q + c_puct * (priors ** (1.0 / t)) * sqrt_parent_N / (1 + child_N_started)
+        )
+        best_local: int = int(np.argmax(ucb))
+        chosen_action: int = int(legal[best_local])
+        mu_used: float = float(child_Q[best_local])
+        return chosen_action, mu_used
 
     # ---------- proof propagation (mirrors mcts.MCTS._try_prove) ----------
 
@@ -134,53 +207,72 @@ class BatchedMCTS:
 
     # ---------- one batch of sims ----------
 
-    def _select_one_leaf(self, root: Node) -> tuple[list[Node], Node, str, float | None]:
-        """Walk from root to a leaf, applying virtual loss to each node on
-        the way down. Returns (path, leaf, status, terminal_value-or-None)."""
-        path = [root]
-        node = root
-        # Apply virtual loss to root (also counts as in-flight through root).
+    def _select_one_leaf(
+        self, root: Node
+    ) -> tuple[list[tuple[Node, float]], Node, str, float | None]:
+        """Walk from root to a leaf, applying virtual loss + Virtual Mean to
+        each node on the way down.
+
+        Returns (path, leaf, status, terminal_value-or-None) where `path` is
+        a list of `(node, mu_used)` tuples. `mu_used` is the Q value that was
+        added to that node's `virtual_Q` when the descent picked it. The root
+        has `mu_used=0.0` because it is never "selected" by a parent.
+
+        The caller is responsible for reverting BOTH `virtual_loss` (decrement
+        by 1) AND `virtual_Q` (subtract `mu_used`) on every node in the path
+        whether the sim is backpropagated or skipped.
+        """
+        path: list[tuple[Node, float]] = [(root, 0.0)]
+        node: Node = root
+        # Virtual loss on root inflates only its own N denominator for any
+        # peer batched sims that bottom-out at root (none in practice, but
+        # keeps the bookkeeping symmetric with the rest of the path).
         node.virtual_loss += 1
         while True:
             if node.is_terminal():
-                value = float(f.game_result(node.state, node.move_counter, 1000)[0])
+                value: float = float(
+                    f.game_result(node.state, node.move_counter, 1000)[0]
+                )
                 # value is from current player's POV: -1 mated, 0 drawn.
                 if value == 0.0 or value == -1.0:
                     node.proven_value = int(value)
                 return path, node, "terminal", value
             if not node.is_expanded():
                 return path, node, "needs_eval", None
-            action = self._select_action_with_vloss(node)
+            action, mu_used = self._select_action_with_vloss(node)
             if action in node.children:
                 node = node.children[action]
             else:
                 node = node.materialize_child(action)
             node.virtual_loss += 1
-            path.append(node)
+            node.virtual_Q += mu_used
+            path.append((node, mu_used))
 
     def _simulate_batch(self, root: Node, sims_remaining: int) -> int:
         """Run up to `min(batch_size, sims_remaining)` parallel sims.
         Returns the number of sims that actually contributed (duplicates
         whose leaf is already in the batch are skipped to avoid double-
         backprop of the same value)."""
-        batch_target = min(self.batch_size, sims_remaining)
+        batch_target: int = min(self.batch_size, sims_remaining)
 
         # Phase 1: selection. Each entry is (path, leaf, status, value-or-None).
-        in_flight: list[tuple[list[Node], Node, str, float | None]] = []
+        # `path` is a list of (node, mu_used) tuples produced by _select_one_leaf;
+        # mu_used is the Virtual-Mean Q value added to that node's virtual_Q.
+        in_flight: list[tuple[list[tuple[Node, float]], Node, str, float | None]] = []
         for _ in range(batch_target):
             in_flight.append(self._select_one_leaf(root))
 
         # Deduplicate needs_eval leaves: if two sims hit the same unexpanded
         # leaf, only the first one is evaluated/backpropagated. The duplicate
-        # has its virtual losses undone and is skipped. This matches sequential
+        # has its virtual stats undone and is skipped. This matches sequential
         # MCTS semantics where after expanding a leaf, subsequent sims descend
         # deeper rather than re-evaluating the same position.
         seen_leaves: set[int] = set()
         skip: set[int] = set()
         unique_eval: list[tuple[int, Node]] = []
-        for sim_idx, (path, leaf, status, _) in enumerate(in_flight):
+        for sim_idx, (_, leaf, status, _) in enumerate(in_flight):
             if status == "needs_eval":
-                lid = id(leaf)
+                lid: int = id(leaf)
                 if lid in seen_leaves:
                     skip.add(sim_idx)
                     continue
@@ -188,22 +280,37 @@ class BatchedMCTS:
                 unique_eval.append((sim_idx, leaf))
 
         # Phase 2: batched NN evaluation for unique needs_eval leaves.
+        # Single GPU→CPU sync: concat values + policies into one (B, 4673)
+        # tensor and pull across PCIe once. Same idea as mcts.py:expand_lazy.
         if unique_eval:
-            inputs = torch.stack([
+            inputs: torch.Tensor = torch.stack([
                 f.prepare_input(leaf.state, leaf.move_counter)
                 for _, leaf in unique_eval
             ]).to(self.args["device"])
-            with torch.no_grad():
+            with torch.inference_mode():
                 value_t, policy_t = self.model(inputs)
-            values = value_to_scalar(
-                value_t, mode=self.args.get("value_scalar", "expected")
-            ).cpu().numpy().flatten()
-            masks_np = np.stack([f.legal_mask(leaf.state) for _, leaf in unique_eval])
-            masks_t = torch.from_numpy(masks_np).to(policy_t.device)
-            masked_logits = policy_t.masked_fill(~masks_t, float("-inf"))
-            policies = torch.softmax(masked_logits, dim=1).cpu().numpy()
 
-            for (sim_idx, leaf), val, pol, mask_row in zip(unique_eval, values, policies, masks_np):
+            masks_np: np.ndarray = np.stack(
+                [f.legal_mask(leaf.state) for _, leaf in unique_eval]
+            )
+            masks_t: torch.Tensor = torch.from_numpy(masks_np).to(policy_t.device)
+
+            values_t: torch.Tensor = value_to_scalar(
+                value_t, mode=self.args.get("value_scalar", "expected")
+            ).reshape(-1, 1)                                    # (B, 1) on GPU
+            masked_logits: torch.Tensor = policy_t.masked_fill(~masks_t, float("-inf"))
+            policies_t: torch.Tensor = torch.softmax(masked_logits, dim=1)  # (B, 4672)
+
+            # ONE sync replaces two separate .cpu() calls.
+            combined: np.ndarray = torch.cat(
+                [values_t, policies_t], dim=1
+            ).cpu().numpy()
+            values: np.ndarray = combined[:, 0]
+            policies: np.ndarray = combined[:, 1:]
+
+            for (sim_idx, leaf), val, pol, mask_row in zip(
+                unique_eval, values, policies, masks_np
+            ):
                 if leaf.raw_policy is None:
                     leaf.raw_policy = pol
                     leaf.policy = pol.copy()
@@ -211,25 +318,32 @@ class BatchedMCTS:
                 path, _, _, _ = in_flight[sim_idx]
                 in_flight[sim_idx] = (path, leaf, "evaluated", float(val))
 
-        # Phase 3: backprop + virtual loss removal + proven-value propagation.
-        gamma = self.args.get("discount", 1.0)
-        effective = 0
-        for sim_idx, (path, leaf, status, value) in enumerate(in_flight):
+        # Phase 3: backprop + virtual-stat revert + proven-value propagation.
+        # Every in-flight sim -- whether successfully backpropagated or skipped
+        # -- MUST revert both virtual_loss (-1) and virtual_Q (-mu_used) on
+        # every (node, mu_used) pair in its path, or the in-flight stats leak
+        # into future batches and corrupt selection.
+        gamma: float = self.args.get("discount", 1.0)
+        effective: int = 0
+        for sim_idx, (path, leaf, _status, value) in enumerate(in_flight):
             if sim_idx in skip or value is None:
-                # Duplicate (or unexpected): undo virtual losses, don't backprop.
-                for n in path:
+                # Duplicate (or unexpected): undo virtual stats, don't backprop.
+                for n, mu_used in path:
                     if n.virtual_loss > 0:
                         n.virtual_loss -= 1
+                        n.virtual_Q -= mu_used
                 continue
-            sign = -1.0
-            for n in reversed(path):
+            # Successful sim: real backprop + virtual revert in the same walk.
+            sign: float = -1.0
+            for n, mu_used in reversed(path):
                 n.N += 1
                 n.Q += sign * value
                 if n.virtual_loss > 0:
                     n.virtual_loss -= 1
+                    n.virtual_Q -= mu_used
                 sign = -sign * gamma
             self._visited_depths.add(leaf.depth)
-            for n in reversed(path):
+            for n, _mu in reversed(path):
                 self._try_prove(n)
             effective += 1
 

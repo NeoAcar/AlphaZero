@@ -25,6 +25,7 @@ bot always thinks for the configured number of simulations. Add
 time-aware behaviour later if you want clocked games.
 """
 import contextlib
+import math
 import sys
 import traceback
 
@@ -33,7 +34,8 @@ import numpy as np
 import torch
 
 from alphazero import utils as f
-from alphazero.mcts import MCTS
+#from alphazero.mcts import MCTS
+from alphazero.batched_mcts import BatchedMCTS as MCTS
 from alphazero.nn import ResNet, SEResNet, SEResNetWDL, value_to_scalar
 
 
@@ -66,11 +68,11 @@ def send(msg: str) -> None:
 
 class UciEngine:
     DEFAULT_OPTS = {
-        "Type": "policy_only",              # one of: mcts | policy_only | value_only
-        "Checkpoint": "models/model_best_combined_wdl.pth",
-        "Architecture": "seresnetwdl",
+        "Type": "mcts",              # one of: mcts | policy_only | value_only
+        "Checkpoint": "models/model_best_combined_5.pth",
+        "Architecture": "seresnet",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
-        "Sims": 1200,
+        "Sims":1200,
         "Temperature": 1.0,
         "TempMoves": 6,
         "DirichletEps": 0.0,
@@ -82,7 +84,7 @@ class UciEngine:
         "Checkpoint": ("string", None, None),
         "Architecture": ("string", None, None),
         "ValueScalar": ("string", None, None),
-        "Sims": ("spin", 1, 100000),
+        "Sims": ("spin", 2, 100000),
         "Temperature": ("string", None, None),
         "TempMoves": ("spin", 0, 200),
         "DirichletEps": ("string", None, None),
@@ -100,6 +102,11 @@ class UciEngine:
         self.real_board = chess.Board()
         self.mirror_state = chess.Board()
         self.move_counter = 0
+        # Used to detect when a new `position` command is just an extension
+        # of the last one (lichess-bot sends the full move list each turn).
+        # Extension -> only push the tail; otherwise reset + walk full list.
+        self._move_history: list[str] = []
+        self._start_fen: str | None = None
         self._rng = np.random.default_rng()
         self._quitting = False
 
@@ -120,7 +127,7 @@ class UciEngine:
         model.eval()
         try:
             model = torch.compile(model, mode="reduce-overhead")
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = model(torch.zeros(1, 19, 8, 8, device=self.device))
             log("torch.compile + warm-up done")
         except Exception as e:
@@ -143,6 +150,7 @@ class UciEngine:
             "t": 1,
             "device": self.device,
             "value_scalar": str(self.options["ValueScalar"]),
+            "batch_size": 8,
         }
         assert self.model is not None
         self.mcts = MCTS(args, self.model)
@@ -165,17 +173,33 @@ class UciEngine:
             self.real_board = chess.Board()
             self.mirror_state = chess.Board()
             self.move_counter = 0
+        self._move_history = []
+        self._start_fen = start_fen
         if self.mcts is not None:
             self.mcts.root = None
 
     def _push_move(self, uci_real: str) -> None:
-        """Apply a move (in real-coord UCI) to both boards."""
+        """Apply a move (in real-coord UCI) to both boards and walk the
+        MCTS root forward by the equivalent action (O(1)). Tree subtree for
+        this move is retained for the next search.
+        """
         mover_was_white = self.real_board.turn == chess.WHITE
         self.real_board.push_uci(uci_real)
         mir_uci = uci_real if mover_was_white else f.mirror_move(uci_real)
+        # Compute action BEFORE the mirror() — alphazero_to_move expects the
+        # board the move was made from.
+        action: int | None = None
+        if self.mcts is not None and self.mcts.root is not None:
+            try:
+                action = f.move_to_alphazero(mir_uci)
+            except Exception:
+                action = None
         self.mirror_state.push_uci(mir_uci)
         self.mirror_state = self.mirror_state.mirror()
         self.move_counter += 1
+        self._move_history.append(uci_real)
+        if action is not None and self.mcts is not None:
+            self.mcts.apply_action(action)
 
     # ---------- UCI command handlers ----------
 
@@ -248,12 +272,30 @@ class UciEngine:
             return
         if rest and rest[0] == "moves":
             moves = rest[1:]
-        self._reset_position(start_fen)
-        for m in moves:
-            self._push_move(m)
-        log(f"position set: {len(moves)} moves applied, "
-            f"turn={'w' if self.real_board.turn == chess.WHITE else 'b'}, "
-            f"counter={self.move_counter}")
+
+        # Lichess-bot sends the full move list each turn. If this `position`
+        # is just an extension of the last one (same start_fen, same move
+        # prefix), only push the new tail -- the MCTS tree from previous
+        # searches carries forward. Otherwise full reset and walk from scratch.
+        is_extension = (
+            start_fen == self._start_fen
+            and len(moves) >= len(self._move_history)
+            and moves[:len(self._move_history)] == self._move_history
+        )
+        if is_extension:
+            new_moves = moves[len(self._move_history):]
+            for m in new_moves:
+                self._push_move(m)
+            log(f"position extended: +{len(new_moves)} moves (total {len(moves)}), "
+                f"turn={'w' if self.real_board.turn == chess.WHITE else 'b'}, "
+                f"counter={self.move_counter}")
+        else:
+            self._reset_position(start_fen)
+            for m in moves:
+                self._push_move(m)
+            log(f"position reset: {len(moves)} moves applied, "
+                f"turn={'w' if self.real_board.turn == chess.WHITE else 'b'}, "
+                f"counter={self.move_counter}")
 
     def cmd_go(self, _args: list[str]) -> None:
         # Time controls are ignored for now; we just use configured Sims.
@@ -299,9 +341,45 @@ class UciEngine:
             log("proven forced mate")
         action = self._select_action(probs)
         mir_uci = f.alphazero_to_move(action, self.mirror_state)
-        return mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
+        real_uci = mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
+        self._emit_mcts_info(action, real_uci)
+        return real_uci
 
-    @torch.no_grad()
+    def _emit_mcts_info(self, action: int, real_uci: str) -> None:
+        """UCI `info` line so GUIs (cute chess, lichess-bot's web view, etc.)
+        can render the eval bar. Uses the chosen root child's mean Q as the
+        position value, converted to centipawns via the inverse Lichess sigmoid.
+        """
+        if self.mcts is None or self.mcts.root is None:
+            return
+        root = self.mcts.root
+        child = root.children.get(action)
+        if child is None or child.N == 0:
+            return
+        q = child.Q / child.N        # bot's-POV mean value of chosen line, in [-1, +1]
+        nodes = sum(c.N for c in root.children.values())
+        depth = int(getattr(self.mcts, "last_max_depth", 0))
+        if getattr(self.mcts, "last_was_proven_mate", False):
+            send(f"info depth {depth} score mate 1 nodes {nodes} pv {real_uci}")
+            send(f"info string eval=#mate {real_uci}")  # human-readable, forwarded to chat
+        else:
+            cp = self._value_to_cp(q)
+            send(f"info depth {depth} score cp {cp} nodes {nodes} pv {real_uci}")
+            # `info string` lines are forwarded to spectator chat by lichess-bot.
+            # Format: "cp/100" so a human-readable +0.62 etc. instead of raw cp.
+            send(f"info string eval={cp/100:+.2f} ({nodes} nodes, depth {depth})")
+
+    @staticmethod
+    def _value_to_cp(v: float) -> int:
+        """Inverse of the Lichess sigmoid used in training:
+            v = 2 * sigmoid(0.00368208 * cp) - 1
+        gives `cp = log((1+v)/(1-v)) / 0.00368208`. Clipped to ±0.9999 to
+        avoid log(inf) on near-saturated values.
+        """
+        v = max(min(float(v), 0.9999), -0.9999)
+        return int(round(math.log((1.0 + v) / (1.0 - v)) / 0.00368208))
+
+    @torch.inference_mode()
     def _go_policy_only(self) -> str:
         assert self.model is not None
         inputs = f.prepare_input(self.mirror_state, self.move_counter).unsqueeze(0).to(self.device)
@@ -313,7 +391,7 @@ class UciEngine:
         mir_uci = f.alphazero_to_move(action, self.mirror_state)
         return mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _go_value_only(self) -> str:
         assert self.model is not None
         mover_was_white = self.real_board.turn == chess.WHITE

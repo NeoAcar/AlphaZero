@@ -186,7 +186,7 @@ class ValueOnlyPlayer:
         # "expected" = P(W) - P(L) (default). "win_only" = P(W) (ignores draw rate).
         self.value_scalar = cfg.get("value_scalar", "expected")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _batch_values(self, mirrored_states: list[chess.Board], move_counter: int) -> np.ndarray:
         inputs = torch.stack(
             [f.prepare_input(s, move_counter) for s in mirrored_states]
@@ -251,7 +251,7 @@ class PolicyOnlyPlayer:
         self.model.eval()
         try:
             self.model = torch.compile(self.model)
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(torch.zeros(1, 19, 8, 8, device=self.device))
         except Exception:
             pass
@@ -261,7 +261,7 @@ class PolicyOnlyPlayer:
         self.temperature = float(cfg.get("temperature", 1.0))
         self._rng = np.random.default_rng(cfg.get("sampling_seed"))
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def select_move(self, real_board, mirrored_state, move_counter):
         inputs = f.prepare_input(mirrored_state, move_counter).unsqueeze(0).to(self.device)
         _value, policy_logits = self.model(inputs)
@@ -319,7 +319,7 @@ class MctsPlayer:
             try:
                 self.model = torch.compile(self.model)
                 warm_bs = batch_size if use_batched else 1
-                with torch.no_grad():
+                with torch.inference_mode():
                     _ = self.model(torch.zeros(warm_bs, 19, 8, 8, device=args["device"]))
                     if use_batched and warm_bs != 1:
                         _ = self.model(torch.zeros(1, 19, 8, 8, device=args["device"]))
