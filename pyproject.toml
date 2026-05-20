@@ -10,6 +10,7 @@ dependencies = [
     "torch>=2.5",
     "tqdm>=4.66",
     "wandb>=0.18",
+    "flask>=3.0",
 ]
 
 [tool.uv.sources]

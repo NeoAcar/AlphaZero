@@ -1,4 +1,6 @@
 import math
+import time
+from typing import Callable, Optional
 
 import chess
 import numpy as np
@@ -49,6 +51,11 @@ class Node:
         # Cached after expand_lazy: number of legal moves at this position
         # (used by the AND-node "all expanded" check during proof propagation).
         self.n_legal: int | None = None
+        # Raw NN value head output for this position (scalar in [-1, +1] after
+        # value_to_scalar collapse). Cached on first expansion so dashboards /
+        # diagnostics can compare the NN's pre-search verdict against the
+        # search-refined Q without spending an extra forward.
+        self.raw_nn_value: float | None = None
         # Virtual loss counter for batched MCTS (number of in-flight sims
         # that have passed through this node). Always 0 in sequential MCTS.
         self.virtual_loss: int = 0
@@ -147,6 +154,7 @@ class Node:
         value = float(combined[0])
         self.raw_policy = combined[1:]
         self.policy = self.raw_policy.copy()
+        self.raw_nn_value = value
         return value
 
 
@@ -299,7 +307,13 @@ class MCTS:
         # All expanded and proven. value = max(-child.proven_value) = -min(child.proven_value)
         node.proven_value = -min(child_provens)
 
-    def search(self, state: chess.Board, move_counter: int) -> np.ndarray:
+    def search(
+        self,
+        state: chess.Board,
+        move_counter: int,
+        info_callback: Optional[Callable[["MCTS", int, float, int], None]] = None,
+        info_interval_s: float = 0.2,
+    ) -> np.ndarray:
         root_state = state.copy()
         if self.root is not None:
             self.update_root(state, move_counter)
@@ -333,11 +347,29 @@ class MCTS:
             self.root.policy = self.root.raw_policy.copy()
 
         self._visited_depths.clear()
-        for _ in range(self.args["num_simulation"]):
+        total_sims = int(self.args["num_simulation"])
+        t_start = time.monotonic()
+        t_last_report = t_start
+        for completed in range(1, total_sims + 1):
             self._simulate(self.root)
+            if info_callback is not None:
+                now = time.monotonic()
+                if now - t_last_report >= info_interval_s:
+                    if self._visited_depths:
+                        self.last_max_depth = max(self._visited_depths) - min_depth
+                    try:
+                        info_callback(self, completed, now - t_start, self.last_max_depth)
+                    except Exception:
+                        pass
+                    t_last_report = now
         self.last_max_depth = (
             max(self._visited_depths) - min_depth if self._visited_depths else 0
         )
+        if info_callback is not None:
+            try:
+                info_callback(self, total_sims, time.monotonic() - t_start, self.last_max_depth)
+            except Exception:
+                pass
 
         # If the solver has proven that bot wins, play it.
         # Bot wins by playing into a child whose player (opp) is proven losing,

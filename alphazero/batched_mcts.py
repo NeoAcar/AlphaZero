@@ -34,6 +34,8 @@ Notes:
       carries over unchanged via shared Node class.
 """
 import math
+import time
+from typing import Callable, Optional
 
 import chess
 import numpy as np
@@ -315,6 +317,7 @@ class BatchedMCTS:
                     leaf.raw_policy = pol
                     leaf.policy = pol.copy()
                     leaf.n_legal = int(mask_row.sum())
+                    leaf.raw_nn_value = float(val)
                 path, _, _, _ = in_flight[sim_idx]
                 in_flight[sim_idx] = (path, leaf, "evaluated", float(val))
 
@@ -351,7 +354,13 @@ class BatchedMCTS:
 
     # ---------- top-level search ----------
 
-    def search(self, state: chess.Board, move_counter: int) -> np.ndarray:
+    def search(
+        self,
+        state: chess.Board,
+        move_counter: int,
+        info_callback: Optional[Callable[["BatchedMCTS", int, float, int], None]] = None,
+        info_interval_s: float = 0.2,
+    ) -> np.ndarray:
         root_state = state.copy()
         if self.root is not None:
             self.update_root(state, move_counter)
@@ -383,11 +392,31 @@ class BatchedMCTS:
         self._visited_depths.clear()
         total_sims = int(self.args["num_simulation"])
         completed = 0
+        t_start = time.monotonic()
+        t_last_report = t_start
         while completed < total_sims:
             completed += self._simulate_batch(self.root, total_sims - completed)
+            # Update last_max_depth incrementally so live info_callback can read it.
+            if self._visited_depths:
+                self.last_max_depth = max(self._visited_depths) - min_depth
+            if info_callback is not None:
+                now = time.monotonic()
+                if now - t_last_report >= info_interval_s:
+                    try:
+                        info_callback(self, completed, now - t_start, self.last_max_depth)
+                    except Exception:
+                        # Never let monitoring break the search.
+                        pass
+                    t_last_report = now
         self.last_max_depth = (
             max(self._visited_depths) - min_depth if self._visited_depths else 0
         )
+        if info_callback is not None:
+            # Final tick so the GUI gets the last state before bestmove is sent.
+            try:
+                info_callback(self, completed, time.monotonic() - t_start, self.last_max_depth)
+            except Exception:
+                pass
 
         # Force-mate: bot wins by playing into a child whose player (opp) is
         # proven losing -- child.proven_value == -1 in the perspective-free

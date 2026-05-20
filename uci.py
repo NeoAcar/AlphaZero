@@ -25,9 +25,14 @@ bot always thinks for the configured number of simulations. Add
 time-aware behaviour later if you want clocked games.
 """
 import contextlib
+import json
 import math
+import os
 import sys
+import time
 import traceback
+import urllib.error
+import urllib.request
 
 import chess
 import numpy as np
@@ -66,6 +71,38 @@ def send(msg: str) -> None:
     sys.stdout.flush()
 
 
+def send_raw(msg: str) -> None:
+    """Write to the *original* process stdout, bypassing any redirect_stdout
+    in effect. Live info callbacks need this because `_go_mcts` redirects
+    sys.stdout -> sys.stderr while MCTS runs to swallow stray prints."""
+    sys.__stdout__.write(msg + "\n")
+    sys.__stdout__.flush()
+
+
+# Dashboard telemetry: POST JSON events to monitor.py. Fail-fast (50ms) so
+# the engine is unaffected when the dashboard isn't running.
+MONITOR_URL = os.environ.get("UCI_MONITOR_URL", "http://localhost:8765/event")
+_MONITOR_TIMEOUT = 0.05
+
+
+def post_event(payload: dict) -> None:
+    if not MONITOR_URL:
+        return
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            MONITOR_URL, data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=_MONITOR_TIMEOUT) as resp:
+            resp.read(1)  # drain so the socket can be reused
+    except (urllib.error.URLError, OSError, TimeoutError):
+        # Dashboard not running, or transient hiccup -- swallow.
+        pass
+    except Exception:
+        pass
+
+
 class UciEngine:
     DEFAULT_OPTS = {
         "Type": "mcts",              # one of: mcts | policy_only | value_only
@@ -73,7 +110,7 @@ class UciEngine:
         "Architecture": "seresnet",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
         "Sims":1200,
-        "Temperature": 1.0,
+        "Temperature": 0.6,
         "TempMoves": 6,
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
@@ -109,6 +146,11 @@ class UciEngine:
         self._start_fen: str | None = None
         self._rng = np.random.default_rng()
         self._quitting = False
+        # Dashboard telemetry state.
+        self._go_start_t: float | None = None         # monotonic time of last `go`
+        self._bot_color: str | None = None            # set on each `go`
+        self._last_bot_chosen_uci: str | None = None  # real-coord UCI of bot's pending move
+        self._pending_bot_eval: dict | None = None    # eval/duration to attach to next _push_move
 
     # ---------- model / mcts plumbing ----------
 
@@ -175,8 +217,18 @@ class UciEngine:
             self.move_counter = 0
         self._move_history = []
         self._start_fen = start_fen
+        self._pending_bot_eval = None
+        self._last_bot_chosen_uci = None
         if self.mcts is not None:
             self.mcts.root = None
+        # Tell dashboard: fresh game / position reset.
+        post_event({
+            "kind": "state",
+            "fen": self.real_board.fen(),
+            "lastmove": None,
+            "ply": self.move_counter,
+            "bot_color": self._bot_color,
+        })
 
     def _push_move(self, uci_real: str) -> None:
         """Apply a move (in real-coord UCI) to both boards and walk the
@@ -200,6 +252,24 @@ class UciEngine:
         self._move_history.append(uci_real)
         if action is not None and self.mcts is not None:
             self.mcts.apply_action(action)
+        # Dashboard `move` event. If this push is the bot's own just-chosen
+        # move (already emitted live at end of cmd_go, before bestmove was
+        # sent), skip emission — otherwise the browser receives bot+opp moves
+        # in the same batch and only the final state is visually perceptible.
+        if (self._last_bot_chosen_uci == uci_real
+                and self._pending_bot_eval is not None):
+            self._pending_bot_eval = None
+            self._last_bot_chosen_uci = None
+            return
+        evt: dict = {
+            "kind": "move",
+            "fen": self.real_board.fen(),
+            "lastmove": uci_real,
+            "ply": self.move_counter,
+            "turn": "white" if self.real_board.turn == chess.WHITE else "black",
+            "mover": "opp",
+        }
+        post_event(evt)
 
     # ---------- UCI command handlers ----------
 
@@ -297,8 +367,29 @@ class UciEngine:
                 f"turn={'w' if self.real_board.turn == chess.WHITE else 'b'}, "
                 f"counter={self.move_counter}")
 
-    def cmd_go(self, _args: list[str]) -> None:
-        # Time controls are ignored for now; we just use configured Sims.
+    def cmd_go(self, args: list[str]) -> None:
+        # Time controls don't drive search yet (we always use configured Sims),
+        # but we parse wtime/btime/winc/binc/movetime to forward to the dashboard.
+        clock: dict = {}
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if tok in ("wtime", "btime", "winc", "binc", "movetime") and i + 1 < len(args):
+                try:
+                    clock[tok] = int(args[i + 1])
+                    i += 2
+                    continue
+                except ValueError:
+                    pass
+            i += 1
+        self._go_start_t = time.monotonic()
+        self._bot_color = "white" if self.real_board.turn == chess.WHITE else "black"
+        post_event({
+            "kind": "go_start",
+            "clock": clock if clock else None,
+            "bot_color": self._bot_color,
+            "ply": self.move_counter,
+        })
         self._ensure_loaded()
         assert self.model is not None
         ptype = str(self.options["Type"]).lower()
@@ -328,14 +419,52 @@ class UciEngine:
             log(f"chose unparseable {real_uci}; bailing")
             legal = list(self.real_board.legal_moves)
             real_uci = legal[0].uci() if legal else "0000"
+        # Dashboard: emit the bot's move now (post-move FEN, eval, duration)
+        # so the browser shows it as a distinct frame rather than getting
+        # batched together with the opponent's reply in the next position cmd.
+        self._last_bot_chosen_uci = real_uci
+        self._emit_bot_move(real_uci)
         send(f"bestmove {real_uci}")
+
+    def _emit_bot_move(self, real_uci: str) -> None:
+        """Emit a `move` event for the bot's just-chosen move using a copy of
+        real_board (the move isn't pushed yet — the GUI will echo it back via
+        the next `position` command, where _push_move suppresses re-emission)."""
+        post = self.real_board.copy()
+        try:
+            post.push_uci(real_uci)
+        except Exception:
+            return
+        evt: dict = {
+            "kind": "move",
+            "fen": post.fen(),
+            "lastmove": real_uci,
+            "ply": self.move_counter + 1,   # post-move ply count
+            "turn": "white" if post.turn == chess.WHITE else "black",
+            "mover": "bot",
+        }
+        if self._pending_bot_eval is not None:
+            evt.update({
+                "cp": self._pending_bot_eval["cp"],
+                "win_prob": self._pending_bot_eval["win_prob"],
+                "duration": self._pending_bot_eval["duration"],
+            })
+            nn_wp = self._pending_bot_eval.get("nn_win_prob")
+            if nn_wp is not None:
+                evt["nn_win_prob"] = nn_wp
+        post_event(evt)
 
     # ---------- per-Type search backends ----------
 
     def _go_mcts(self) -> str:
         assert self.mcts is not None
         with contextlib.redirect_stdout(sys.stderr):
-            probs = self.mcts.search(self.mirror_state, self.move_counter)
+            probs = self.mcts.search(
+                self.mirror_state,
+                self.move_counter,
+                info_callback=self._live_mcts_info,
+                info_interval_s=0.2,
+            )
         if getattr(self.mcts, "last_was_proven_mate", False):
             send("info string proven forced mate")
             log("proven forced mate")
@@ -343,12 +472,133 @@ class UciEngine:
         mir_uci = f.alphazero_to_move(action, self.mirror_state)
         real_uci = mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
         self._emit_mcts_info(action, real_uci)
+        self._stash_bot_eval(action, real_uci)
         return real_uci
 
+    def _stash_bot_eval(self, action: int, real_uci: str) -> None:
+        """Compute and queue bot's eval for the chosen move; the next
+        `_push_move` matching this UCI will attach it to the dashboard event."""
+        if self.mcts is None or self.mcts.root is None:
+            return
+        child = self.mcts.root.children.get(action)
+        if child is None or child.N == 0:
+            return
+        q = child.Q / child.N           # bot's POV in [-1, +1]
+        win_prob = (q + 1.0) / 2.0
+        cp = self._value_to_cp(q)
+        duration = (
+            time.monotonic() - self._go_start_t if self._go_start_t is not None else None
+        )
+        self._last_bot_chosen_uci = real_uci
+        # Raw NN value for the pre-move root position (bot's POV — root is in
+        # mirror-canonical frame so side-to-move = bot). Cached on Node during
+        # expand_lazy / batched leaf eval; no extra forward.
+        nn_v = self.mcts.root.raw_nn_value
+        nn_win_prob = (nn_v + 1.0) / 2.0 if nn_v is not None else None
+        self._pending_bot_eval = {
+            "q": q, "win_prob": win_prob, "cp": cp, "duration": duration,
+            "nn_win_prob": nn_win_prob,
+        }
+
+    # ---------- live monitoring during MCTS search ----------
+
+    def _pv_from_root(self, mcts, max_len: int = 16) -> list[str]:
+        """Principal variation as a list of UCI moves in *real-board* frame.
+        Descends from root taking the max-visit child at each ply, mirroring
+        the board between plies so coordinate conversion stays correct."""
+        if mcts.root is None or not mcts.root.children:
+            return []
+        real = self.real_board.copy()
+        mir = self.mirror_state.copy()
+        node = mcts.root
+        pv: list[str] = []
+        for _ in range(max_len):
+            if not node.children:
+                break
+            best = max(node.children.items(), key=lambda kv: kv[1].N)
+            action, child = best
+            if child.N == 0:
+                break
+            try:
+                mir_uci = f.alphazero_to_move(action, mir)
+            except Exception:
+                break
+            real_uci = mir_uci if real.turn == chess.WHITE else f.mirror_move(mir_uci)
+            try:
+                real.push_uci(real_uci)
+                mir.push_uci(mir_uci)
+                mir.apply_mirror()
+            except Exception:
+                break
+            pv.append(real_uci)
+            node = child
+        return pv
+
+    def _top_k_children(self, mcts, k: int = 3) -> list[tuple[str, int, float]]:
+        """Return [(real_uci, N, Q/N), ...] for the k most-visited root children."""
+        if mcts.root is None:
+            return []
+        items = [(a, c) for a, c in mcts.root.children.items() if c.N > 0]
+        items.sort(key=lambda ac: ac[1].N, reverse=True)
+        out: list[tuple[str, int, float]] = []
+        for action, child in items[:k]:
+            try:
+                mir_uci = f.alphazero_to_move(action, self.mirror_state)
+            except Exception:
+                continue
+            real_uci = mir_uci if self.real_board.turn == chess.WHITE else f.mirror_move(mir_uci)
+            out.append((real_uci, child.N, child.Q / child.N))
+        return out
+
+    def _live_mcts_info(self, mcts, completed: int, elapsed_s: float, depth: int) -> None:
+        """Emit a UCI `info` line + `info string` summary during search, AND
+        push a `tick` event to the dashboard. Called from inside `mcts.search`
+        while stdout is redirected, so use send_raw() for UCI output."""
+        if mcts.root is None or not mcts.root.children:
+            return
+        best_action, best_child = max(mcts.root.children.items(), key=lambda kv: kv[1].N)
+        if best_child.N == 0:
+            return
+        q = best_child.Q / best_child.N  # bot's POV
+        win_prob = (q + 1.0) / 2.0
+        nodes = sum(c.N for c in mcts.root.children.values())
+        time_ms = max(int(elapsed_s * 1000), 1)
+        nps = int(nodes * 1000 / time_ms)
+        pv = self._pv_from_root(mcts, max_len=12)
+        if not pv:
+            return
+        cp = self._value_to_cp(q)
+        d = max(int(depth), 1)
+        send_raw(
+            f"info depth {d} seldepth {d} score cp {cp} nodes {nodes} "
+            f"nps {nps} time {time_ms} pv {' '.join(pv)}"
+        )
+        top = self._top_k_children(mcts, k=3)
+        if top:
+            tops_str = " ".join(
+                f"{u}(N={n},Q={qv:+.2f})" for u, n, qv in top
+            )
+            send_raw(
+                f"info string sims={completed} eval={cp/100:+.2f} top: {tops_str}"
+            )
+        # Dashboard tick. List-of-dicts for top moves so the JS can format them.
+        post_event({
+            "kind": "tick",
+            "sims": completed,
+            "depth": d,
+            "nodes": nodes,
+            "nps": nps,
+            "cp": cp,
+            "win_prob": win_prob,
+            "elapsed_s": round(elapsed_s, 3),
+            "pv": pv,
+            "top": [{"uci": u, "N": n, "q": qv} for u, n, qv in top],
+        })
+
     def _emit_mcts_info(self, action: int, real_uci: str) -> None:
-        """UCI `info` line so GUIs (cute chess, lichess-bot's web view, etc.)
-        can render the eval bar. Uses the chosen root child's mean Q as the
-        position value, converted to centipawns via the inverse Lichess sigmoid.
+        """Final UCI `info` line for the chosen move. The live callback
+        already streamed updates during search; this is the closing reading
+        the GUI shows after `bestmove` arrives.
         """
         if self.mcts is None or self.mcts.root is None:
             return
@@ -358,16 +608,43 @@ class UciEngine:
             return
         q = child.Q / child.N        # bot's-POV mean value of chosen line, in [-1, +1]
         nodes = sum(c.N for c in root.children.values())
-        depth = int(getattr(self.mcts, "last_max_depth", 0))
+        depth = max(int(getattr(self.mcts, "last_max_depth", 0)), 1)
+        # PV: chosen move + continuation from the chosen subtree by max-visit descent.
+        pv: list[str] = [real_uci]
+        try:
+            after_real = self.real_board.copy()
+            after_real.push_uci(real_uci)
+            after_mir = self.mirror_state.copy()
+            mir_uci = real_uci if self.real_board.turn == chess.WHITE else f.mirror_move(real_uci)
+            after_mir.push_uci(mir_uci)
+            after_mir.apply_mirror()
+            node = child
+            for _ in range(11):
+                if not node.children:
+                    break
+                best = max(node.children.items(), key=lambda kv: kv[1].N)
+                a, c = best
+                if c.N == 0:
+                    break
+                cont_mir = f.alphazero_to_move(a, after_mir)
+                cont_real = cont_mir if after_real.turn == chess.WHITE else f.mirror_move(cont_mir)
+                after_real.push_uci(cont_real)
+                after_mir.push_uci(cont_mir)
+                after_mir.apply_mirror()
+                pv.append(cont_real)
+                node = c
+        except Exception:
+            pass
+        pv_str = " ".join(pv)
         if getattr(self.mcts, "last_was_proven_mate", False):
-            send(f"info depth {depth} score mate 1 nodes {nodes} pv {real_uci}")
-            send(f"info string eval=#mate {real_uci}")  # human-readable, forwarded to chat
+            send(f"info depth {depth} score mate 1 nodes {nodes} pv {pv_str}")
+            send(f"info string eval=#mate {pv_str}")
         else:
             cp = self._value_to_cp(q)
-            send(f"info depth {depth} score cp {cp} nodes {nodes} pv {real_uci}")
-            # `info string` lines are forwarded to spectator chat by lichess-bot.
-            # Format: "cp/100" so a human-readable +0.62 etc. instead of raw cp.
-            send(f"info string eval={cp/100:+.2f} ({nodes} nodes, depth {depth})")
+            send(f"info depth {depth} score cp {cp} nodes {nodes} pv {pv_str}")
+            top = self._top_k_children(self.mcts, k=3)
+            tops_str = " ".join(f"{u}(N={n},Q={qv:+.2f})" for u, n, qv in top)
+            send(f"info string final eval={cp/100:+.2f} depth={depth} nodes={nodes} top: {tops_str}")
 
     @staticmethod
     def _value_to_cp(v: float) -> int:
