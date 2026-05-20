@@ -46,8 +46,11 @@ promotion uses the regular slide encoding, not a promotion encoding.
 
 ### Value convention
 
-- NN value head outputs a scalar in `[-1, +1]` via tanh, from the
-  side-to-move's perspective at the input position.
+- NN value head: `ResNet` and `SEResNet` emit a single scalar in
+  `[-1, +1]` via tanh from the side-to-move's POV; `SEResNetWDL` emits
+  3-class W/D/L logits, collapsed to a scalar in `[-1, +1]` by
+  `value_to_scalar(..., mode=...)` — `"expected"` = `P(W) − P(L)`
+  (default), `"win_only"` = `P(W)`. MCTS Q stores the collapsed scalar.
 - Terminal positions are **hard-assigned** via `game_result()`: -1 if the
   player-to-move is mated, 0 for draw. Never +1 (the winner already moved,
   game ended on opp's loss).
@@ -80,20 +83,36 @@ Library code lives in the `alphazero/` package; entrypoint scripts
 ### Search
 
 - `alphazero/mcts.py` — sequential MCTS. Lazy expansion (one NN forward per
-  sim). Tree reuse via `update_root(state, move_counter)`. Default.
+  sim). Tree reuse via `update_root(state, move_counter)` (now walks 2
+  levels — bot's move + opp's reply — so reuse fires reliably in
+  match.py / uci.py too, not just selfplay). μ-FPU on unvisited children
+  (visit-weighted Σ Q / Σ N over explored children instead of pessimistic
+  FPU=0; +Elo confirmed via internal A/B). O(1) `apply_action(action)`
+  for callers that already know which action was played. Default.
 - `alphazero/batched_mcts.py` — same algorithm but batches `batch_size`
-  leaf evaluations per NN call. Uses LC0-style "unscored virtual visit"
-  (in-flight sims inflate U-denominator only, don't poison Q). Deduplicates
-  leaves within a batch. ~5-10× faster on GPU but slightly weaker per-sim
-  due to virtual-loss exploration spread. Opt-in via `"batched": true` in
-  config.
-- Both expose identical interface: `search(state, move_counter) →
-  action_probs (np.ndarray, shape [4672])`.
+  leaf evaluations per NN call. Uses Cazenave 2021 "Batch MCTS" tricks:
+  **μ-FPU** (unvisited get mean-of-explored Q, not 0) and **Virtual Mean**
+  (`Q_eff = (Q + virtual_Q) / (N + virtual_loss)` blends real + in-flight
+  stats for next descent). Deduplicates leaves within a batch.
+  ~5-10× faster on GPU. Opt-in via `"batched": true` in config.
+- Both expose identical interface: `search(state, move_counter,
+  info_callback=None, info_interval_s=0.2) → action_probs (np.ndarray,
+  shape [4672])`. `info_callback(self, completed, elapsed_s, max_depth)`
+  fires every ~200 ms during search — used by `uci.py` to push live ticks
+  to the monitoring dashboard and UCI `info` lines.
+- `Node.raw_nn_value` caches the value-head output when the node is first
+  expanded, so dashboards / diagnostics can compare NN's pre-search verdict
+  against the search-refined Q without spending an extra forward pass.
 
 ### Network
 
-- `alphazero/nn.py` — ResNet body + policy head (4672 outputs) + value
-  head (single scalar through tanh). Conv → BN → ReLU residual blocks.
+- `alphazero/nn.py` — three variants registered in
+  `uci.ARCHITECTURES`: `ResNet` (plain residual body), `SEResNet`
+  (adds Squeeze-and-Excitation blocks), and `SEResNetWDL` (SE body
+  with a 3-class W/D/L value head instead of a tanh scalar). All share
+  the 4672-output policy head. Pick via UCI `setoption Architecture
+  <name>` or `architecture` in player configs. `value_to_scalar(out,
+  mode)` collapses the WDL logits back to a scalar for MCTS.
 
 ### Player abstractions (`alphazero/players.py`)
 
@@ -139,11 +158,33 @@ Used by `match.py` and `runner.py`. Each player loads from a JSON config in
 ### Live play
 
 - `uci.py` — UCI protocol wrapper. Spoken by lichess-bot and any chess
-  GUI. Configurable via UCI `setoption`: `Sims`, `Checkpoint`,
-  `Temperature`, `TempMoves`, `DirichletEps`, `DirichletAlpha`, `CInit`.
+  GUI. Configurable via UCI `setoption`: `Type` (mcts|policy_only|
+  value_only), `Architecture` (resnet|seresnet|seresnetwdl),
+  `ValueScalar` (expected|win_only — WDL collapse mode), `Checkpoint`,
+  `Sims`, `Temperature`, `TempMoves`, `DirichletEps`, `DirichletAlpha`,
+  `CInit`.
 - `alphazero_uci.sh` — shell launcher that cd's into project and execs
   `uci.py` with the venv python. Point lichess-bot config at this.
 - `play.py` — local terminal UI for human vs bot.
+
+### Live monitoring dashboard
+
+- `monitor.py` — standalone Flask server (port 8765) that renders a live
+  browser dashboard while the bot plays: animated chessboard (chessboard.js),
+  vertical eval bar, MCTS depth / sims / nps / move-time counters, parsed
+  game clock, and a win-prob line plot growing ply-by-ply (MCTS Q/N green +
+  raw NN value blue, both bot's POV). Independent of the engine — run
+  separately and open `http://localhost:8765`.
+- `uci.py` POSTs telemetry events to `http://localhost:8765/event` by
+  default (override via `UCI_MONITOR_URL`, empty value disables). Fail-fast
+  with 50 ms timeout, so the engine is unaffected when the monitor isn't
+  running.
+- Events fire at: `_reset_position` (state), `cmd_go` (go_start + clock),
+  `_live_mcts_info` (tick every ~200 ms during search), `_emit_bot_move`
+  (bot's move at end of cmd_go, with eval + duration), `_push_move`
+  (opp moves). Bot's own move event is emitted **before** `bestmove` to
+  separate visually from the opponent's reply that arrives bundled in the
+  next `position` command.
 
 ## Common commands
 
@@ -220,6 +261,19 @@ echo -e "uci\nposition startpos moves e2e4\nisready\ngo\nquit" \
     | ./alphazero_uci.sh
 ```
 
+### Live monitoring dashboard
+
+```bash
+uv run python monitor.py        # starts Flask on http://localhost:8765
+# then open http://localhost:8765 in a browser
+# and run lichess-bot / a chess GUI as usual
+```
+
+Disable telemetry emission from `uci.py`:
+```bash
+UCI_MONITOR_URL= ./alphazero_uci.sh
+```
+
 ## Performance knobs
 
 - **`torch.compile(mode="reduce-overhead")`** — applied in
@@ -235,10 +289,12 @@ echo -e "uci\nposition startpos moves e2e4\nisready\ngo\nquit" \
 
 ## Gotchas
 
-- **`update_root` only walks one tree level.** Across full bot turns
-  (bot move + opp move), the new state is a grandchild of the previous
-  root, so tree reuse doesn't fire and the tree resets. Reuse fires
-  reliably in `selfplay.py` (which calls `search` every half-move).
+- **`update_root` walks up to two tree levels.** Depth-1 catches the
+  selfplay half-move case; depth-2 catches the match.py / uci.py case
+  where between two `search()` calls the state advances by bot's move
+  + opp's reply (i.e., the new state is a grandchild). Also idempotent:
+  no-op if root already matches `state`, so callers can pre-walk via
+  `apply_action(action)` and then call `update_root` defensively.
 - **The 4672 policy array has dead indices.** ~2814 of 4672 are
   geometrically impossible moves (e.g., knight jumps off the board from
   edge squares). Cross-entropy gradients naturally push them to large
@@ -256,9 +312,12 @@ echo -e "uci\nposition startpos moves e2e4\nisready\ngo\nquit" \
 Tracked as memory items for future Claude sessions; surface when relevant:
 
 - 19 → 119 input planes (add 8-frame history)
-- WDL value head (3-class instead of single tanh scalar; Stockfish has
-  `UCI_ShowWDL` for direct targets)
 - Puzzle fine-tuning (Lichess puzzle CSV → tactical fine-tune)
 - Resign threshold in self-play with calibration loop
-- Virtual losses + batched NN eval already implemented in `alphazero/batched_mcts.py`
 - 1858-action policy head (LC0-compact, ~5-10% model size win)
+- UCI pondering (background search on opp's clock; monitor.py already has
+  the infra to display it)
+- Retune PUCT `c_init` for the sharper WDL Q distribution (current 1.25
+  likely under-explores; try LC0-style ~1.7 + log scaling)
+- Variance band on the win-prob plot from WDL: `Var = P(W) + P(L) − (P(W)
+  − P(L))²` is free given the WDL head; would visualize search uncertainty
