@@ -63,6 +63,7 @@ DEFAULT_MCTS_ARGS = {
     "truncation": 200,
     "c_base": 19652,
     "c_init": 1.25,
+    "c_fpu": 0.2,  # Leela/KataGo FPU-reduction; 0.0 falls back to plain μ-FPU
     "dirichlet_epsilon": 0.0,
     "dirichlet_alpha": 0.3,
     "memory_size": 1000,
@@ -319,10 +320,15 @@ class MctsPlayer:
             try:
                 self.model = torch.compile(self.model)
                 warm_bs = batch_size if use_batched else 1
+                # Warm with a real starting position, not torch.zeros: the JIT
+                # trace specializes on input content too (BN/SE paths behave
+                # differently on all-zero input), so a zeros-warmup leaves the
+                # first REAL forward to pay a ~6s re-trace cost on move 1.
+                real_one = f.prepare_input(chess.Board(), 0).unsqueeze(0).to(args["device"])
                 with torch.inference_mode():
-                    _ = self.model(torch.zeros(warm_bs, 19, 8, 8, device=args["device"]))
-                    if use_batched and warm_bs != 1:
-                        _ = self.model(torch.zeros(1, 19, 8, 8, device=args["device"]))
+                    if warm_bs > 1:
+                        _ = self.model(real_one.expand(warm_bs, -1, -1, -1).contiguous())
+                    _ = self.model(real_one)
             except Exception:
                 pass
 
@@ -333,6 +339,20 @@ class MctsPlayer:
         else:
             self.mcts = MCTS(args, self.model)
         self.args = args
+
+        # MCTS pipeline pre-warm. The model warm-up above covers the NN graph,
+        # but the search loop has extra lazy CUDA/CPU paths (masked_fill+softmax
+        # with -inf, torch.cat + .cpu().numpy(), legal_mask numpy interop) that
+        # only fire on the FIRST search call -- adding ~6s of unaccounted time
+        # to move 1 otherwise. A 4-sim throwaway absorbs that cost into startup.
+        try:
+            orig_sims = args["num_simulation"]
+            args["num_simulation"] = 4
+            self.mcts.search(chess.Board(), 0)
+            args["num_simulation"] = orig_sims
+            self.mcts.root = None
+        except Exception:
+            pass
 
         self.temperature_moves = int(cfg.get("temperature_moves", 0))
         self.temperature = float(cfg.get("temperature", 1.0))

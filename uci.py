@@ -29,6 +29,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -115,6 +116,12 @@ class UciEngine:
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
         "CInit": 1.25,
+        "CFPU": 0.2,
+        # Engine-driven background pondering. NOT the same as the standard UCI
+        # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
+        # disables by default). Rename avoids the conflict.
+        "BackgroundPonder": "true",
+        "PonderMaxSims": 1800,
     }
     OPT_TYPES = {
         "Type": ("string", None, None),
@@ -127,6 +134,9 @@ class UciEngine:
         "DirichletEps": ("string", None, None),
         "DirichletAlpha": ("string", None, None),
         "CInit": ("string", None, None),
+        "CFPU": ("string", None, None),
+        "BackgroundPonder": ("string", None, None),
+        "PonderMaxSims": ("spin", 0, 1000000),
     }
 
     def __init__(self) -> None:
@@ -144,6 +154,12 @@ class UciEngine:
         # Extension -> only push the tail; otherwise reset + walk full list.
         self._move_history: list[str] = []
         self._start_fen: str | None = None
+        # Repetition tracking: count of each position (by transposition_key)
+        # seen so far in the actual game. python-chess's board.mirror() doesn't
+        # preserve the move stack / _transpositions, so MCTS can't see 3-fold
+        # via the board alone -- we maintain this counter and inject it into
+        # MCTS before each search. Keyed on mirror_state's transposition_key.
+        self._rep_counter: dict = {}
         self._rng = np.random.default_rng()
         self._quitting = False
         # Dashboard telemetry state.
@@ -151,6 +167,13 @@ class UciEngine:
         self._bot_color: str | None = None            # set on each `go`
         self._last_bot_chosen_uci: str | None = None  # real-coord UCI of bot's pending move
         self._pending_bot_eval: dict | None = None    # eval/duration to attach to next _push_move
+        # Background pondering. After every `bestmove` we push our own move
+        # locally and start running sims on the after-our-move root. When the
+        # next `position` arrives we stop the thread; the existing extension
+        # detection + apply_action then walks the tree to opp's actual reply,
+        # inheriting the pondered subtree for the upcoming search.
+        self._ponder_stop = threading.Event()
+        self._ponder_thread: threading.Thread | None = None
 
     # ---------- model / mcts plumbing ----------
 
@@ -168,9 +191,16 @@ class UciEngine:
         model.load_state_dict(state["model_state_dict"])
         model.eval()
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            # NOTE: default mode, NOT mode="reduce-overhead". The latter records
+            # CUDA graphs bound to the recording thread's default stream, which
+            # crashes the moment our background ponder thread (running on its
+            # own stream) tries to invoke the same model. Default mode loses
+            # ~1.5x kernel-fusion speedup at batch=1 but is thread-safe.
+            model = torch.compile(model)
+            # Real starting position, not torch.zeros -- see players.py for why.
+            real_one = f.prepare_input(chess.Board(), 0).unsqueeze(0).to(self.device)
             with torch.inference_mode():
-                _ = model(torch.zeros(1, 19, 8, 8, device=self.device))
+                _ = model(real_one)
             log("torch.compile + warm-up done")
         except Exception as e:
             log(f"torch.compile skipped: {e}")
@@ -185,6 +215,7 @@ class UciEngine:
             "truncation": 1000,
             "c_base": 19652,
             "c_init": float(self.options["CInit"]),
+            "c_fpu": float(self.options["CFPU"]),
             "dirichlet_epsilon": float(self.options["DirichletEps"]),
             "dirichlet_alpha": float(self.options["DirichletAlpha"]),
             "memory_size": 1000,
@@ -195,7 +226,22 @@ class UciEngine:
             "batch_size": 8,
         }
         assert self.model is not None
+        first_build = self.mcts is None
         self.mcts = MCTS(args, self.model)
+        # MCTS pipeline pre-warm on first build. The forward warm-up alone
+        # doesn't cover the masked_fill/softmax-with-inf, torch.cat + cpu(),
+        # and legal_mask numpy paths that fire only on the first real search.
+        # A 4-sim throwaway absorbs ~6s into isready so move 1 isn't stalled.
+        if first_build:
+            try:
+                orig_sims = args["num_simulation"]
+                args["num_simulation"] = 4
+                self.mcts.search(chess.Board(), 0)
+                args["num_simulation"] = orig_sims
+                self.mcts.root = None
+                log("mcts pre-warm done")
+            except Exception as e:
+                log(f"mcts pre-warm skipped: {e}")
 
     # ---------- position tracking ----------
 
@@ -219,6 +265,8 @@ class UciEngine:
         self._start_fen = start_fen
         self._pending_bot_eval = None
         self._last_bot_chosen_uci = None
+        # Start fresh: the starting position has been seen once.
+        self._rep_counter = {self.mirror_state._transposition_key(): 1}
         if self.mcts is not None:
             self.mcts.root = None
         # Tell dashboard: fresh game / position reset.
@@ -250,6 +298,12 @@ class UciEngine:
         self.mirror_state = self.mirror_state.mirror()
         self.move_counter += 1
         self._move_history.append(uci_real)
+        # Bump repetition counter for the new position. A 50-move-rule reset
+        # (capture or pawn move) makes the position un-repeatable from here
+        # on, but since we key on the full transposition_key (occupancy +
+        # castling + ep), captured-pieces positions already get distinct keys.
+        tk = self.mirror_state._transposition_key()
+        self._rep_counter[tk] = self._rep_counter.get(tk, 0) + 1
         if action is not None and self.mcts is not None:
             self.mcts.apply_action(action)
         # Dashboard `move` event. If this push is the bot's own just-chosen
@@ -289,10 +343,12 @@ class UciEngine:
         send("readyok")
 
     def cmd_ucinewgame(self, _args: list[str]) -> None:
+        self._stop_pondering()
         self._reset_position()
         log("ucinewgame: reset")
 
     def cmd_setoption(self, args: list[str]) -> None:
+        self._stop_pondering()
         # Format: setoption name <NAME> [value <VALUE>]
         try:
             name_idx = args.index("name")
@@ -322,6 +378,11 @@ class UciEngine:
             self.loaded_arch = None
 
     def cmd_position(self, args: list[str]) -> None:
+        # Always stop pondering first -- the new `position` either extends the
+        # known move list (opp's reply arrived; tree-reuse will inherit the
+        # pondered subtree via apply_action), or it's a fresh setup that
+        # invalidates the tree entirely.
+        self._stop_pondering()
         moves: list[str] = []
         start_fen: str | None = None
         if not args:
@@ -368,6 +429,9 @@ class UciEngine:
                 f"counter={self.move_counter}")
 
     def cmd_go(self, args: list[str]) -> None:
+        # Defensive: kill any leftover ponder before foreground search runs.
+        # In normal flow cmd_position will have already stopped it.
+        self._stop_pondering()
         # Time controls don't drive search yet (we always use configured Sims),
         # but we parse wtime/btime/winc/binc/movetime to forward to the dashboard.
         clock: dict = {}
@@ -425,6 +489,100 @@ class UciEngine:
         self._last_bot_chosen_uci = real_uci
         self._emit_bot_move(real_uci)
         send(f"bestmove {real_uci}")
+        # Pre-push the bot's own move so the MCTS root advances to "after our
+        # move." The next `position` from the GUI will see this move already
+        # in _move_history and only push opp's reply on top -- existing
+        # extension detection in cmd_position handles that case.
+        if ptype == "mcts":
+            try:
+                self._push_move(real_uci)
+            except Exception as e:
+                log(f"local push after bestmove failed: {e}")
+            self._start_pondering()
+
+    def _start_pondering(self) -> None:
+        """Spawn a background thread that keeps running MCTS sims from the
+        current root until interrupted by the next UCI command. Reads
+        `BackgroundPonder` (not `Ponder` -- that one is reserved by the UCI
+        protocol for GUI-driven `go ponder` and lichess-bot disables it by
+        default, which would silently turn our engine-side pondering off too)."""
+        bp = str(self.options.get("BackgroundPonder", "true")).lower()
+        if bp != "true":
+            log(f"ponder: skipped (BackgroundPonder={bp!r})")
+            return
+        if self.mcts is None or self.mcts.root is None:
+            log("ponder: skipped (mcts root is None)")
+            return
+        # If a previous ponder is somehow still alive, stop it first.
+        self._stop_pondering()
+        max_sims = int(self.options["PonderMaxSims"])
+        if max_sims <= 0:
+            log(f"ponder: skipped (PonderMaxSims={max_sims})")
+            return
+        self._ponder_stop.clear()
+        self._ponder_thread = threading.Thread(
+            target=self._ponder_loop, args=(max_sims,), daemon=True
+        )
+        self._ponder_thread.start()
+        log(f"ponder: started (max_sims={max_sims}, root.N={self.mcts.root.N})")
+
+    def _ponder_loop(self, max_sims: int) -> None:
+        """Run sims in chunks until stop event or max_sims reached. We bypass
+        the search() noise/setup overhead by issuing small `search` calls with
+        a temporary num_simulation override and restoring it each time."""
+        assert self.mcts is not None
+        # Run many sims per `search()` call (NOT just batch_size) so the
+        # per-call setup overhead (policy copy, depth-set clear, etc.) is
+        # amortised. Stop-event responsiveness caps at chunk_sims * forward_ms:
+        # at 64 sims/chunk with batch=8 that's ~240ms worst-case lag, fine.
+        chunk = max(64, int(self.mcts.args.get("batch_size", 8)) * 8)
+        orig_sims = int(self.mcts.args["num_simulation"])
+        done = 0
+        t0 = time.monotonic()
+        try:
+            while not self._ponder_stop.is_set() and done < max_sims:
+                self.mcts.args["num_simulation"] = min(chunk, max_sims - done)
+                with contextlib.redirect_stdout(sys.stderr):
+                    self.mcts.search(self.mirror_state, self.move_counter)
+                done += chunk
+                elapsed = time.monotonic() - t0
+                root_N = self.mcts.root.N if self.mcts.root is not None else 0
+                post_event({
+                    "kind": "ponder_tick",
+                    "status": "running",
+                    "sims": done,
+                    "elapsed_s": round(elapsed, 3),
+                    "nps": int(done / max(elapsed, 0.001)),
+                    "root_N": root_N,
+                })
+        except Exception as e:
+            log(f"ponder thread crashed: {e}\n{traceback.format_exc()}")
+        finally:
+            self.mcts.args["num_simulation"] = orig_sims
+            log(f"ponder stopped after {done} sims")
+            root_N = (
+                self.mcts.root.N
+                if self.mcts is not None and self.mcts.root is not None
+                else 0
+            )
+            post_event({
+                "kind": "ponder_tick",
+                "status": "stopped",
+                "sims": 0,
+                "elapsed_s": round(time.monotonic() - t0, 3),
+                "nps": 0,
+                "root_N": root_N,
+            })
+
+    def _stop_pondering(self) -> None:
+        """Signal the ponder thread and wait for it to exit. Idempotent."""
+        if self._ponder_thread is None:
+            return
+        self._ponder_stop.set()
+        self._ponder_thread.join(timeout=5.0)
+        if self._ponder_thread.is_alive():
+            log("warning: ponder thread did not exit within 5s")
+        self._ponder_thread = None
 
     def _emit_bot_move(self, real_uci: str) -> None:
         """Emit a `move` event for the bot's just-chosen move using a copy of
@@ -458,6 +616,7 @@ class UciEngine:
 
     def _go_mcts(self) -> str:
         assert self.mcts is not None
+        self.mcts.set_rep_counter(self._rep_counter)
         with contextlib.redirect_stdout(sys.stderr):
             probs = self.mcts.search(
                 self.mirror_state,
@@ -717,11 +876,12 @@ class UciEngine:
         return int(np.argmax(probs))
 
     def cmd_stop(self, _args: list[str]) -> None:
-        # Single-threaded MCTS; nothing to stop. The 'bestmove' from the
-        # in-flight 'go' (if any) will arrive whenever it finishes.
-        pass
+        # Foreground search is single-threaded -- nothing to stop there. But
+        # if a ponder thread is running in the background, kill it now.
+        self._stop_pondering()
 
     def cmd_quit(self, _args: list[str]) -> None:
+        self._stop_pondering()
         self._quitting = True
 
     # ---------- main loop ----------

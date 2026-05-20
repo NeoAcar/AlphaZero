@@ -57,6 +57,21 @@ class BatchedMCTS:
         self.last_was_proven_mate: bool = False
         # Per-search set of leaf depths; cleared at the start of `search`.
         self._visited_depths: set[int] = set()
+        # Repetition tracking -- see mcts.MCTS for details.
+        self._ext_rep: dict = {}
+
+    def set_rep_counter(self, counter) -> None:
+        self._ext_rep = dict(counter) if counter else {}
+
+    def _compute_rep_count(self, node: Node) -> int:
+        tk = node.tk
+        extra = 0
+        cur = node
+        while cur.parent is not None:
+            if cur.tk == tk:
+                extra += 1
+            cur = cur.parent
+        return self._ext_rep.get(tk, 0) + extra
 
     def apply_action(self, action: int) -> None:
         """O(1) walk by known action -- see mcts.MCTS.apply_action."""
@@ -149,9 +164,9 @@ class BatchedMCTS:
         legal: np.ndarray = np.nonzero(node.policy)[0]
         priors: np.ndarray = node.policy[legal]
 
-        # μ-FPU: visit-weighted mean Q over children with at least one real
-        # visit. Σ Q / Σ N treats every observation equally rather than every
-        # child equally, so a 1-visit outlier can't yank the FPU around.
+        # μ-FPU baseline: visit-weighted mean Q over children with at least one
+        # real visit. Σ Q / Σ N treats every observation equally rather than
+        # every child equally, so a 1-visit outlier can't yank the FPU around.
         # Excludes virtual-only contributions (we want a stable signal here,
         # not one that drifts with the in-flight batch).
         explored_Q_sum: float = 0.0
@@ -161,6 +176,20 @@ class BatchedMCTS:
                 explored_Q_sum += c.Q
                 explored_N_sum += c.N
         mu_fpu: float = (explored_Q_sum / explored_N_sum) if explored_N_sum > 0 else 0.0
+
+        # FPU-reduction (Leela / KataGo): subtract cFPU·sqrt(P_explored) so
+        # unvisited children are more pessimistic when little policy mass has
+        # been explored yet. Disabled at root if Dirichlet noise is driving
+        # exploration -- otherwise the reduction would fight the noise.
+        c_fpu: float = float(node.args.get("c_fpu", 0.0))
+        if node.parent is None and float(node.args.get("dirichlet_epsilon", 0.0)) > 0:
+            c_fpu = 0.0
+        if c_fpu > 0.0 and node.children:
+            p_explored: float = 0.0
+            for a, c in node.children.items():
+                if c.N > 0:
+                    p_explored += float(node.policy[a])
+            mu_fpu -= c_fpu * math.sqrt(p_explored)
 
         # Per-action effective Q: combine real + virtual when there are any
         # visits, else fall back to mu_fpu.
@@ -233,7 +262,7 @@ class BatchedMCTS:
         while True:
             if node.is_terminal():
                 value: float = float(
-                    f.game_result(node.state, node.move_counter, 1000)[0]
+                    f.game_result(node.state, node.move_counter, 1000, node.rep_count)[0]
                 )
                 # value is from current player's POV: -1 mated, 0 drawn.
                 if value == 0.0 or value == -1.0:
@@ -246,6 +275,7 @@ class BatchedMCTS:
                 node = node.children[action]
             else:
                 node = node.materialize_child(action)
+                node.rep_count = self._compute_rep_count(node)
             node.virtual_loss += 1
             node.virtual_Q += mu_used
             path.append((node, mu_used))
@@ -367,6 +397,7 @@ class BatchedMCTS:
 
         if self.root is None:
             self.root = Node(self.args, state, move_counter)
+            self.root.rep_count = self._compute_rep_count(self.root)
             self.root.expand_lazy(self.model)
             min_depth = 0
         else:

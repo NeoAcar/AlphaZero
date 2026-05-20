@@ -105,8 +105,12 @@ def play_human_vs_bot(checkpoint: str, sims: int, human_color: chess.Color, trun
     real_board = chess.Board()
     mirrored_state = chess.Board()
     move_counter = 0
+    rep_counter: dict = {mirrored_state._transposition_key(): 1}
 
-    while not f.game_result(mirrored_state, move_counter, truncation)[1]:
+    while not f.game_result(
+        mirrored_state, move_counter, truncation,
+        rep_counter.get(mirrored_state._transposition_key(), 0),
+    )[1]:
         render(real_board)
         if real_board.turn == human_color:
             mover_was_white = real_board.turn == chess.WHITE
@@ -119,6 +123,7 @@ def play_human_vs_bot(checkpoint: str, sims: int, human_color: chess.Color, trun
         else:
             print("\nBot is thinking...")
             t0 = time.time()
+            mcts.set_rep_counter(rep_counter)
             uci_mirrored = bot_move(mcts, mirrored_state, move_counter)
             dt = time.time() - t0
             real_uci = uci_mirrored if real_board.turn == chess.WHITE else f.mirror_move(uci_mirrored)
@@ -128,6 +133,8 @@ def play_human_vs_bot(checkpoint: str, sims: int, human_color: chess.Color, trun
             mirrored_state.push_uci(uci_mirrored)
             mirrored_state = mirrored_state.mirror()
         move_counter += 1
+        tk = mirrored_state._transposition_key()
+        rep_counter[tk] = rep_counter.get(tk, 0) + 1
 
     render(real_board)
     announce_result(real_board, move_counter, truncation)
@@ -138,10 +145,15 @@ def play_bot_vs_bot(checkpoint: str, sims: int, truncation: int, delay: float) -
     real_board = chess.Board()
     mirrored_state = chess.Board()
     move_counter = 0
+    rep_counter: dict = {mirrored_state._transposition_key(): 1}
 
     render(real_board)
-    while not f.game_result(mirrored_state, move_counter, truncation)[1]:
+    while not f.game_result(
+        mirrored_state, move_counter, truncation,
+        rep_counter.get(mirrored_state._transposition_key(), 0),
+    )[1]:
         t0 = time.time()
+        mcts.set_rep_counter(rep_counter)
         uci_mirrored = bot_move(mcts, mirrored_state, move_counter)
         dt = time.time() - t0
         real_uci = uci_mirrored if real_board.turn == chess.WHITE else f.mirror_move(uci_mirrored)
@@ -152,6 +164,8 @@ def play_bot_vs_bot(checkpoint: str, sims: int, truncation: int, delay: float) -
         mirrored_state.push_uci(uci_mirrored)
         mirrored_state = mirrored_state.mirror()
         move_counter += 1
+        tk = mirrored_state._transposition_key()
+        rep_counter[tk] = rep_counter.get(tk, 0) + 1
         render(real_board, last_move=move)
         if delay > 0:
             time.sleep(delay)

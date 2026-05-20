@@ -31,6 +31,11 @@ def parse_args() -> dict:
     p.add_argument("--batch-size", type=int)
     p.add_argument("--learning-rate", type=float)
     p.add_argument("--l2-weight", type=float, help="L2 weight decay")
+    p.add_argument("--optimizer", choices=["sgd", "adamw"],
+                   help="sgd = SGD + Nesterov momentum (AlphaZero / LC0 style, default). "
+                        "adamw = AdamW (convenient but slightly worse minima at scale).")
+    p.add_argument("--momentum", type=float,
+                   help="SGD momentum coefficient (ignored for adamw); default 0.9")
     p.add_argument("--log-step", type=int, help="log every N iterations")
     p.add_argument("--label-smoothing", type=float,
                    help="cross-entropy label smoothing factor (e.g. 0.1)")
@@ -76,6 +81,8 @@ def parse_args() -> dict:
     cfg.setdefault("max_shards", None)
     cfg.setdefault("value_head", "scalar")
     cfg.setdefault("vals_per_epoch", 1)
+    cfg.setdefault("optimizer", "sgd")
+    cfg.setdefault("momentum", 0.9)
 
     # CLI overrides (only when explicitly given).
     overrides = {
@@ -99,6 +106,8 @@ def parse_args() -> dict:
         "max_shards": cli.max_shards,
         "value_head": cli.value_head,
         "vals_per_epoch": cli.vals_per_epoch,
+        "optimizer": cli.optimizer,
+        "momentum": cli.momentum,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -140,14 +149,42 @@ class Train:
         model_cls = SEResNetWDL if self.value_head == "wdl" else SEResNet
         self.model = model_cls().to(self.device)
         print(f"Model: {model_cls.__name__} (value_head={self.value_head})")
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.l2_weight)
+
+        opt_name = str(args.get("optimizer", "sgd")).lower()
+        if opt_name == "sgd":
+            momentum = float(args.get("momentum", 0.9))
+            self.optimizer = optim.SGD(
+                self.model.parameters(),
+                lr=self.lr,
+                momentum=momentum,
+                nesterov=True,
+                weight_decay=self.l2_weight,
+            )
+            print(f"Optimizer: SGD (Nesterov, momentum={momentum}, lr={self.lr}, "
+                  f"weight_decay={self.l2_weight})")
+            if self.lr < 1e-3:
+                print(f"  WARNING: lr={self.lr} looks tuned for Adam. SGD usually wants "
+                      f"~1e-2 → step down (e.g. 1e-2 → 1e-3 → 1e-4).")
+        elif opt_name == "adamw":
+            self.optimizer = optim.AdamW(
+                self.model.parameters(), lr=self.lr, weight_decay=self.l2_weight,
+            )
+            print(f"Optimizer: AdamW (lr={self.lr}, weight_decay={self.l2_weight})")
+        else:
+            raise ValueError(f"unknown optimizer: {opt_name!r}")
 
         if args.get("resume"):
             print(f"Resuming from {args['resume']}")
             ckpt = torch.load(args["resume"], map_location=self.device, weights_only=False)
             self.model.load_state_dict(ckpt["model_state_dict"])
             if "optimizer_state_dict" in ckpt:
-                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                try:
+                    self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except (ValueError, KeyError) as e:
+                    # Optimizer mismatch (e.g. AdamW ckpt → SGD now). Start
+                    # optimizer state fresh; model weights are still inherited.
+                    print(f"  optimizer state incompatible ({e}); starting "
+                          f"optimizer state from scratch")
 
     def data_preparation(self):
         """Build train and val datasets according to self.data_mix.

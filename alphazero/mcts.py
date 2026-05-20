@@ -66,8 +66,17 @@ class Node:
         # combined Q during selection. Always 0.0 in sequential MCTS.
         self.virtual_Q: float = 0.0
 
+        # Transposition key for 3-fold repetition tracking. `state.mirror()`
+        # internally calls `copy(stack=False)` which wipes _transpositions, so
+        # we can't ask the board itself -- we maintain the count externally.
+        # `rep_count` = how many times this position has appeared in
+        # (real-game history before MCTS root) + (tree path from root to here,
+        # including this node). Filled in by MCTS after construction.
+        self.tk = state._transposition_key()
+        self.rep_count: int = 0
+
     def is_terminal(self) -> bool:
-        return f.game_result(self.state, self.move_counter, 1000)[1]
+        return f.game_result(self.state, self.move_counter, 1000, self.rep_count)[1]
 
     def is_expanded(self) -> bool:
         return self.policy is not None
@@ -89,8 +98,8 @@ class Node:
         legal: np.ndarray = np.nonzero(self.policy)[0]
         priors: np.ndarray = self.policy[legal]
 
-        # Visit-weighted μ-FPU: Σ Q / Σ N over explored children. More stable
-        # than mean-of-means; a 1-visit outlier can't yank the FPU around.
+        # Visit-weighted μ-FPU baseline: Σ Q / Σ N over explored children. More
+        # stable than mean-of-means; a 1-visit outlier can't yank it around.
         explored_Q_sum: float = 0.0
         explored_N_sum: int = 0
         for c in self.children.values():
@@ -98,6 +107,20 @@ class Node:
                 explored_Q_sum += c.Q
                 explored_N_sum += c.N
         mu_fpu: float = (explored_Q_sum / explored_N_sum) if explored_N_sum > 0 else 0.0
+
+        # FPU-reduction (Leela / KataGo): subtract cFPU·sqrt(P_explored) from
+        # the baseline so unvisited children are penalized when little policy
+        # mass has been explored. Disabled at root if Dirichlet noise is
+        # driving exploration -- otherwise the reduction would fight the noise.
+        c_fpu: float = float(self.args.get("c_fpu", 0.0))
+        if self.parent is None and float(self.args.get("dirichlet_epsilon", 0.0)) > 0:
+            c_fpu = 0.0
+        if c_fpu > 0.0 and self.children:
+            p_explored: float = 0.0
+            for a, c in self.children.items():
+                if c.N > 0:
+                    p_explored += float(self.policy[a])
+            mu_fpu -= c_fpu * math.sqrt(p_explored)
 
         child_Q: np.ndarray = np.full(len(legal), mu_fpu, dtype=np.float64)
         child_N: np.ndarray = np.zeros(len(legal), dtype=np.int64)
@@ -167,6 +190,32 @@ class MCTS:
         self.last_max_depth: int = 0
         # Per-search set of leaf depths reached; cleared at the start of `search`.
         self._visited_depths: set[int] = set()
+        # Repetition tracking: external history counter (real-game positions
+        # before MCTS root). Caller updates via set_rep_counter() before each
+        # search. Keyed by transposition_key (tuple). Includes the root
+        # position itself (so ext_rep[root.tk] >= 1 always).
+        self._ext_rep: dict = {}
+
+    def set_rep_counter(self, counter) -> None:
+        """Inject the game-level Counter[transposition_key] before search.
+        Stored as a plain dict; we only read it. Callers should reset it on
+        new games and bump it after each played move."""
+        self._ext_rep = dict(counter) if counter else {}
+
+    def _compute_rep_count(self, node: "Node") -> int:
+        """Total repetition count for `node`: real-game history (ext_rep) +
+        tree path from root to node (excluding root, since root is already
+        in ext_rep)."""
+        tk = node.tk
+        extra = 0
+        cur = node
+        # Walk up, counting matches of `tk` among non-root ancestors AND self.
+        # Stop one short of root (cur.parent is None means cur is root).
+        while cur.parent is not None:
+            if cur.tk == tk:
+                extra += 1
+            cur = cur.parent
+        return self._ext_rep.get(tk, 0) + extra
 
     def apply_action(self, action: int) -> None:
         """O(1) tree walk by known action: set the action's child as new root,
@@ -240,7 +289,7 @@ class MCTS:
             if node.is_terminal():
                 # value is already from node's player-to-move perspective:
                 # -1 = current player is mated, 0 = drawn (stalemate / etc.)
-                value = float(f.game_result(node.state, node.move_counter, 1000)[0])
+                value = float(f.game_result(node.state, node.move_counter, 1000, node.rep_count)[0])
                 if value == 0.0 or value == -1.0:
                     node.proven_value = int(value)
                 break
@@ -252,6 +301,7 @@ class MCTS:
                 node = node.children[action]
             else:
                 node = node.materialize_child(action)
+                node.rep_count = self._compute_rep_count(node)
             path.append(node)
 
         self._visited_depths.add(node.depth)
@@ -320,6 +370,7 @@ class MCTS:
 
         if self.root is None:
             self.root = Node(self.args, state, move_counter)
+            self.root.rep_count = self._compute_rep_count(self.root)
             self.root.expand_lazy(self.model)
             min_depth = 0
         else:

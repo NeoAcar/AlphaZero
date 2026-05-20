@@ -50,6 +50,7 @@ ARCHITECTURES = {
 DEFAULT_MCTS_ARGS = {
     "c_base": 19652,
     "c_init": 1.25,
+    "c_fpu": 0.2,
     "dirichlet_epsilon": 0.25,
     "dirichlet_alpha": 0.3,
     "memory_size": 1000,
@@ -111,12 +112,18 @@ def play_one_game(mcts: MCTS, temperature_moves: int, temperature: float,
     mcts.root = None
     mirrored_state = chess.Board()
     move_counter = 0
+    # Per-game repetition counter keyed on mirror_state transposition_key.
+    rep_counter: dict = {mirrored_state._transposition_key(): 1}
 
     boards: list[np.ndarray] = []
     pis: list[np.ndarray] = []
 
-    while not f.game_result(mirrored_state, move_counter, truncation)[1]:
+    while not f.game_result(
+        mirrored_state, move_counter, truncation,
+        rep_counter.get(mirrored_state._transposition_key(), 0),
+    )[1]:
         boards.append(f.board_to_matrix(mirrored_state, move_counter))
+        mcts.set_rep_counter(rep_counter)
         pi = mcts.search(mirrored_state, move_counter)
         pis.append(pi.astype(np.float32))
 
@@ -129,6 +136,8 @@ def play_one_game(mcts: MCTS, temperature_moves: int, temperature: float,
         mirrored_state.push_uci(uci_mirrored)
         mirrored_state = mirrored_state.mirror()
         move_counter += 1
+        tk = mirrored_state._transposition_key()
+        rep_counter[tk] = rep_counter.get(tk, 0) + 1
         # O(1) tree walk by the action we just took. Without this, the next
         # search()'s update_root walks the children list and state-compares
         # (slow). With it, the chosen child is the new root immediately.
@@ -138,7 +147,10 @@ def play_one_game(mcts: MCTS, temperature_moves: int, temperature: float,
     # mirrored_state right now (i.e. the next-to-move at the time the loop
     # exited). That's the player whose turn it WOULD have been -- equivalently
     # the parity of move_counter.
-    final_value, _ = f.game_result(mirrored_state, move_counter, truncation)
+    final_value, _ = f.game_result(
+        mirrored_state, move_counter, truncation,
+        rep_counter.get(mirrored_state._transposition_key(), 0),
+    )
     # final_value: -1 means "the next-to-move lost", 0 draw, +1 not really
     # produced by game_result (it returns -1 for mated, 0 for draw, never +1).
     # So we use parity:

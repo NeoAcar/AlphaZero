@@ -122,10 +122,21 @@ def alphazero_to_move(action: int, board: chess.Board | None = None) -> str:
     return uci
 
 
-def game_result(board: chess.Board, move_counter: int, truncation: int) -> tuple[int, bool]:
+def game_result(board: chess.Board, move_counter: int, truncation: int,
+                rep_count: int = 1) -> tuple[int, bool]:
+    """`rep_count` is how many times THIS position has occurred in the real
+    game so far (including the current occurrence). Caller maintains a
+    Counter[transposition_key] across the game and looks up the current
+    board's key, because `chess.Board.mirror()` does not preserve the
+    repetition history (`copy(stack=False)` internally), so we can't ask
+    the board itself."""
     if board.is_checkmate():
         return -1, True
-    if board.is_stalemate() or board.is_insufficient_material() or board.is_fifty_moves() or move_counter >= truncation:
+    if (board.is_stalemate()
+            or board.is_insufficient_material()
+            or board.is_fifty_moves()
+            or rep_count >= 3
+            or move_counter >= truncation):
         return 0, True
     return 0, False
 

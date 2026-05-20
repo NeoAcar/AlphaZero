@@ -2,7 +2,7 @@
     "type": "mcts",
     "architecture": "seresnet",
     "checkpoint": "models/model_best_combined_5.pth",
-    "num_simulation": 1200,
+    "num_simulation": 300,
     "discount": 1,
     "c_init": 1.25,
     "c_base": 19652,

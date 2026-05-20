@@ -51,6 +51,7 @@ _state = {
     "win_prob_series": [],      # list of [ply, win_prob_bot_pov]  (MCTS Q)
     "nn_win_prob_series": [],   # list of [ply, win_prob_bot_pov]  (raw NN)
     "last_tick": None,
+    "last_ponder_tick": None,   # latest ponder_tick (status=running); cleared on bot move / new game
     "clock": None,
     "board_svg": chess.svg.board(chess.Board(), size=400),
 }
@@ -105,6 +106,7 @@ def event_in():
                 _state["win_prob_series"] = []
                 _state["nn_win_prob_series"] = []
                 _state["last_tick"] = None
+                _state["last_ponder_tick"] = None
             _state["board_svg"] = _render_board_svg(
                 _state["fen"], _state["lastmove"], _bot_side_flipped()
             )
@@ -126,8 +128,18 @@ def event_in():
             nn_wp = payload.get("nn_win_prob")
             if nn_wp is not None and ply is not None:
                 _state["nn_win_prob_series"].append([ply, nn_wp])
+            # Bot just moved -- any prior ponder state is stale.
+            if payload.get("mover") == "bot":
+                _state["last_ponder_tick"] = None
         elif kind == "tick":
             _state["last_tick"] = payload
+        elif kind == "ponder_tick":
+            # Keep the latest running tick. Ignore 'stopped' events: we want
+            # the final count to remain visible across opp's think time and
+            # our next search, until we move again (which clears it via the
+            # mover=='bot' branch in the "move" handler above).
+            if payload.get("status") != "stopped":
+                _state["last_ponder_tick"] = payload
         elif kind == "go_start":
             if payload.get("clock"):
                 _state["clock"] = payload["clock"]
@@ -281,6 +293,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span id="sims" class="value">0</span></div>
       <div class="row"><span class="label">NPS</span>
         <span id="nps" class="value">0</span></div>
+      <div class="row"><span class="label">Pondering</span>
+        <span class="value"><span id="ponderSims">—</span>
+          &nbsp;sims&nbsp;·&nbsp;<span id="ponderNps">—</span>&nbsp;nps</span></div>
       <div class="row"><span class="label">Move time</span>
         <span class="value"><span id="goTime">—</span>
           &nbsp;·&nbsp; <span id="lastMoveTime">—</span></span></div>
@@ -437,6 +452,10 @@ function applyMove(m) {
   if (m.mover === 'bot') {
     goStartMs = null;
     $('goTime').textContent = '—';
+    // Our move just landed — wipe the previous round's ponder count so the
+    // counter starts fresh when pondering kicks off for the next round.
+    $('ponderSims').textContent = '—';
+    $('ponderNps').textContent = '—';
   }
 }
 
@@ -453,6 +472,8 @@ function applyState(s) {
     $('depth').textContent = '0';
     $('sims').textContent = '0';
     $('nps').textContent = '0';
+    $('ponderSims').textContent = '—';
+    $('ponderNps').textContent = '—';
     $('lastMoveTime').textContent = '—';
     $('topMoves').textContent = '—';
   }
@@ -483,6 +504,13 @@ function applySnapshot(s) {
     if (hasMcts) setEval(null, ys[ys.length - 1]);
   }
   if (s.last_tick) applyTick(s.last_tick);
+  if (s.last_ponder_tick && s.last_ponder_tick.status !== 'stopped') {
+    $('ponderSims').textContent = s.last_ponder_tick.sims.toLocaleString();
+    $('ponderNps').textContent = s.last_ponder_tick.nps.toLocaleString();
+  } else {
+    $('ponderSims').textContent = '—';
+    $('ponderNps').textContent = '—';
+  }
 }
 
 const es = new EventSource('/stream');
@@ -502,6 +530,16 @@ es.onmessage = e => {
     case 'move':     applyMove(ev); break;
     case 'state':    applyState(ev); break;
     case 'clock':    applyClock(ev); break;
+    case 'ponder_tick':
+      // Only update on 'running' ticks. 'stopped' is advisory — leave the
+      // final count visible so the user can see how much was pondered during
+      // opp's think time. The display is reset later in applyMove when *we*
+      // move again (mover === 'bot').
+      if (ev.status === 'running') {
+        $('ponderSims').textContent = ev.sims.toLocaleString();
+        $('ponderNps').textContent = ev.nps.toLocaleString();
+      }
+      break;
     case 'go_start':
       goStartMs = Date.now();
       if (ev.clock) applyClock(ev.clock);

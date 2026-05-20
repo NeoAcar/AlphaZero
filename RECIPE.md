@@ -19,7 +19,7 @@ what `runner.py` does today (with the per-iteration scripts `selfplay.py`,
 | Self-play games per cycle | 25,000 | continuous; 44M lifetime games | 50 per iteration |
 | Training data buffer | Last 500k games sliding | Last 500k games sliding | Last 3 self-play files (~150 games) |
 | Mini-batch size | 2048 | 4096 | 256 |
-| Optimizer | SGD + momentum 0.9 | SGD + momentum 0.9 | AdamW |
+| Optimizer | SGD + momentum 0.9 | SGD + momentum 0.9 | SGD + Nesterov 0.9 ✓ (AdamW switchable via --optimizer adamw) |
 | Learning rate | 0.01 → 0.001 → 0.0001 (stepped) | 0.2 → 0.02 → 0.002 → 0.0002 (stepped) | 1e-4 fixed |
 | Weight decay (L2) | 1e-4 | 1e-4 | 1e-4 ✓ |
 | ResNet blocks × filters | 40 × 256 | 20 × 256 (chess) | smaller (`resnet.py`) |
@@ -68,10 +68,11 @@ now 0.3.
 search. PUCT's prior weighting naturally focuses budget on high-prior moves
 without an explicit cutoff. The `top_actions` knob is gone from `mcts.py`.
 
-**Optimizer choice.** Both papers used vanilla SGD + momentum with a stepped
-LR schedule. We use AdamW with a flat 1e-4. Adam's adaptivity is convenient
-at small scales but tends to find slightly worse minima than tuned SGD on
-big training runs. Worth revisiting if scaling up.
+**Optimizer choice.** Default is SGD + Nesterov momentum 0.9 (matching
+AGZ/AZ/LC0). AdamW is still available via `--optimizer adamw` for quick
+experiments or for resuming Adam-state checkpoints. SGD wants a much larger
+LR than Adam (~1e-2 vs 1e-4); the train.py defaults assume Adam, so when
+running SGD pass `--learning-rate 1e-2` (and step it down over the run).
 
 **Buffer size.** A 3-file rolling window is tiny compared to AZ's 500k-game
 window. Each iteration trains on essentially the most recent generation's
@@ -91,5 +92,5 @@ changes would be:
 2. Drop the eval gate from `runner.py` (every iteration promotes)
 3. ~~Remove `top_actions` cap~~ done
 4. Increase buffer to many more recent iterations
-5. Switch optimizer to SGD + momentum with a stepped LR schedule
+5. ~~Switch optimizer to SGD + momentum~~ done (stepped LR schedule still manual via re-runs)
 6. Add 8-frame history to input planes (deferred)

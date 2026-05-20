@@ -53,14 +53,23 @@ def play_game(p1, p2, p1_color: chess.Color, truncation: int) -> tuple[int, ches
     real_board = chess.Board()
     mirrored_state = chess.Board()
     move_counter = 0
+    # Per-game repetition counter (see alphazero/mcts.py rationale).
+    rep_counter: dict = {mirrored_state._transposition_key(): 1}
 
-    while not f.game_result(mirrored_state, move_counter, truncation)[1]:
+    while not f.game_result(
+        mirrored_state, move_counter, truncation,
+        rep_counter.get(mirrored_state._transposition_key(), 0),
+    )[1]:
         active = p1 if real_board.turn == p1_color else p2
+        if hasattr(active, "mcts"):
+            active.mcts.set_rep_counter(rep_counter)
         real_uci, mir_uci = active.select_move(real_board, mirrored_state, move_counter)
         real_board.push_uci(real_uci)
         mirrored_state.push_uci(mir_uci)
         mirrored_state = mirrored_state.mirror()
         move_counter += 1
+        tk = mirrored_state._transposition_key()
+        rep_counter[tk] = rep_counter.get(tk, 0) + 1
 
     reason = termination_reason(real_board, move_counter, truncation)
     if real_board.is_checkmate():
