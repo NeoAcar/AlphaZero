@@ -131,7 +131,10 @@ def main() -> None:
           f"{cli.p1_name} plays white in odd-numbered games (1, 3, 5, ...).\n")
 
     wins = draws = losses = 0
-    pgns = []
+    games_completed = 0
+    # Open PGN output in append mode and flush after every game so a Ctrl-C
+    # mid-match preserves whatever has finished so far.
+    pgn_fh = open(cli.output, "w") if cli.output else None
     try:
         for i in range(cli.games):
             p1_color = chess.WHITE if i % 2 == 0 else chess.BLACK
@@ -147,6 +150,7 @@ def main() -> None:
                 losses += 1; tag = f"{cli.p1_name} LOSS"
             else:
                 draws += 1; tag = "DRAW"
+            games_completed += 1
 
             plies = len(board.move_stack)
             print(f"Game {i+1:>3}/{cli.games}: {cli.p1_name} as {color_str:>5} -> "
@@ -154,27 +158,33 @@ def main() -> None:
                   f"running: {wins}W {draws}D {losses}L")
             print(f"  final FEN: {board.fen()}")
 
-            if cli.output:
-                pgns.append(board_to_pgn(board, p1_color, result, cli.p1_name, cli.p2_name))
+            if pgn_fh is not None:
+                game = board_to_pgn(board, p1_color, result, cli.p1_name, cli.p2_name)
+                pgn_fh.write(str(game) + "\n\n")
+                pgn_fh.flush()
+    except KeyboardInterrupt:
+        print(f"\n[Ctrl-C] aborting after {games_completed}/{cli.games} games "
+              f"({wins}W {draws}D {losses}L)")
     finally:
+        if pgn_fh is not None:
+            pgn_fh.close()
         p1.close()
         p2.close()
 
     score = wins + 0.5 * draws
+    n = max(games_completed, 1)
     print(f"\n=== Final ===")
     print(f"{cli.p1_name}: {wins} W / {draws} D / {losses} L")
-    print(f"{cli.p1_name} score: {score:.1f}/{cli.games} ({100 * score / cli.games:.1f}%)")
-    elo = elo_diff_from_score(score, cli.games)
+    print(f"{cli.p1_name} score: {score:.1f}/{games_completed} "
+          f"({100 * score / n:.1f}%)")
+    elo = elo_diff_from_score(score, games_completed)
     if elo is not None:
         print(f"Elo diff ({cli.p1_name} - {cli.p2_name}): {elo:+.0f}  "
-              f"(~{cli.games} games -- noisy below 30)")
+              f"(~{games_completed} games -- noisy below 30)")
     else:
         print("Elo diff: undefined (perfect or null score)")
 
     if cli.output:
-        with open(cli.output, "w") as fh:
-            for g in pgns:
-                fh.write(str(g) + "\n\n")
         print(f"PGNs written to {cli.output}")
 
 

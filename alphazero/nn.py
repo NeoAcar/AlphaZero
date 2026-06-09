@@ -3,6 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# Default input plane count. 19 = legacy "current board only" representation.
+# 119 = AlphaZero 8-frame history (8 × 14 + 7 constants). New tabula-rasa
+# training uses 119; legacy checkpoints (e.g. the SFT WDL run) are 19. Model
+# constructors take in_channels explicitly; callers should detect from
+# the checkpoint's first-conv weight shape (see detect_in_channels below).
+INPUT_PLANES_LEGACY = 19
+INPUT_PLANES_HISTORY = 119
+
+
+def detect_in_channels(state_dict) -> int:
+    """Read the first-conv input-channels from a model state_dict (or the
+    inner ``model_state_dict`` of a full checkpoint dict). Used so callers
+    can load 19- or 119-plane checkpoints without knowing in advance."""
+    if "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+    key = "startBlock.0.weight"  # shared name across ResNet/SEResNet/SEResNetWDL
+    if key not in state_dict:
+        raise KeyError(
+            f"checkpoint missing {key!r}; cannot detect in_channels. "
+            f"Keys present: {list(state_dict.keys())[:5]}..."
+        )
+    return int(state_dict[key].shape[1])
+
+
 def value_to_scalar(value_t: torch.Tensor, mode: str = "expected") -> torch.Tensor:
     """Normalise either tanh-scalar (B,1) or WDL-logits (B,3) value output
     to a scalar per sample. Returns shape (B,).
@@ -25,10 +49,11 @@ def value_to_scalar(value_t: torch.Tensor, mode: str = "expected") -> torch.Tens
 
 
 class ResNet(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels: int = INPUT_PLANES_HISTORY):
         super().__init__()
+        self.in_channels = in_channels
         self.startBlock = nn.Sequential(
-            nn.Conv2d(19, 256, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(),
         )
@@ -123,10 +148,12 @@ class SEResBlock(nn.Module):
 class SEResNet(nn.Module):
     """ResNet variant: SE channel attention in every block + SiLU everywhere."""
 
-    def __init__(self, channels: int = 256, n_blocks: int = 19, reduction: int = 16):
+    def __init__(self, channels: int = 256, n_blocks: int = 19, reduction: int = 16,
+                 in_channels: int = INPUT_PLANES_HISTORY):
         super().__init__()
+        self.in_channels = in_channels
         self.startBlock = nn.Sequential(
-            nn.Conv2d(19, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.SiLU(),
         )
@@ -171,10 +198,12 @@ class SEResNetWDL(nn.Module):
     a scalar in [-1, +1]).
     """
 
-    def __init__(self, channels: int = 256, n_blocks: int = 19, reduction: int = 16):
+    def __init__(self, channels: int = 256, n_blocks: int = 19, reduction: int = 16,
+                 in_channels: int = INPUT_PLANES_HISTORY):
         super().__init__()
+        self.in_channels = in_channels
         self.startBlock = nn.Sequential(
-            nn.Conv2d(19, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.SiLU(),
         )
@@ -207,3 +236,4 @@ class SEResNetWDL(nn.Module):
         policy = self.policyHead(x)
         value = self.valueHead(x)
         return value, policy
+

@@ -23,7 +23,7 @@ class Node:
     """
 
     def __init__(self, args, state, move_counter, depth=0,
-                 parent=None, action=None, prior=None):
+                 parent=None, action=None, prior=None, history=None):
         self.args = args
         self.state = state
         self.parent = parent
@@ -31,6 +31,11 @@ class Node:
         self.prior = prior
         self.depth = depth
         self.move_counter = move_counter
+        # Up to 7 prior canonical boards (chronological, oldest first). Used
+        # only when input_planes=119 -- expand_lazy threads it into
+        # board_to_matrix to fill the historical frames. Empty list = clean
+        # start (zero-padded historical frames).
+        self.history: list = list(history) if history else []
 
         # `raw_policy` = NN output masked to legal moves; immutable after expand.
         # `policy` = `raw_policy` plus any Dirichlet noise (added only when this
@@ -56,6 +61,11 @@ class Node:
         # diagnostics can compare the NN's pre-search verdict against the
         # search-refined Q without spending an extra forward.
         self.raw_nn_value: float | None = None
+        # Raw NN WDL distribution (P(W), P(D), P(L)) for WDL heads, None for
+        # scalar-tanh heads. Same single GPU→CPU sync as raw_nn_value above.
+        # Lets the dashboard compute variance for the win-prob band without
+        # a second forward pass.
+        self.raw_nn_wdl: tuple[float, float, float] | None = None
         # Virtual loss counter for batched MCTS (number of in-flight sims
         # that have passed through this node). Always 0 in sequential MCTS.
         self.virtual_loss: int = 0
@@ -141,10 +151,15 @@ class Node:
         move = f.alphazero_to_move(action, self.state)
         new_state.push_uci(move)
         new_state.apply_mirror()
+        # Child's history = parent's recent history + parent's own state
+        # (chronological, oldest first). Keep at most the last 7 entries --
+        # 119-plane representation only uses 7 historical frames.
+        new_history = self.history[-6:] + [self.state] if self.history else [self.state]
         child = Node(
             self.args, new_state, self.move_counter + 1,
             depth=self.depth + 1, parent=self, action=action,
             prior=float(self.policy[action]),
+            history=new_history,
         )
         self.children[action] = child
         return child
@@ -160,7 +175,14 @@ class Node:
         n_legal comes from the numpy mask (no extra sync).
         """
         model.eval()
-        inputs = f.prepare_input(self.state, self.move_counter).unsqueeze(0).to(self.args["device"])
+        # input_planes=119 -> pass history for 8-frame representation; otherwise
+        # legacy 19-plane (current board only). Also fill the frame-0 repetition
+        # planes from this node's rep_count (already maintained by MCTS).
+        hist = self.history if self.args.get("input_planes") == 119 else None
+        inputs = f.prepare_input(
+            self.state, self.move_counter, history=hist,
+            rep_count=max(self.rep_count, 1),
+        ).unsqueeze(0).to(self.args["device"])
         value_t, policy_t = model(inputs)
 
         legal_mask_np = f.legal_mask(self.state)
@@ -173,9 +195,20 @@ class Node:
         masked_logits = policy_t.squeeze(0).masked_fill(~mask, float("-inf"))
         policy_probs = torch.softmax(masked_logits, dim=0)  # (4672,) on GPU
 
-        combined = torch.cat([value_scalar, policy_probs]).cpu().numpy()
-        value = float(combined[0])
-        self.raw_policy = combined[1:]
+        # If this is a WDL head (value_t shape (..., 3)), pull the softmax'd
+        # W/D/L probs across the *same* CPU sync — no extra GPU→CPU round-trip.
+        if value_t.shape[-1] == 3:
+            wdl_probs = torch.softmax(value_t.flatten(), dim=0)   # (3,) on GPU
+            combined = torch.cat([value_scalar, wdl_probs, policy_probs]).cpu().numpy()
+            value = float(combined[0])
+            self.raw_nn_wdl = (
+                float(combined[1]), float(combined[2]), float(combined[3])
+            )
+            self.raw_policy = combined[4:]
+        else:
+            combined = torch.cat([value_scalar, policy_probs]).cpu().numpy()
+            value = float(combined[0])
+            self.raw_policy = combined[1:]
         self.policy = self.raw_policy.copy()
         self.raw_nn_value = value
         return value
@@ -195,12 +228,25 @@ class MCTS:
         # search. Keyed by transposition_key (tuple). Includes the root
         # position itself (so ext_rep[root.tk] >= 1 always).
         self._ext_rep: dict = {}
+        # Board history (chronological list of prior canonical boards). Set
+        # by callers via set_history() so a fresh root knows its 8-frame
+        # history context for the 119-plane representation.
+        self._ext_history: list = []
 
     def set_rep_counter(self, counter) -> None:
         """Inject the game-level Counter[transposition_key] before search.
         Stored as a plain dict; we only read it. Callers should reset it on
         new games and bump it after each played move."""
         self._ext_rep = dict(counter) if counter else {}
+
+    def set_history(self, history) -> None:
+        """Inject the game-level history (chronological list of prior canonical
+        boards, EXCLUDING the current root state) before each search. Used to
+        seed `Node.history` when a fresh root has to be built. Tree-reused
+        roots ignore this -- their history is already correctly inherited
+        from their previous-life parents. Only meaningful when input_planes
+        is 119; harmless when 19."""
+        self._ext_history = list(history) if history else []
 
     def _compute_rep_count(self, node: "Node") -> int:
         """Total repetition count for `node`: real-game history (ext_rep) +
@@ -369,7 +415,10 @@ class MCTS:
             self.update_root(state, move_counter)
 
         if self.root is None:
-            self.root = Node(self.args, state, move_counter)
+            self.root = Node(
+                self.args, state, move_counter,
+                history=self._ext_history,
+            )
             self.root.rep_count = self._compute_rep_count(self.root)
             self.root.expand_lazy(self.model)
             min_depth = 0

@@ -50,6 +50,7 @@ _state = {
     "bot_color": None,
     "win_prob_series": [],      # list of [ply, win_prob_bot_pov]  (MCTS Q)
     "nn_win_prob_series": [],   # list of [ply, win_prob_bot_pov]  (raw NN)
+    "nn_std_series": [],        # list of [ply, std_dev_of_nn_win_prob]  (WDL only)
     "last_tick": None,
     "last_ponder_tick": None,   # latest ponder_tick (status=running); cleared on bot move / new game
     "clock": None,
@@ -105,6 +106,7 @@ def event_in():
             if _state["ply"] == 0:
                 _state["win_prob_series"] = []
                 _state["nn_win_prob_series"] = []
+                _state["nn_std_series"] = []
                 _state["last_tick"] = None
                 _state["last_ponder_tick"] = None
             _state["board_svg"] = _render_board_svg(
@@ -128,6 +130,9 @@ def event_in():
             nn_wp = payload.get("nn_win_prob")
             if nn_wp is not None and ply is not None:
                 _state["nn_win_prob_series"].append([ply, nn_wp])
+            nn_std = payload.get("nn_std")
+            if nn_std is not None and ply is not None:
+                _state["nn_std_series"].append([ply, nn_std])
             # Bot just moved -- any prior ponder state is stale.
             if payload.get("mover") == "bot":
                 _state["last_ponder_tick"] = None
@@ -289,10 +294,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span id="winProb" class="value">50.0%</span></div>
       <div class="row"><span class="label">MCTS depth</span>
         <span id="depth" class="value">0</span></div>
-      <div class="row"><span class="label">Sims done</span>
-        <span id="sims" class="value">0</span></div>
-      <div class="row"><span class="label">NPS</span>
-        <span id="nps" class="value">0</span></div>
+      <div class="row"><span class="label">Sims&nbsp;/&nbsp;NPS</span>
+        <span class="value"><span id="sims">0</span>
+          &nbsp;·&nbsp; <span id="nps">0</span></span></div>
       <div class="row"><span class="label">Pondering</span>
         <span class="value"><span id="ponderSims">—</span>
           &nbsp;sims&nbsp;·&nbsp;<span id="ponderNps">—</span>&nbsp;nps</span></div>
@@ -366,8 +370,11 @@ window.addEventListener('resize', () => {
   }, 80);
 });
 
-function initPlot(xs, ys, nnXs, nnYs) {
+function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+
+function initPlot(xs, ys, nnXs, nnYs, nnLo, nnHi) {
   Plotly.newPlot('plot', [
+    // Trace 0: MCTS Q/N (visible)
     {
       x: xs.length ? xs : [0],
       y: ys.length ? ys : [0.5],
@@ -376,6 +383,27 @@ function initPlot(xs, ys, nnXs, nnYs) {
       marker: { size: 6, color: '#66bb6a' },
       name: 'MCTS Q/N'
     },
+    // Trace 1: NN lower bound (invisible line; fill anchor)
+    {
+      x: nnXs.length ? nnXs : [0],
+      y: nnLo.length ? nnLo : [0.5],
+      mode: 'lines',
+      line: { color: 'transparent', shape: 'spline' },
+      showlegend: false,
+      hoverinfo: 'skip',
+    },
+    // Trace 2: NN upper bound + shaded fill down to trace 1 (the band)
+    {
+      x: nnXs.length ? nnXs : [0],
+      y: nnHi.length ? nnHi : [0.5],
+      mode: 'lines',
+      line: { color: 'transparent', shape: 'spline' },
+      fill: 'tonexty',
+      fillcolor: 'rgba(66, 165, 245, 0.18)',
+      name: 'NN ±σ',
+      hoverinfo: 'skip',
+    },
+    // Trace 3: NN center line (visible)
     {
       x: nnXs.length ? nnXs : [0],
       y: nnYs.length ? nnYs : [0.5],
@@ -396,7 +424,7 @@ function initPlot(xs, ys, nnXs, nnYs) {
   }, { displayModeBar: false, responsive: true });
   plotInitialised = true;
 }
-initPlot([], [], [], []);
+initPlot([], [], [], [], [], []);
 
 function fmtClock(ms) {
   if (ms == null) return '—';
@@ -446,8 +474,15 @@ function applyMove(m) {
     setEval(m.cp, m.win_prob);
   }
   if (m.nn_win_prob !== undefined && m.ply !== undefined && plotInitialised) {
-    Plotly.extendTraces('plot',
-      { x: [[m.ply]], y: [[m.nn_win_prob]] }, [1]);
+    // Extend NN lower/upper bound + center together so the band stays in sync.
+    // If no std was sent (non-WDL head), collapse the band to zero-width.
+    const sigma = (m.nn_std !== undefined) ? m.nn_std : 0;
+    const lo = clamp01(m.nn_win_prob - sigma);
+    const hi = clamp01(m.nn_win_prob + sigma);
+    Plotly.extendTraces('plot', {
+      x: [[m.ply], [m.ply], [m.ply]],
+      y: [[lo], [hi], [m.nn_win_prob]],
+    }, [1, 2, 3]);
   }
   if (m.mover === 'bot') {
     goStartMs = null;
@@ -467,7 +502,7 @@ function applyState(s) {
   if (s.bot_color) $('botColor').textContent = s.bot_color;
   if (s.ply === 0) {
     highlightLastmove(null);
-    initPlot([], [], [], []);
+    initPlot([], [], [], [], [], []);
     setEval(0, 0.5);
     $('depth').textContent = '0';
     $('sims').textContent = '0';
@@ -500,7 +535,13 @@ function applySnapshot(s) {
     const ys  = hasMcts ? s.win_prob_series.map(p => p[1]) : [];
     const nxs = hasNn   ? s.nn_win_prob_series.map(p => p[0]) : [];
     const nys = hasNn   ? s.nn_win_prob_series.map(p => p[1]) : [];
-    initPlot(xs, ys, nxs, nys);
+    // Build band arrays from nn_std_series (keyed by ply). Missing std -> zero
+    // band radius, so the fill region collapses to the center line for that pt.
+    const stdMap = {};
+    (s.nn_std_series || []).forEach(p => { stdMap[p[0]] = p[1]; });
+    const nLo = nxs.map((x, i) => clamp01(nys[i] - (stdMap[x] || 0)));
+    const nHi = nxs.map((x, i) => clamp01(nys[i] + (stdMap[x] || 0)));
+    initPlot(xs, ys, nxs, nys, nLo, nHi);
     if (hasMcts) setEval(null, ys[ys.length - 1]);
   }
   if (s.last_tick) applyTick(s.last_tick);

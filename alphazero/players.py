@@ -31,21 +31,35 @@ torch.set_float32_matmul_precision("high")
 
 from . import utils as f
 from .mcts import MCTS
-from .nn import ResNet, SEResNet, SEResNetWDL, value_to_scalar
+from .nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
+
+
+_ARCH_CLASSES = {
+    "resnet":      ResNet,
+    "seresnet":    SEResNet,
+    "seresnetwdl": SEResNetWDL,
+}
 
 
 def build_model(cfg: dict):
-    """Instantiate the NN architecture named in cfg['architecture'] (default 'resnet')."""
+    """Instantiate the NN architecture named in cfg['architecture'] (default
+    'resnet'). Auto-detects in_channels from the checkpoint (legacy 19 vs
+    history 119) so old SFT checkpoints still load."""
     name = cfg.get("architecture", "resnet").lower()
-    if name == "resnet":
-        return ResNet()
-    if name == "seresnet":
-        return SEResNet()
-    if name == "seresnetwdl":
-        return SEResNetWDL()
-    raise ValueError(
-        f"unknown architecture: {name!r}; expected 'resnet', 'seresnet', or 'seresnetwdl'"
-    )
+    if name not in _ARCH_CLASSES:
+        raise ValueError(
+            f"unknown architecture: {name!r}; expected 'resnet', 'seresnet', or 'seresnetwdl'"
+        )
+    in_ch = 19   # legacy default; overridden if a checkpoint is given
+    ckpt_path = cfg.get("checkpoint")
+    if ckpt_path:
+        try:
+            state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            in_ch = detect_in_channels(state)
+        except Exception:
+            pass
+    cfg["_in_channels"] = in_ch                  # stash so MctsPlayer can read
+    return _ARCH_CLASSES[name](in_channels=in_ch)
 
 
 PIECE_VALUES = {
@@ -170,6 +184,7 @@ class ValueOnlyPlayer:
             raise ValueError("value_only config needs 'checkpoint'")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = build_model(cfg).to(self.device)
+        self.in_channels = int(cfg.get("_in_channels", 19))
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
@@ -189,8 +204,12 @@ class ValueOnlyPlayer:
 
     @torch.inference_mode()
     def _batch_values(self, mirrored_states: list[chess.Board], move_counter: int) -> np.ndarray:
+        # ValueOnlyPlayer doesn't track per-game history (stateless across
+        # moves), so 119-plane models get zero-padded historical frames. Less
+        # strong than MCTS path but works.
+        hist = [] if self.in_channels == 119 else None
         inputs = torch.stack(
-            [f.prepare_input(s, move_counter) for s in mirrored_states]
+            [f.prepare_input(s, move_counter, history=hist) for s in mirrored_states]
         ).to(self.device)
         values, _ = self.model(inputs)
         return value_to_scalar(values, mode=self.value_scalar).cpu().numpy().flatten()
@@ -247,13 +266,14 @@ class PolicyOnlyPlayer:
             raise ValueError("policy_only config needs 'checkpoint'")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = build_model(cfg).to(self.device)
+        self.in_channels = int(cfg.get("_in_channels", 19))
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
         try:
             self.model = torch.compile(self.model)
             with torch.inference_mode():
-                _ = self.model(torch.zeros(1, 19, 8, 8, device=self.device))
+                _ = self.model(torch.zeros(1, self.in_channels, 8, 8, device=self.device))
         except Exception:
             pass
         # Temperature controls policy sampling for the first temperature_moves plies;
@@ -264,7 +284,10 @@ class PolicyOnlyPlayer:
 
     @torch.inference_mode()
     def select_move(self, real_board, mirrored_state, move_counter):
-        inputs = f.prepare_input(mirrored_state, move_counter).unsqueeze(0).to(self.device)
+        hist = [] if self.in_channels == 119 else None
+        inputs = f.prepare_input(
+            mirrored_state, move_counter, history=hist,
+        ).unsqueeze(0).to(self.device)
         _value, policy_logits = self.model(inputs)
         mask = torch.from_numpy(f.legal_mask(mirrored_state)).to(self.device)
         masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
@@ -307,6 +330,8 @@ class MctsPlayer:
         args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = build_model(cfg).to(args["device"])
+        in_ch = int(cfg.get("_in_channels", 19))
+        args["input_planes"] = in_ch                # MCTS routes board_to_matrix accordingly
         state = torch.load(args["checkpoint"], map_location=args["device"], weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
@@ -324,7 +349,10 @@ class MctsPlayer:
                 # trace specializes on input content too (BN/SE paths behave
                 # differently on all-zero input), so a zeros-warmup leaves the
                 # first REAL forward to pay a ~6s re-trace cost on move 1.
-                real_one = f.prepare_input(chess.Board(), 0).unsqueeze(0).to(args["device"])
+                real_one = f.prepare_input(
+                    chess.Board(), 0,
+                    history=([] if in_ch == 119 else None),
+                ).unsqueeze(0).to(args["device"])
                 with torch.inference_mode():
                     if warm_bs > 1:
                         _ = self.model(real_one.expand(warm_bs, -1, -1, -1).contiguous())

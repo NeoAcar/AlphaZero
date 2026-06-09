@@ -1,93 +1,164 @@
-"""
-Generate self-play games for AlphaZero training.
+"""Generate self-play games for AlphaZero training.
 
-Each move:
-  * MCTS runs with Dirichlet noise at root (for exploration).
-  * For the first `temperature_moves` plies, action is sampled from the
-    visit-count distribution scaled by `1/temperature`. After that, argmax.
+This is the laptop-side game generator. Each invocation is one *session*
+that produces fragments under `data/selfplay/<checkpoint_name>/`. Sessions
+are arbitrarily small (10 games, 50 games, 100 games) -- a later Colab
+training run merges all fragments for a checkpoint and trains on them.
 
-Per position, we record:
-  * board_matrix (19, 8, 8) -- the mirror-canonical board representation
-  * pi          (4672,)    -- MCTS visit-count distribution (sums to 1)
-  * z           scalar     -- the eventual game outcome from THIS player's
-                              perspective: +1 if they won, -1 if lost, 0 if draw
+Implements the following:
 
-Output is a .pt file:
-    {"boards": Tensor(N,19,8,8), "pis": Tensor(N,4672), "values": Tensor(N,1)}
+* **PCR (Playout Cap Randomization)** -- KataGo-style. With probability
+  `high_prob`, run `high_sims` simulations; otherwise `low_sims`. Only
+  high-sim positions are used for policy training (the `is_high_sim` flag
+  rides with each position). Value training uses all positions. No
+  Dirichlet noise on low-sim moves.
+
+* **LC0-style termination** -- resign threshold + playthrough sampling +
+  hard ply cap. Some fraction of games disable resign so the threshold can
+  be calibrated (false-positive rate tracked in analytics later).
+
+* **PGN export** alongside the `.pt` -- human-readable game records.
+
+* **Sparse pi storage** -- only legal/visited action indices + values are
+  stored, padded to MAX_LEGAL. Cuts per-position size ~10x.
+
+* **119-plane history** -- self-play maintains the per-game board history
+  and feeds it into MCTS. Auto-detects 19 vs 119 from the checkpoint.
 
 Usage:
-    uv run python selfplay.py \
-        --checkpoint models/model_best.pth \
-        --games 100 \
-        --sims 200 \
-        --output selfplay_data/iter_0.pt
+    uv run python selfplay.py \\
+        --checkpoint models/v00_seed.pth \\
+        --games 50 \\
+        --output-dir data/selfplay/
 """
 import argparse
+import datetime
+import hashlib
 import json
 import os
 import time
 from pathlib import Path
 
 import chess
+import chess.pgn
 import numpy as np
 import torch
 from tqdm import tqdm  # type: ignore
 
-torch.set_float32_matmul_precision("high")    # TF32 on Ampere+ GPUs
+torch.set_float32_matmul_precision("high")
 
 from alphazero import utils as f
-from alphazero.batched_mcts import BatchedMCTS as MCTS  # TEMP: profile batched path
-from alphazero.nn import ResNet, SEResNet, SEResNetWDL
+from alphazero.batched_mcts import BatchedMCTS as MCTS
+from alphazero.nn import (
+    INPUT_PLANES_HISTORY,
+    ResNet,
+    SEResNet,
+    SEResNetWDL,
+    detect_in_channels,
+    value_to_scalar,
+)
 
 
 ARCHITECTURES = {
-    "resnet": ResNet,
-    "seresnet": SEResNet,
+    "resnet":      ResNet,
+    "seresnet":    SEResNet,
     "seresnetwdl": SEResNetWDL,
 }
+
+
+# Max sparse pi entries kept per position. Visit counts at high_sims=1200 with
+# batch=8 reach ~40-50 distinct children in worst case; 64 has slack. If a
+# position somehow has more, we keep top-K by visit and renormalize.
+MAX_LEGAL = 64
 
 
 DEFAULT_MCTS_ARGS = {
     "c_base": 19652,
     "c_init": 1.25,
-    "c_fpu": 0.2,
+    "c_fpu":  0.2,
     "dirichlet_epsilon": 0.25,
-    "dirichlet_alpha": 0.3,
-    "memory_size": 1000,
+    "dirichlet_alpha":   0.3,
+    "memory_size":  1000,
     "action_space": 4672,
     "t": 1,
 }
 
 
-def build_mcts(checkpoint: str, sims: int, dirichlet_eps: float,
-               architecture: str = "seresnet") -> tuple[MCTS, torch.nn.Module, dict]:
-    args = dict(DEFAULT_MCTS_ARGS)
-    args["num_simulation"] = sims
-    args["dirichlet_epsilon"] = dirichlet_eps
-    args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args["truncation"] = 300
-    args["batch_size"] = 8   # TEMP: for batched profile run
+# ---------- checkpoint loading + MCTS bootstrap -------------------------------
 
-    arch = architecture.lower()
-    if arch not in ARCHITECTURES:
-        raise ValueError(f"architecture must be one of {list(ARCHITECTURES)}, got {arch!r}")
-    model = ARCHITECTURES[arch]().to(args["device"])
-    state = torch.load(checkpoint, map_location=args["device"], weights_only=False)
+def load_checkpoint(path: str, device: torch.device,
+                    arch_override: str | None) -> tuple[torch.nn.Module, str, int]:
+    """Loads a checkpoint, detecting architecture (from meta or override) and
+    in_channels (from first-conv weight shape). Returns (model, arch_name,
+    in_channels)."""
+    state = torch.load(path, map_location=device, weights_only=False)
+    in_ch = detect_in_channels(state)
+    meta = state.get("meta", {})
+    arch_name = (arch_override or meta.get("architecture") or "seresnetwdl").lower()
+    if arch_name not in ARCHITECTURES:
+        raise ValueError(
+            f"Unknown architecture {arch_name!r}; choices: {list(ARCHITECTURES)}"
+        )
+    cls = ARCHITECTURES[arch_name]
+    model = cls(in_channels=in_ch).to(device)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
-    # mode="reduce-overhead" — empirically ~50% faster per-ply than default
-    # on this workload (batched MCTS, batch=8, 22M-param SEResNet, 3050 Ti).
-    # The .to() sync overhead (visible at 34% wall-clock in profile) is the
-    # cost of CUDA-graph kernel fusion, which more than pays for itself by
-    # eliminating per-launch overhead on the thousands of small forwards.
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        with torch.inference_mode():
-            _ = model(torch.zeros(1, 19, 8, 8, device=args["device"]))
-    except Exception as e:
-        print(f"torch.compile skipped: {e}")
-    return MCTS(args, model), model, args
+    return model, arch_name, in_ch
 
+
+def build_mcts(model: torch.nn.Module, in_channels: int, batch_size: int,
+               device: torch.device) -> MCTS:
+    args = dict(DEFAULT_MCTS_ARGS)
+    args["device"]        = device
+    args["batch_size"]    = batch_size
+    args["truncation"]    = 1000               # we apply our own max_plies cap
+    args["input_planes"]  = in_channels
+    args["num_simulation"] = 1                  # placeholder; overridden per-move
+    return MCTS(args, model)
+
+
+def checkpoint_sha(path: str) -> str:
+    """Short hash of a checkpoint's bytes -- so we can tag every session with
+    the exact weights that produced it. SHA1 truncated for readability."""
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+def checkpoint_dir_name(path: str) -> str:
+    """Directory name under data/selfplay/ for this checkpoint. Uses the
+    checkpoint's stem (e.g. 'v00_seed') so sessions group by version."""
+    return Path(path).stem
+
+
+# ---------- per-position sparse-pi encoding -----------------------------------
+
+def encode_pi_sparse(pi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (indices: int16[MAX_LEGAL], values: float16[MAX_LEGAL]).
+    Padded with index=-1 and value=0 for empty slots. If a position has more
+    than MAX_LEGAL nonzero entries (shouldn't happen with our sim caps), we
+    keep the top-MAX_LEGAL by visit and renormalize."""
+    nz = np.flatnonzero(pi)
+    vals = pi[nz]
+    if len(nz) > MAX_LEGAL:
+        top = np.argpartition(-vals, MAX_LEGAL - 1)[:MAX_LEGAL]
+        nz = nz[top]
+        vals = vals[top]
+        # Re-normalize after dropping low-mass moves.
+        s = vals.sum()
+        if s > 0:
+            vals = vals / s
+    idx = np.full(MAX_LEGAL, -1, dtype=np.int16)
+    val = np.zeros(MAX_LEGAL, dtype=np.float16)
+    k = min(len(nz), MAX_LEGAL)
+    idx[:k] = nz[:k].astype(np.int16)
+    val[:k] = vals[:k].astype(np.float16)
+    return idx, val
+
+
+# ---------- action sampling ---------------------------------------------------
 
 def sample_action(pi: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
     if temperature <= 0:
@@ -99,204 +170,438 @@ def sample_action(pi: np.ndarray, temperature: float, rng: np.random.Generator) 
     return int(rng.choice(len(scaled), p=scaled / total))
 
 
-def play_one_game(mcts: MCTS, temperature_moves: int, temperature: float,
-                  truncation: int, rng: np.random.Generator
-                  ) -> tuple[list[np.ndarray], list[np.ndarray], int]:
-    """Run one self-play game. Returns (boards, pis, outcome_from_p0_perspective).
+# ---------- one self-play game ------------------------------------------------
 
-    Per ply we record:
-      - board_matrix at that ply
-      - pi (MCTS visit distribution)
-    Players alternate; we'll compute per-position z based on who was to move.
+def root_value_from_pov(mcts: MCTS) -> float:
+    """Mean value at the root from the side-to-move's POV, in [-1, +1].
+    Used by the resign-threshold check after a high-sim search."""
+    root = mcts.root
+    if root is None or root.N == 0:
+        return float(root.raw_nn_value) if (root and root.raw_nn_value is not None) else 0.0
+    # root.Q is accumulated with the leaf-perspective alternating-sign rule, so
+    # for the root specifically `root.Q / root.N` is in the "grandparent" frame
+    # (which doesn't exist); negating gives the root-player perspective.
+    return -root.Q / root.N
+
+
+def play_one_game(mcts: MCTS, in_channels: int, cli, rng: np.random.Generator,
+                  allow_resign: bool):
+    """Run one self-play game. Returns:
+        positions: list of per-position dicts
+        plies:     number of plies played
+        final_value: from the perspective of the side-to-move at game end
+        reason:    "checkmate" | "draw_rule" | "resign" | "truncation"
+        real_moves: list of real-frame UCI moves (for PGN export)
     """
     mcts.root = None
     mirrored_state = chess.Board()
     move_counter = 0
-    # Per-game repetition counter keyed on mirror_state transposition_key.
     rep_counter: dict = {mirrored_state._transposition_key(): 1}
+    history: list = []                # canonical board history, oldest first
+    consecutive_low = 0
 
-    boards: list[np.ndarray] = []
-    pis: list[np.ndarray] = []
+    positions: list = []
+    real_moves: list = []
 
-    while not f.game_result(
-        mirrored_state, move_counter, truncation,
-        rep_counter.get(mirrored_state._transposition_key(), 0),
-    )[1]:
-        boards.append(f.board_to_matrix(mirrored_state, move_counter))
+    use_history = (in_channels == 119)
+
+    while True:
+        # Terminal check (checkmate / stalemate / insufficient / 50-move /
+        # 3-fold / hard ply cap).
+        rep_now = rep_counter.get(mirrored_state._transposition_key(), 0)
+        val, terminal = f.game_result(
+            mirrored_state, move_counter, cli.max_plies, rep_now,
+        )
+        if terminal:
+            # Categorise the reason for analytics.
+            if mirrored_state.is_checkmate():
+                reason = "checkmate"
+            elif move_counter >= cli.max_plies:
+                reason = "truncation"
+            elif rep_now >= 3:
+                reason = "3-fold"
+            elif mirrored_state.is_fifty_moves():
+                reason = "50-move"
+            else:
+                reason = "draw_rule"
+            return positions, move_counter, val, reason, real_moves
+
+        # ---- PCR: pick sim count for this move ------------------------------
+        use_high = rng.random() < cli.high_prob
+        if use_high:
+            mcts.args["num_simulation"]    = cli.high_sims
+            mcts.args["dirichlet_epsilon"] = cli.dirichlet_eps
+        else:
+            mcts.args["num_simulation"]    = cli.low_sims
+            mcts.args["dirichlet_epsilon"] = 0.0    # no noise on low-sim
+
+        # ---- search ---------------------------------------------------------
         mcts.set_rep_counter(rep_counter)
+        if use_history:
+            mcts.set_history(history)
         pi = mcts.search(mirrored_state, move_counter)
-        pis.append(pi.astype(np.float32))
 
-        if move_counter < temperature_moves:
-            action = sample_action(pi, temperature, rng)
+        # ---- record position ------------------------------------------------
+        # rep_now is the count INCLUDING the current occurrence (always >= 1).
+        # AZ's frame-0 rep planes fire at >=2 (seen-before) and >=3 (3-fold).
+        board_planes = f.board_to_matrix(
+            mirrored_state, move_counter,
+            history=(history if use_history else None),
+            rep_count=max(rep_now, 1),
+        )
+        idx, val_arr = encode_pi_sparse(pi)
+        positions.append({
+            "board":        board_planes,              # float32; cast to uint8 later
+            "pi_idx":       idx,
+            "pi_val":       val_arr,
+            "is_high_sim":  np.uint8(1 if use_high else 0),
+        })
+
+        # ---- LC0-style resign check (high-sim only) -------------------------
+        if allow_resign and use_high:
+            v = root_value_from_pov(mcts)
+            if v < cli.resign_threshold:
+                consecutive_low += 1
+                if consecutive_low >= cli.resign_consecutive:
+                    # Side-to-move resigns -> their loss.
+                    return positions, move_counter, -1, "resign", real_moves
+            else:
+                consecutive_low = 0
+        else:
+            consecutive_low = 0
+
+        # ---- play the move --------------------------------------------------
+        if move_counter < cli.temperature_moves:
+            action = sample_action(pi, cli.temperature, rng)
         else:
             action = int(np.argmax(pi))
 
         uci_mirrored = f.alphazero_to_move(action, mirrored_state)
+        mover_was_white = (move_counter % 2 == 0)
+        uci_real = uci_mirrored if mover_was_white else f.mirror_move(uci_mirrored)
+        real_moves.append(uci_real)
+
+        # Maintain canonical history: append the BEFORE-push state.
+        if use_history:
+            history.append(mirrored_state.copy())
+            if len(history) > 7:
+                history.pop(0)
+
         mirrored_state.push_uci(uci_mirrored)
         mirrored_state = mirrored_state.mirror()
         move_counter += 1
         tk = mirrored_state._transposition_key()
         rep_counter[tk] = rep_counter.get(tk, 0) + 1
-        # O(1) tree walk by the action we just took. Without this, the next
-        # search()'s update_root walks the children list and state-compares
-        # (slow). With it, the chosen child is the new root immediately.
+        # O(1) tree walk for reuse on the next search call.
         mcts.apply_action(action)
 
-    # game_result()[0] is from the perspective of the player to move in
-    # mirrored_state right now (i.e. the next-to-move at the time the loop
-    # exited). That's the player whose turn it WOULD have been -- equivalently
-    # the parity of move_counter.
-    final_value, _ = f.game_result(
-        mirrored_state, move_counter, truncation,
-        rep_counter.get(mirrored_state._transposition_key(), 0),
-    )
-    # final_value: -1 means "the next-to-move lost", 0 draw, +1 not really
-    # produced by game_result (it returns -1 for mated, 0 for draw, never +1).
-    # So we use parity:
-    #   If next-to-move is the same player as ply k -> z[k] = final_value
-    #   Otherwise z[k] = -final_value
-    return boards, pis, int(final_value), move_counter
 
+# ---------- session bookkeeping + serialisation -------------------------------
+
+def build_pgn(real_moves: list[str], headers: dict) -> str:
+    """Construct a single-game PGN string from real-frame UCI moves."""
+    game = chess.pgn.Game()
+    for k, v in headers.items():
+        game.headers[k] = str(v)
+    board = chess.Board()
+    node = game
+    for uci in real_moves:
+        move = chess.Move.from_uci(uci)
+        if move not in board.legal_moves:
+            break  # safety
+        node = node.add_main_variation(move)
+        board.push(move)
+    return str(game)
+
+
+def per_position_zs(plies: int, final_value: int) -> list[float]:
+    """Compute z (game outcome) for each ply, from THAT ply's side-to-move POV.
+    `final_value` is from the side-to-move at game end."""
+    next_parity = plies % 2
+    return [
+        float(final_value) if (k % 2) == next_parity else float(-final_value)
+        for k in range(plies)
+    ]
+
+
+def write_session(out_dir: Path, ckpt_path: str, session_positions: list,
+                  game_pgns: list[str], session_stats: dict, cli) -> Path:
+    """Write the session's .pt + .pgn + .json side-car. Returns the .pt path."""
+    ckpt_dir = out_dir / checkpoint_dir_name(ckpt_path)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Include microseconds + PID so multiple parallel selfplay.py processes
+    # writing into the same checkpoint dir never collide on filenames.
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    n_games = int(session_stats["meta"].get("games_completed", 0))
+    base = f"games_{ts}_pid{os.getpid()}_n{n_games}"
+    pt_path   = ckpt_dir / f"{base}.pt"
+    pgn_path  = ckpt_dir / f"{base}.pgn"
+    json_path = ckpt_dir / f"{base}.json"
+
+    # Stack arrays. Boards stored uint8 (4x shrink); pi sparse; values float32.
+    N = len(session_positions)
+    boards_u8 = np.stack([np.clip(p["board"] * 255, 0, 255).astype(np.uint8)
+                          for p in session_positions])
+    pi_idx    = np.stack([p["pi_idx"] for p in session_positions])
+    pi_val    = np.stack([p["pi_val"] for p in session_positions])
+    is_hi     = np.stack([p["is_high_sim"] for p in session_positions])
+    values    = np.array(session_stats["values_per_position"], dtype=np.float32).reshape(-1, 1)
+
+    payload = {
+        "boards":       torch.from_numpy(boards_u8),           # (N, P, 8, 8) uint8
+        "pi_indices":   torch.from_numpy(pi_idx),              # (N, MAX_LEGAL) int16
+        "pi_values":    torch.from_numpy(pi_val),              # (N, MAX_LEGAL) float16
+        "values":       torch.from_numpy(values),              # (N, 1) float32
+        "is_high_sim":  torch.from_numpy(is_hi),               # (N,) uint8
+        "meta": session_stats["meta"],
+    }
+    torch.save(payload, pt_path)
+
+    with open(pgn_path, "w") as fh:
+        for pgn in game_pgns:
+            fh.write(pgn + "\n\n")
+
+    with open(json_path, "w") as fh:
+        json.dump(session_stats["meta"] | {"positions": N}, fh, indent=2)
+
+    return pt_path
+
+
+# ---------- CLI + main loop ---------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", required=True, help="path to .pth model")
-    p.add_argument("--architecture", choices=list(ARCHITECTURES), default="seresnet",
-                   help="NN class to instantiate before loading checkpoint")
-    p.add_argument("--games", type=int, default=100, help="games to generate")
-    p.add_argument("--sims", type=int, default=200, help="MCTS simulations per move")
-    p.add_argument("--dirichlet-eps", type=float, default=0.25, help="exploration noise at root")
-    p.add_argument("--temperature-moves", type=int, default=15, help="plies of stochastic sampling")
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--truncation", type=int, default=300, help="max plies before draw")
-    p.add_argument("--seed", type=int, default=None, help="RNG seed for action sampling")
-    p.add_argument("--output", required=True, help="output .pt file")
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--checkpoint", required=True, help="model .pth path")
+    p.add_argument("--architecture", choices=list(ARCHITECTURES), default=None,
+                   help="optional architecture override; otherwise read from checkpoint meta")
+    p.add_argument("--games", type=int, default=10, help="games to generate this session")
+    p.add_argument("--output-dir", default="data/selfplay",
+                   help="root dir; a per-checkpoint subdir is created automatically")
+
+    # PCR (KataGo defaults for our scale: 1200/300, p=0.25).
+    p.add_argument("--high-sims",   type=int,   default=1200)
+    p.add_argument("--low-sims",    type=int,   default=300)
+    p.add_argument("--high-prob",   type=float, default=0.25)
+    p.add_argument("--dirichlet-eps", type=float, default=0.25,
+                   help="Dirichlet noise weight at root (only on HIGH-sim moves)")
+    p.add_argument("--dirichlet-alpha", type=float, default=0.3)
+
+    # LC0-style termination.
+    p.add_argument("--resign-threshold", type=float, default=-0.95,
+                   help="side-to-move resigns if root value <= this for N plies in a row")
+    p.add_argument("--resign-consecutive", type=int, default=4,
+                   help="N plies below threshold required to trigger resign")
+    p.add_argument("--resign-disabled-fraction", type=float, default=0.10,
+                   help="fraction of games where resign is disabled (for threshold calibration)")
+    p.add_argument("--max-plies", type=int, default=500,
+                   help="hard ply cap as safety net (long tabula-rasa games)")
+
+    # Exploration / temperature.
+    p.add_argument("--temperature",       type=float, default=1.0)
+    p.add_argument("--temperature-moves", type=int,   default=20,
+                   help="plies of stochastic sampling at start (AZ-style)")
+
+    p.add_argument("--batch-size", type=int, default=8, help="BatchedMCTS batch size")
+    p.add_argument("--flush-every", type=int, default=5,
+                   help="write a fragment to disk after every N completed games. "
+                        "Smaller = less work lost on Ctrl-C, more files. 0 disables "
+                        "(only writes at session end). Default 5.")
+    p.add_argument("--seed", type=int, default=None)
     cli = p.parse_args()
 
     if torch.cuda.is_available():
+        device = torch.device("cuda")
         print(f"Device: cuda ({torch.cuda.get_device_name(0)})")
     else:
+        device = torch.device("cpu")
         print("Device: cpu")
 
     print(f"Loading {cli.checkpoint}")
-    mcts, _, args = build_mcts(cli.checkpoint, cli.sims, cli.dirichlet_eps, cli.architecture)
+    model, arch, in_ch = load_checkpoint(cli.checkpoint, device, cli.architecture)
+    print(f"  architecture={arch}  in_channels={in_ch}")
+    cli.in_channels = in_ch                # stash for use inside play_one_game
+
+    sha = checkpoint_sha(cli.checkpoint)
+    print(f"  ckpt_sha={sha}")
+
+    # Compile + warm-up. Real-data warm-up (not torch.zeros) to dodge the
+    # first-real-forward JIT re-trace we hit earlier.
+    try:
+        model = torch.compile(model)
+        real_one = f.prepare_input(
+            chess.Board(), 0,
+            history=([] if in_ch == 119 else None),
+        ).unsqueeze(0).to(device)
+        with torch.inference_mode():
+            if cli.batch_size > 1:
+                _ = model(real_one.expand(cli.batch_size, -1, -1, -1).contiguous())
+            _ = model(real_one)
+        print("torch.compile + warm-up done")
+    except Exception as e:
+        print(f"torch.compile skipped: {e}")
+
+    mcts = build_mcts(model, in_ch, cli.batch_size, device)
     rng = np.random.default_rng(cli.seed)
 
-    all_boards: list[np.ndarray] = []
-    all_pis: list[np.ndarray] = []
-    all_values: list[float] = []
-    stats = {"wins_white": 0, "wins_black": 0, "draws": 0, "truncated": 0, "total_plies": 0}
+    def fresh_stats() -> dict:
+        return {
+            "games_completed": 0, "positions_total": 0,
+            "wins_white": 0, "wins_black": 0, "draws": 0,
+            "truncated": 0, "resigned": 0, "checkmated": 0, "rule_draws": 0,
+            "resign_disabled_games": 0,
+            "high_sim_positions": 0, "low_sim_positions": 0,
+        }
 
-    print(f"\nGenerating {cli.games} games (sims={cli.sims}, temp_moves={cli.temperature_moves})\n")
+    # Pending fragment (everything not yet flushed to disk).
+    pending_positions: list = []
+    pending_zs: list[float] = []
+    pending_pgns: list[str] = []
+    pending_stats: dict = fresh_stats()
+    pending_t_start = time.time()
+    fragments_written: list = []
 
-    t_total = time.time()
-    pbar = tqdm(range(cli.games), desc="Self-play", unit="game")
-    for g in pbar:
-        t0 = time.time()
-        boards, pis, final_value, plies = play_one_game(
-            mcts, cli.temperature_moves, cli.temperature, cli.truncation, rng
+    # Aggregate counters for the end-of-session summary (across all fragments).
+    total_stats = fresh_stats()
+
+    def flush() -> Path | None:
+        """Write the current pending buffer as a fragment .pt/.pgn/.json and
+        reset. Returns the .pt path, or None if nothing pending."""
+        nonlocal pending_positions, pending_zs, pending_pgns, pending_stats, pending_t_start
+        if pending_stats["games_completed"] == 0:
+            return None
+        elapsed = time.time() - pending_t_start
+        frag_stats = {
+            "values_per_position": pending_zs,
+            "meta": {
+                "checkpoint":           cli.checkpoint,
+                "checkpoint_sha":       sha,
+                "architecture":         arch,
+                "in_channels":          in_ch,
+                "started":              datetime.datetime.fromtimestamp(pending_t_start).isoformat(),
+                "duration_s":           round(elapsed, 1),
+                "high_sims":            cli.high_sims,
+                "low_sims":             cli.low_sims,
+                "high_prob":            cli.high_prob,
+                "dirichlet_eps":        cli.dirichlet_eps,
+                "dirichlet_alpha":      cli.dirichlet_alpha,
+                "resign_threshold":     cli.resign_threshold,
+                "resign_consecutive":   cli.resign_consecutive,
+                "resign_disabled_fraction": cli.resign_disabled_fraction,
+                "max_plies":            cli.max_plies,
+                "temperature":          cli.temperature,
+                "temperature_moves":    cli.temperature_moves,
+                "batch_size":           cli.batch_size,
+                **pending_stats,
+            }
+        }
+        pt_path = write_session(
+            Path(cli.output_dir), cli.checkpoint,
+            pending_positions, pending_pgns, frag_stats, cli,
         )
-        dt = time.time() - t0
+        fragments_written.append(pt_path)
+        tqdm.write(f"  → flushed {pending_stats['games_completed']} games to {pt_path.name} "
+                   f"({pt_path.stat().st_size / 1e6:.1f} MB)")
+        # Reset pending state.
+        pending_positions = []
+        pending_zs = []
+        pending_pgns = []
+        pending_stats = fresh_stats()
+        pending_t_start = time.time()
+        return pt_path
 
-        # Compute z for each ply. final_value is from the perspective of the
-        # next-to-move at game end. Plies 0, 2, 4, ... had player A to move;
-        # plies 1, 3, 5, ... had player B. The "next-to-move at game end" had
-        # the same parity as `plies` would have (i.e. if `plies` plies were
-        # made, the next-to-move has parity (plies) % 2). So:
-        next_parity = plies % 2
-        zs = []
-        for k in range(plies):
-            if (k % 2) == next_parity:
-                zs.append(float(final_value))
-            else:
-                zs.append(float(-final_value))
-        # Note: final_value is from mirror-canonical "player-to-move at end"
-        # perspective. Because both bots play in the same mirrored frame,
-        # the perspective math is uniform.
+    t_session = time.time()
+    pbar = tqdm(range(cli.games), desc="self-play", unit="game")
+    try:
+        for g in pbar:
+            allow_resign = (rng.random() >= cli.resign_disabled_fraction)
+            if not allow_resign:
+                pending_stats["resign_disabled_games"] += 1
+                total_stats["resign_disabled_games"] += 1
+            t0 = time.time()
+            positions, plies, final_value, reason, real_moves = play_one_game(
+                mcts, in_ch, cli, rng, allow_resign,
+            )
+            dt = time.time() - t0
 
-        all_boards.extend(boards)
-        all_pis.extend(pis)
-        all_values.extend(zs)
+            zs = per_position_zs(plies, final_value)
+            pending_positions.extend(positions)
+            pending_zs.extend(zs)
 
-        if final_value == -1:
-            # Player to move at end lost. They had parity `next_parity`.
-            # In the mirror-canonical frame, plays 0/2/4 are white-mirror;
-            # 1/3/5 are post-mirror i.e. black's real move. But since both
-            # sides see "white to move" in their mirror, we just track which
-            # ply-parity won.
-            if next_parity == 0:
-                stats["wins_black"] += 1
-            else:
-                stats["wins_white"] += 1
-        else:
-            if plies >= cli.truncation:
-                stats["truncated"] += 1
-            else:
-                stats["draws"] += 1
-        stats["total_plies"] += plies
+            hi_n = sum(1 for p in positions if p["is_high_sim"])
+            lo_n = len(positions) - hi_n
+            for s in (pending_stats, total_stats):
+                s["positions_total"] += len(positions)
+                s["games_completed"] += 1
+                s["high_sim_positions"] += hi_n
+                s["low_sim_positions"]  += lo_n
+                if final_value == -1:
+                    if reason == "checkmate":
+                        s["checkmated"] += 1
+                    elif reason == "resign":
+                        s["resigned"] += 1
+                    if plies % 2 == 0:
+                        s["wins_black"] += 1
+                    else:
+                        s["wins_white"] += 1
+                elif reason == "truncation":
+                    s["truncated"] += 1
+                else:
+                    s["rule_draws"] += 1
+                    s["draws"] += 1
 
-        tqdm.write(f"Game {g+1:>3}/{cli.games}: {plies:>3} plies, "
-                   f"final_value={final_value:+d}  ({dt:5.1f}s)")
-        completed = g + 1
-        pbar.set_postfix(
-            w=stats["wins_white"] + stats["wins_black"],
-            d=stats["draws"],
-            t=stats["truncated"],
-            avg_plies=f"{stats['total_plies'] / completed:.0f}",
-        )
+            pgn_headers = {
+                "Event":   "Self-play",
+                "Site":    "local",
+                "Date":    datetime.datetime.now().strftime("%Y.%m.%d"),
+                "Round":   str(g + 1),
+                "White":   "AZBot",
+                "Black":   "AZBot",
+                "Result":  ("1-0" if (final_value == -1 and plies % 2 == 1)
+                            else "0-1" if (final_value == -1 and plies % 2 == 0)
+                            else "1/2-1/2"),
+                "Plies":   str(plies),
+                "Reason":  reason,
+                "Sims":    f"{cli.high_sims}/{cli.low_sims}@p={cli.high_prob}",
+                "Ckpt":    Path(cli.checkpoint).name,
+            }
+            pending_pgns.append(build_pgn(real_moves, pgn_headers))
 
-    print(f"\nTotal: {time.time() - t_total:.1f}s for {cli.games} games "
-          f"({stats['total_plies']} positions, "
-          f"avg {stats['total_plies'] / cli.games:.1f} plies/game)")
-    print(f"  wins(parity-1) {stats['wins_white']}, "
-          f"wins(parity-0) {stats['wins_black']}, "
-          f"draws {stats['draws']}, truncated {stats['truncated']}")
+            pbar.set_postfix(
+                plies=plies, reason=reason,
+                cm=total_stats["checkmated"], rs=total_stats["resigned"],
+                d=total_stats["draws"], t=total_stats["truncated"],
+                frag=pending_stats["games_completed"],
+                tdt=f"{time.time()-t_session:.0f}s",
+            )
+            tqdm.write(f"  game {g+1:>3}/{cli.games}: {plies:>3} plies, "
+                       f"{reason:<10} z_next={final_value:+d}  ({dt:5.1f}s)")
 
-    out_dir = os.path.dirname(cli.output)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+            # Periodic flush -- so Ctrl-C only loses at most --flush-every games.
+            if cli.flush_every > 0 and pending_stats["games_completed"] >= cli.flush_every:
+                flush()
+    except KeyboardInterrupt:
+        tqdm.write("\n  Ctrl-C: flushing pending games before exit...")
 
-    boards_t = torch.from_numpy(np.stack(all_boards)).to(torch.float32)
-    pis_t = torch.from_numpy(np.stack(all_pis)).to(torch.float32)
-    values_t = torch.tensor(all_values, dtype=torch.float32).reshape(-1, 1)
+    # Final flush for anything still pending (also handles the case where
+    # cli.flush_every == 0 -- everything sits in pending until now).
+    flush()
 
-    payload = {
-        "boards": boards_t,
-        "pis": pis_t,
-        "values": values_t,
-        "meta": {
-            "checkpoint": cli.checkpoint,
-            "games": cli.games,
-            "sims": cli.sims,
-            "temperature_moves": cli.temperature_moves,
-            "temperature": cli.temperature,
-            "dirichlet_eps": cli.dirichlet_eps,
-            "truncation": cli.truncation,
-            **stats,
-        },
-    }
-    torch.save(payload, cli.output)
-    print(f"Saved {len(all_boards)} positions to {cli.output} "
-          f"({os.path.getsize(cli.output) / 1e6:.1f} MB)")
-
-    # Tiny side-car so downstream tools (e.g. runner.py / wandb logging) don't
-    # have to load the full .pt just for stats.
-    summary_path = os.path.splitext(cli.output)[0] + "_summary.json"
-    summary = {
-        "checkpoint": cli.checkpoint,
-        "games": cli.games,
-        "sims": cli.sims,
-        "temperature_moves": cli.temperature_moves,
-        "temperature": cli.temperature,
-        "dirichlet_eps": cli.dirichlet_eps,
-        "truncation": cli.truncation,
-        "positions": len(all_boards),
-        "avg_plies": stats["total_plies"] / cli.games if cli.games else 0,
-        **stats,
-    }
-    with open(summary_path, "w") as fh:
-        json.dump(summary, fh, indent=2)
+    total_dt = time.time() - t_session
+    n_games = total_stats["games_completed"]
+    print(f"\nSession done: {n_games} games in {total_dt:.1f}s "
+          f"across {len(fragments_written)} fragment(s) "
+          f"({total_stats['positions_total']} positions, "
+          f"avg {total_stats['positions_total']/max(n_games,1):.0f} plies/game)")
+    print(f"  win/draw split: W{total_stats['wins_white']} B{total_stats['wins_black']} "
+          f"D{total_stats['draws']} T{total_stats['truncated']}")
+    print(f"  termination: checkmate={total_stats['checkmated']} resign={total_stats['resigned']} "
+          f"rule_draw={total_stats['rule_draws']} truncation={total_stats['truncated']}")
+    print(f"  PCR: hi={total_stats['high_sim_positions']} lo={total_stats['low_sim_positions']} "
+          f"({total_stats['high_sim_positions']/max(total_stats['positions_total'],1):.0%} hi)")
+    for ptp in fragments_written:
+        print(f"  {ptp}")
 
 
 if __name__ == "__main__":

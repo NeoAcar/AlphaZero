@@ -5,7 +5,42 @@ import numpy as np
 import torch
 
 
-def board_to_matrix(board: chess.Board, move_counter: int) -> np.ndarray:
+def board_to_matrix(board: chess.Board, move_counter: int,
+                    history: list | None = None,
+                    rep_count: int = 1) -> np.ndarray:
+    """Input planes.
+
+    `history`:
+      - None → legacy 19-plane representation (current board only).
+      - list of chess.Board → 119-plane AlphaZero representation. The list
+        should be chronological (oldest first), holding the prior canonical
+        boards (NOT including the current `board`). Up to 7 entries are
+        consumed; earlier ones are ignored. Missing slots are zero-padded.
+
+    `rep_count`: how many times the CURRENT position has appeared in the
+    real-game history so far (including this occurrence). Used to fill the
+    frame-0 repetition planes per AZ S1: plane 12 lit if rep_count >= 2
+    (seen at least once before), plane 13 lit if rep_count >= 3 (3-fold
+    draw imminent). For historical frames we leave the rep planes zero --
+    tracking per-frame historical rep counts would require a parallel
+    history of rep_counts which we don't maintain. Frame-0 carries ~80% of
+    the signal anyway.
+
+    The 119-plane layout matches AlphaZero (Silver et al. 2018 chess Table S1):
+      - 8 time-step frames × 14 planes (12 pieces + 2 repetition flags).
+      - Frame 0 is the current board. Frame -1 is the previous ply, etc.
+      - Historical frames are rotated to the CURRENT player's perspective.
+        Since each `mirror_state` ply alternates canonical frame, odd-offset
+        historical frames need a vertical flip + P1/P2 swap to align.
+      - 7 constant planes follow: real side-to-move, move counter, 4 castling
+        flags, no-progress counter.
+    """
+    if history is None:
+        return _board_to_matrix_19(board, move_counter)
+    return _board_to_matrix_119(board, move_counter, history, rep_count=rep_count)
+
+
+def _board_to_matrix_19(board: chess.Board, move_counter: int) -> np.ndarray:
     matrix = np.zeros((19, 8, 8), dtype=np.float32)
     for color in [True, False]:
         piece_offset = 0 if color else 6
@@ -18,10 +53,6 @@ def board_to_matrix(board: chess.Board, move_counter: int) -> np.ndarray:
     # "Colour" plane (AZ S1): real side-to-move (player-to-move's actual color
     # in the un-mirrored game), NOT the canonical board.turn (always True here).
     matrix[12, :, :] = 1.0 if (move_counter % 2 == 0) else 0.0
-    # Move-counter normalisations: keep values in [0, 1] before save_shard's
-    # clamp+uint8 quantisation. halfmove_clock can reach 99 before the 50-move
-    # rule forces a draw; total move counter is capped at ~300 plies which
-    # matches our self-play truncation and covers the bulk of real games.
     matrix[13, :, :] = move_counter / 300
     matrix[14, :, :] = board.has_kingside_castling_rights(True)
     matrix[15, :, :] = board.has_queenside_castling_rights(True)
@@ -29,6 +60,68 @@ def board_to_matrix(board: chess.Board, move_counter: int) -> np.ndarray:
     matrix[17, :, :] = board.has_queenside_castling_rights(False)
     matrix[18, :, :] = board.halfmove_clock / 100
     return matrix
+
+
+def _write_pieces_into(board: chess.Board, dest_frame: np.ndarray) -> None:
+    """Fill 12 piece planes (own [0:6] + opp [6:12]) for a canonical board.
+    In the canonical frame, the player-to-move's pieces are board.WHITE."""
+    for piece_type in range(1, 7):
+        for sq in board.pieces(piece_type, True):   # own (canonical WHITE)
+            r, c = divmod(sq, 8)
+            dest_frame[piece_type - 1, r, c] = 1.0
+        for sq in board.pieces(piece_type, False):  # opp (canonical BLACK)
+            r, c = divmod(sq, 8)
+            dest_frame[6 + piece_type - 1, r, c] = 1.0
+
+
+def _flip_frame_to_current_view(frame: np.ndarray) -> np.ndarray:
+    """A canonical frame that is in the OPPOSITE perspective from the current
+    player (i.e., an odd-offset historical frame). Bring it to the current
+    player's view: vertical rank flip + swap own/opp piece planes. Repetition
+    planes flip ranks too (rep is a per-position fact, no color swap needed)."""
+    out = np.empty_like(frame)
+    out[0:6, :, :] = np.flip(frame[6:12, :, :], axis=1)
+    out[6:12, :, :] = np.flip(frame[0:6, :, :], axis=1)
+    out[12:14, :, :] = np.flip(frame[12:14, :, :], axis=1)
+    return out
+
+
+def _board_to_matrix_119(board: chess.Board, move_counter: int,
+                         history: list, rep_count: int = 1) -> np.ndarray:
+    planes = np.zeros((119, 8, 8), dtype=np.float32)
+
+    # Frame 0: current board (already in current-player canonical view).
+    _write_pieces_into(board, planes[0:14, :, :])
+    # Frame-0 repetition flags. AZ Table S1: plane 12 = position has been
+    # seen at least once before (rep_count >= 2); plane 13 = at least twice
+    # before (rep_count >= 3, draw imminent). Historical frames stay zero.
+    if rep_count >= 2:
+        planes[12, :, :] = 1.0
+    if rep_count >= 3:
+        planes[13, :, :] = 1.0
+
+    # Frames -1 through -7: historical boards (chronological list, oldest first).
+    # Iterate most-recent past first so offset_idx=0 → 1 ply ago, etc.
+    recent = history[-7:]                 # at most 7 prior boards
+    for offset_idx, hist_board in enumerate(reversed(recent)):
+        offset = offset_idx + 1            # 1..7
+        start = offset * 14                # planes [14:28] for offset=1, ...
+        frame = np.zeros((14, 8, 8), dtype=np.float32)
+        _write_pieces_into(hist_board, frame)
+        if offset % 2 == 1:
+            # Odd offsets are in opposite canonical frame from current.
+            frame = _flip_frame_to_current_view(frame)
+        planes[start:start + 14, :, :] = frame
+
+    # 7 constant planes [112:119].
+    planes[112, :, :] = 1.0 if (move_counter % 2 == 0) else 0.0  # real color
+    planes[113, :, :] = min(move_counter / 500.0, 1.0)            # total moves
+    planes[114, :, :] = float(board.has_kingside_castling_rights(True))
+    planes[115, :, :] = float(board.has_queenside_castling_rights(True))
+    planes[116, :, :] = float(board.has_kingside_castling_rights(False))
+    planes[117, :, :] = float(board.has_queenside_castling_rights(False))
+    planes[118, :, :] = board.halfmove_clock / 100.0
+    return planes
 
 
 def move_to_alphazero(move: str) -> int:
@@ -149,11 +242,14 @@ def legal_mask(board: chess.Board) -> np.ndarray:
     return mask
 
 
-def prepare_input(board: chess.Board, move_counter: int) -> torch.Tensor:
-    matrix = board_to_matrix(board, move_counter)
-    X_tensor = torch.tensor(matrix, dtype=torch.float32)
-    # shape = (19, 8, 8)
-    return X_tensor
+def prepare_input(board: chess.Board, move_counter: int,
+                  history: list | None = None,
+                  rep_count: int = 1) -> torch.Tensor:
+    """Float-tensor wrapper around board_to_matrix. Pass `history` for 119
+    planes (omit for legacy 19); `rep_count` populates the current-frame
+    repetition flags when running 119-plane."""
+    matrix = board_to_matrix(board, move_counter, history=history, rep_count=rep_count)
+    return torch.tensor(matrix, dtype=torch.float32)
 
 
 def mirror_move(move: str) -> str:

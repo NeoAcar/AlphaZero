@@ -59,9 +59,14 @@ class BatchedMCTS:
         self._visited_depths: set[int] = set()
         # Repetition tracking -- see mcts.MCTS for details.
         self._ext_rep: dict = {}
+        # Board history for the 119-plane representation; see mcts.MCTS.
+        self._ext_history: list = []
 
     def set_rep_counter(self, counter) -> None:
         self._ext_rep = dict(counter) if counter else {}
+
+    def set_history(self, history) -> None:
+        self._ext_history = list(history) if history else []
 
     def _compute_rep_count(self, node: Node) -> int:
         tk = node.tk
@@ -315,8 +320,13 @@ class BatchedMCTS:
         # Single GPU→CPU sync: concat values + policies into one (B, 4673)
         # tensor and pull across PCIe once. Same idea as mcts.py:expand_lazy.
         if unique_eval:
+            use_history = self.args.get("input_planes") == 119
             inputs: torch.Tensor = torch.stack([
-                f.prepare_input(leaf.state, leaf.move_counter)
+                f.prepare_input(
+                    leaf.state, leaf.move_counter,
+                    history=(leaf.history if use_history else None),
+                    rep_count=max(leaf.rep_count, 1),
+                )
                 for _, leaf in unique_eval
             ]).to(self.args["device"])
             with torch.inference_mode():
@@ -333,21 +343,41 @@ class BatchedMCTS:
             masked_logits: torch.Tensor = policy_t.masked_fill(~masks_t, float("-inf"))
             policies_t: torch.Tensor = torch.softmax(masked_logits, dim=1)  # (B, 4672)
 
-            # ONE sync replaces two separate .cpu() calls.
-            combined: np.ndarray = torch.cat(
-                [values_t, policies_t], dim=1
-            ).cpu().numpy()
-            values: np.ndarray = combined[:, 0]
-            policies: np.ndarray = combined[:, 1:]
+            # WDL probs ride along in the same single GPU→CPU sync so we can
+            # cache them on the leaf for variance-band rendering. For non-WDL
+            # heads (single scalar) we skip this slot and `wdl_probs` is None.
+            is_wdl: bool = value_t.shape[-1] == 3
+            if is_wdl:
+                wdl_t: torch.Tensor = torch.softmax(value_t, dim=-1)  # (B, 3)
+                combined: np.ndarray = torch.cat(
+                    [values_t, wdl_t, policies_t], dim=1
+                ).cpu().numpy()
+                values: np.ndarray = combined[:, 0]
+                wdl_probs: np.ndarray | None = combined[:, 1:4]
+                policies: np.ndarray = combined[:, 4:]
+            else:
+                combined = torch.cat(
+                    [values_t, policies_t], dim=1
+                ).cpu().numpy()
+                values = combined[:, 0]
+                wdl_probs = None
+                policies = combined[:, 1:]
 
-            for (sim_idx, leaf), val, pol, mask_row in zip(
-                unique_eval, values, policies, masks_np
-            ):
+            for i, (sim_idx, leaf) in enumerate(unique_eval):
+                val = values[i]
+                pol = policies[i]
+                mask_row = masks_np[i]
                 if leaf.raw_policy is None:
                     leaf.raw_policy = pol
                     leaf.policy = pol.copy()
                     leaf.n_legal = int(mask_row.sum())
                     leaf.raw_nn_value = float(val)
+                    if wdl_probs is not None:
+                        leaf.raw_nn_wdl = (
+                            float(wdl_probs[i, 0]),
+                            float(wdl_probs[i, 1]),
+                            float(wdl_probs[i, 2]),
+                        )
                 path, _, _, _ = in_flight[sim_idx]
                 in_flight[sim_idx] = (path, leaf, "evaluated", float(val))
 
@@ -396,7 +426,10 @@ class BatchedMCTS:
             self.update_root(state, move_counter)
 
         if self.root is None:
-            self.root = Node(self.args, state, move_counter)
+            self.root = Node(
+                self.args, state, move_counter,
+                history=self._ext_history,
+            )
             self.root.rep_count = self._compute_rep_count(self.root)
             self.root.expand_lazy(self.model)
             min_depth = 0

@@ -18,7 +18,13 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
 
 from alphazero.dataset import ChessDataset, SelfPlayDataset
-from alphazero.nn import SEResNet, SEResNetWDL
+from alphazero.nn import (
+    INPUT_PLANES_HISTORY,
+    INPUT_PLANES_LEGACY,
+    SEResNet,
+    SEResNetWDL,
+    detect_in_channels,
+)
 
 
 def parse_args() -> dict:
@@ -57,6 +63,13 @@ def parse_args() -> dict:
                    help="RNG seed for train/val game split")
     p.add_argument("--self-play-data", action="append", default=None,
                    help="path to a self-play .pt produced by selfplay.py; can be passed multiple times")
+    p.add_argument("--selfplay-dir",
+                   help="root directory of fragmented self-play sessions "
+                        "(produced by the new selfplay.py); recursively loads all "
+                        "<dir>/<ckpt_name>/games_*.pt files. Ordering by mtime.")
+    p.add_argument("--selfplay-last-gens", type=int, default=-1,
+                   help="when using --selfplay-dir, keep only the most-recent N "
+                        "checkpoint subdirs (= 'generations'). -1 = use all.")
     p.add_argument("--data-mix", choices=["supervised", "self_play", "both"],
                    help="which data sources to use (default: supervised if no self-play-data, "
                         "both if any --self-play-data is given)")
@@ -83,6 +96,8 @@ def parse_args() -> dict:
     cfg.setdefault("vals_per_epoch", 1)
     cfg.setdefault("optimizer", "sgd")
     cfg.setdefault("momentum", 0.9)
+    cfg.setdefault("selfplay_dir", None)
+    cfg.setdefault("selfplay_last_gens", -1)
 
     # CLI overrides (only when explicitly given).
     overrides = {
@@ -108,6 +123,8 @@ def parse_args() -> dict:
         "vals_per_epoch": cli.vals_per_epoch,
         "optimizer": cli.optimizer,
         "momentum": cli.momentum,
+        "selfplay_dir": cli.selfplay_dir,
+        "selfplay_last_gens": cli.selfplay_last_gens,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -131,6 +148,8 @@ class Train:
         self.val_fraction = args["val_fraction"]
         self.split_seed = args["split_seed"]
         self.self_play_paths = args["self_play_data"] or []
+        self.selfplay_dir = args.get("selfplay_dir")
+        self.selfplay_last_gens = int(args.get("selfplay_last_gens", -1) or -1)
         self.wandb_project = args.get("wandb_project")
         self.wandb_group = args.get("wandb_group")
         self.wandb_name = args.get("wandb_name")
@@ -140,15 +159,26 @@ class Train:
         if self.value_head not in ("scalar", "wdl"):
             raise ValueError(f"value_head must be 'scalar' or 'wdl', got {self.value_head!r}")
         self.vals_per_epoch = int(args.get("vals_per_epoch", 1) or 1)
-        # Resolve data_mix default
+        # Resolve data_mix default. self_play_paths and selfplay_dir both flag
+        # self-play sources for the default routing.
         mix = args.get("data_mix")
         if mix is None:
-            mix = "both" if self.self_play_paths else "supervised"
+            mix = "both" if (self.self_play_paths or self.selfplay_dir) else "supervised"
         self.data_mix = mix
 
+        # Detect in_channels for the model. Priority:
+        #   1. --resume checkpoint's first-conv shape.
+        #   2. First self-play .pt in --selfplay-dir (board tensor channel dim).
+        #   3. Legacy supervised path -> 19.
+        #   4. Otherwise default 119 (new tabula-rasa).
+        in_channels = self._detect_in_channels(args)
+        print(f"Input planes: {in_channels}")
+
         model_cls = SEResNetWDL if self.value_head == "wdl" else SEResNet
-        self.model = model_cls().to(self.device)
-        print(f"Model: {model_cls.__name__} (value_head={self.value_head})")
+        self.model = model_cls(in_channels=in_channels).to(self.device)
+        self.in_channels = in_channels
+        print(f"Model: {model_cls.__name__} (value_head={self.value_head}, "
+              f"in_channels={in_channels})")
 
         opt_name = str(args.get("optimizer", "sgd")).lower()
         if opt_name == "sgd":
@@ -186,6 +216,42 @@ class Train:
                     print(f"  optimizer state incompatible ({e}); starting "
                           f"optimizer state from scratch")
 
+    @staticmethod
+    def _detect_in_channels(args: dict) -> int:
+        """Decide how many input planes the model needs. Order of precedence:
+        resume checkpoint → first self-play .pt under --selfplay-dir → first
+        supervised shard → legacy 19 (default for supervised-only) /
+        history 119 (default otherwise)."""
+        # 1) --resume
+        resume = args.get("resume")
+        if resume:
+            try:
+                ckpt = torch.load(resume, map_location="cpu", weights_only=False)
+                return detect_in_channels(ckpt)
+            except Exception as e:
+                print(f"  could not detect in_channels from resume ckpt: {e}")
+        # 2) --selfplay-dir's first .pt
+        sd = args.get("selfplay_dir")
+        if sd:
+            from pathlib import Path as _P
+            for ptf in sorted(_P(sd).rglob("games_*.pt")):
+                try:
+                    d = torch.load(ptf, map_location="cpu", weights_only=False)
+                    return int(d["boards"].shape[1])
+                except Exception:
+                    continue
+        # 3) self-play .pt list
+        for path in (args.get("self_play_data") or []):
+            try:
+                d = torch.load(path, map_location="cpu", weights_only=False)
+                return int(d["boards"].shape[1])
+            except Exception:
+                continue
+        # 4) supervised shards-dir presence → legacy 19; else default to history.
+        if args.get("shards_dir"):
+            return INPUT_PLANES_LEGACY
+        return INPUT_PLANES_HISTORY
+
     def data_preparation(self):
         """Build train and val datasets according to self.data_mix.
 
@@ -197,21 +263,35 @@ class Train:
         train_datasets = []
         val_dataset = None
 
-        if self.data_mix in ("supervised", "both"):
-            if not self.shards_dir:
-                raise RuntimeError(
-                    "Supervised data requires --shards-dir pointing at gen_sf_data.py output."
-                )
+        if self.data_mix in ("supervised", "both") and self.shards_dir:
             sup_train, sup_val = self._load_sharded_split()
             train_datasets.append(sup_train)
             val_dataset = sup_val
+        elif self.data_mix == "supervised":
+            raise RuntimeError(
+                "Supervised data_mix requires --shards-dir pointing at gen_sf_data.py output."
+            )
 
         if self.data_mix in ("self_play", "both"):
+            # Legacy single-file paths (--self-play-data).
             for path in self.self_play_paths:
                 print(f"Loading self-play data: {path}")
                 sp = torch.load(path, map_location="cpu", weights_only=False)
-                ds = SelfPlayDataset(sp["boards"], sp["values"], sp["pis"])
+                if "pi_indices" in sp:
+                    ds = SelfPlayDataset(
+                        sp["boards"], sp["values"],
+                        pi_indices=sp["pi_indices"],
+                        pi_values=sp["pi_values"],
+                        is_high_sim=sp.get("is_high_sim"),
+                    )
+                else:
+                    ds = SelfPlayDataset(sp["boards"], sp["values"], pis=sp["pis"])
                 print(f"  {len(ds)} positions  (meta: {sp.get('meta', {})})")
+                train_datasets.append(ds)
+
+            # New fragmented layout (--selfplay-dir).
+            if self.selfplay_dir:
+                ds = self._load_selfplay_dir()
                 train_datasets.append(ds)
 
         if not train_datasets:
@@ -221,6 +301,90 @@ class Train:
         print(f"Combined training set: {len(train_dataset)} positions "
               f"from {len(train_datasets)} source(s).")
         return {"train": train_dataset, "val": val_dataset}
+
+    def _load_selfplay_dir(self) -> SelfPlayDataset:
+        """Recursively load games_*.pt under self.selfplay_dir. Each immediate
+        subdirectory is treated as one generation (named after the checkpoint
+        that produced its games). If selfplay_last_gens > 0, only the most
+        recently-modified N subdirs are loaded -- this is the AGZ-style
+        sliding-window mechanism."""
+        from pathlib import Path
+        root = Path(self.selfplay_dir)
+        if not root.exists():
+            raise RuntimeError(f"--selfplay-dir not found: {root}")
+
+        # Two supported layouts:
+        #   (a) root/<gen>/games_*.pt           ← multi-generation (selfplay/)
+        #   (b) root/games_*.pt                 ← single generation (selfplay/v00_seed/)
+        direct_games = list(root.glob("games_*.pt"))
+        if direct_games:
+            gen_dirs = [root]
+        else:
+            gen_dirs = sorted(
+                [d for d in root.iterdir() if d.is_dir()],
+                key=lambda d: d.stat().st_mtime,
+            )
+            if not gen_dirs:
+                raise RuntimeError(
+                    f"No games_*.pt files in {root}, and no generation subdirs either."
+                )
+        if self.selfplay_last_gens > 0:
+            gen_dirs = gen_dirs[-self.selfplay_last_gens:]
+        print(f"Self-play dir: {root}")
+        print(f"  using {len(gen_dirs)} generation(s):")
+        for gd in gen_dirs:
+            print(f"    {gd.name}")
+
+        pt_paths = []
+        for gd in gen_dirs:
+            pt_paths.extend(sorted(gd.glob("games_*.pt")))
+        if not pt_paths:
+            raise RuntimeError(f"No games_*.pt files under selected gen dirs")
+
+        all_boards, all_pi_idx, all_pi_val, all_values, all_hi = [], [], [], [], []
+        total_positions = 0
+        for ptf in pt_paths:
+            d = torch.load(ptf, map_location="cpu", weights_only=False)
+            n = len(d["boards"])
+            total_positions += n
+            all_boards.append(d["boards"])
+            if "pi_indices" in d:
+                all_pi_idx.append(d["pi_indices"])
+                all_pi_val.append(d["pi_values"])
+            else:
+                # Legacy dense pi -- convert to sparse on the fly.
+                pis = d["pis"]                                  # (N, 4672)
+                top_k = pis.topk(64, dim=1)
+                idx16 = top_k.indices.to(torch.int16)
+                vals = top_k.values
+                # Zero-out values where the topk fell on a 0-prob action.
+                vals = torch.where(vals > 0, vals, torch.zeros_like(vals))
+                # Renormalize.
+                sums = vals.sum(dim=1, keepdim=True).clamp_min(1e-9)
+                vals = (vals / sums).to(torch.float16)
+                # Pad sentinel -1 wherever value is 0 so the dataset's mask
+                # excludes those entries.
+                idx16 = torch.where(vals > 0, idx16, torch.full_like(idx16, -1))
+                all_pi_idx.append(idx16)
+                all_pi_val.append(vals)
+            all_values.append(d["values"])
+            all_hi.append(
+                d["is_high_sim"] if "is_high_sim" in d
+                else torch.ones(n, dtype=torch.uint8)
+            )
+        boards = torch.cat(all_boards, dim=0);  del all_boards
+        pi_idx = torch.cat(all_pi_idx, dim=0);  del all_pi_idx
+        pi_val = torch.cat(all_pi_val, dim=0);  del all_pi_val
+        values = torch.cat(all_values, dim=0);  del all_values
+        is_hi  = torch.cat(all_hi,     dim=0);  del all_hi
+
+        n_hi = int(is_hi.sum().item())
+        print(f"  {total_positions} positions loaded "
+              f"(high-sim {n_hi}, low-sim {total_positions - n_hi})")
+        return SelfPlayDataset(
+            boards, values,
+            pi_indices=pi_idx, pi_values=pi_val, is_high_sim=is_hi,
+        )
 
     def _load_sharded_split(self) -> tuple[ChessDataset, ChessDataset]:
         """Load shard_NNNN.pt files from --shards-dir, concatenate, split by game.
@@ -334,13 +498,35 @@ class Train:
         return train_ds, val_ds
 
     @staticmethod
-    def _soft_ce(logits: torch.Tensor, soft_target: torch.Tensor) -> torch.Tensor:
-        return -(soft_target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+    def _soft_ce(logits: torch.Tensor, soft_target: torch.Tensor,
+                 weights: torch.Tensor | None = None) -> torch.Tensor:
+        """Soft cross-entropy. If `weights` is given, each position's loss
+        contributes weights[i] (0..1). Used for PCR-aware policy training:
+        only high-sim self-play positions count toward policy gradients
+        (low-sim positions have weights=0). All-1 weights reproduce the
+        unweighted mean."""
+        per_pos = -(soft_target * F.log_softmax(logits, dim=1)).sum(dim=1)  # (B,)
+        if weights is None:
+            return per_pos.mean()
+        denom = weights.sum().clamp_min(1e-6)
+        return (weights * per_pos).sum() / denom
 
     def _value_loss(self, outputs: torch.Tensor, targets: torch.Tensor,
                     criterion_mse: nn.MSELoss) -> torch.Tensor:
-        """MSE on tanh-scalar (B,1) targets, soft-CE on WDL (B,3) probability targets."""
+        """MSE on tanh-scalar (B,1) targets, soft-CE on WDL (B,3) probability targets.
+
+        Self-play stores scalar game outcomes z in {-1, 0, +1} (shape B×1); when
+        training the WDL head against those, we convert to one-hot (W, D, L) first.
+        Otherwise -(z) * log_softmax flips sign for z<0 and the loss goes negative.
+        """
         if self.value_head == "wdl":
+            if targets.dim() == 2 and targets.size(1) == 1:
+                z = targets.squeeze(1)
+                wdl = torch.zeros(z.size(0), 3, device=z.device, dtype=outputs.dtype)
+                wdl[:, 0] = (z > 0.5).to(outputs.dtype)              # W
+                wdl[:, 1] = ((z > -0.5) & (z < 0.5)).to(outputs.dtype)  # D
+                wdl[:, 2] = (z < -0.5).to(outputs.dtype)             # L
+                targets = wdl
             return self._soft_ce(outputs, targets)
         return criterion_mse(outputs, targets)
 
@@ -352,13 +538,14 @@ class Train:
         running_ce_loss = 0.0
         correct = 0
         total = 1
-        for data, labels_value, labels_ce in val_loader:
+        for data, labels_value, labels_ce, is_high in val_loader:
             data = data.to(self.device)
             labels_value = labels_value.to(self.device)
             labels_ce = labels_ce.to(self.device)
+            is_high = is_high.to(self.device)
             outputs_value, outputs_ce = self.model(data)
             loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
-            loss_ce = self._soft_ce(outputs_ce, labels_ce)
+            loss_ce = self._soft_ce(outputs_ce, labels_ce, weights=is_high)
             running_loss += (loss_value + loss_ce).item()
             running_mse_loss += loss_value.item()
             running_ce_loss += loss_ce.item()
@@ -476,17 +663,18 @@ class Train:
                 max(1, (i + 1) * n_batches // vpe) - 1 for i in range(vpe)
             )
 
-            for batch_idx, (data, labels_value, labels_ce) in enumerate(
+            for batch_idx, (data, labels_value, labels_ce, is_high) in enumerate(
                 tqdm(train_loader, desc=f"Epoch {epoch + 1}/{self.epochs}")
             ):
                 data = data.to(self.device)
                 labels_value = labels_value.to(self.device)
                 labels_ce = labels_ce.to(self.device)
+                is_high = is_high.to(self.device)
                 self.optimizer.zero_grad()
 
                 outputs_value, outputs_ce = self.model(data)
                 loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
-                loss_ce = self._soft_ce(outputs_ce, labels_ce)
+                loss_ce = self._soft_ce(outputs_ce, labels_ce, weights=is_high)
                 loss = loss_value + loss_ce
                 loss.backward()
                 self.optimizer.step()

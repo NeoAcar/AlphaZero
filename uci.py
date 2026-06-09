@@ -42,7 +42,7 @@ import torch
 from alphazero import utils as f
 #from alphazero.mcts import MCTS
 from alphazero.batched_mcts import BatchedMCTS as MCTS
-from alphazero.nn import ResNet, SEResNet, SEResNetWDL, value_to_scalar
+from alphazero.nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
 
 
 ARCHITECTURES = {
@@ -68,14 +68,23 @@ def log(msg: str) -> None:
 
 
 def send(msg: str) -> None:
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
+    """Emit a UCI protocol reply (readyok / bestmove / uciok / info ...).
+
+    Writes to the *original* process stdout (`sys.__stdout__`), NOT `sys.stdout`.
+    The background ponder thread holds a `contextlib.redirect_stdout(sys.stderr)`
+    for the whole inter-move period, and that redirect mutates the process-global
+    `sys.stdout`. If protocol replies went through `sys.stdout` they'd be diverted
+    to stderr while pondering -- the engine would log `readyok` to the logfile
+    instead of answering the host, the server's drain barrier would time out, and
+    every subsequent session would be corrupted (bot stops moving). Going straight
+    to `sys.__stdout__` makes protocol output immune to any in-effect redirect."""
+    sys.__stdout__.write(msg + "\n")
+    sys.__stdout__.flush()
 
 
 def send_raw(msg: str) -> None:
-    """Write to the *original* process stdout, bypassing any redirect_stdout
-    in effect. Live info callbacks need this because `_go_mcts` redirects
-    sys.stdout -> sys.stderr while MCTS runs to swallow stray prints."""
+    """Alias for send(): protocol output to the true stdout. Kept as a separate
+    name for the live info_callback call sites that documented the intent."""
     sys.__stdout__.write(msg + "\n")
     sys.__stdout__.flush()
 
@@ -107,15 +116,15 @@ def post_event(payload: dict) -> None:
 class UciEngine:
     DEFAULT_OPTS = {
         "Type": "mcts",              # one of: mcts | policy_only | value_only
-        "Checkpoint": "models/model_best_combined_5.pth",
-        "Architecture": "seresnet",
+        "Checkpoint": "models/model_best_combined_wdl.pth",
+        "Architecture": "seresnetwdl",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
-        "Sims":1200,
+        "Sims": 1200,
         "Temperature": 0.6,
         "TempMoves": 6,
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
-        "CInit": 1.25,
+        "CInit": 1.33,
         "CFPU": 0.2,
         # Engine-driven background pondering. NOT the same as the standard UCI
         # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
@@ -160,6 +169,10 @@ class UciEngine:
         # via the board alone -- we maintain this counter and inject it into
         # MCTS before each search. Keyed on mirror_state's transposition_key.
         self._rep_counter: dict = {}
+        # Canonical board history (chronological, oldest first), used to build
+        # the 119-plane input. Empty for 19-plane checkpoints. Kept across
+        # _push_move calls; cleared in _reset_position. Length capped at 7.
+        self._mirror_history: list = []
         self._rng = np.random.default_rng()
         self._quitting = False
         # Dashboard telemetry state.
@@ -174,6 +187,12 @@ class UciEngine:
         # inheriting the pondered subtree for the upcoming search.
         self._ponder_stop = threading.Event()
         self._ponder_thread: threading.Thread | None = None
+        # Serializes every GPU/model invocation. The foreground search and the
+        # background ponder loop both run MCTS on the same torch.compile'd model;
+        # invoking it from two threads at once corrupts CUDA state (intermittent
+        # crash / OOM that bricks the engine for the rest of the session). Both
+        # paths must hold this lock around their search() call.
+        self._model_lock = threading.Lock()
 
     # ---------- model / mcts plumbing ----------
 
@@ -186,10 +205,16 @@ class UciEngine:
         if arch not in ARCHITECTURES:
             raise ValueError(f"Architecture must be one of {list(ARCHITECTURES)}, got {arch!r}")
         log(f"Loading checkpoint {ckpt} (architecture: {arch})")
-        model = ARCHITECTURES[arch]().to(self.device)
+        # Detect input-plane count from the checkpoint's first-conv weight so
+        # legacy 19-plane checkpoints (e.g. the SFT WDL run) still load. New
+        # tabula-rasa checkpoints will be 119.
         state = torch.load(ckpt, map_location=self.device, weights_only=False)
+        in_ch = detect_in_channels(state)
+        log(f"  input_planes = {in_ch}")
+        model = ARCHITECTURES[arch](in_channels=in_ch).to(self.device)
         model.load_state_dict(state["model_state_dict"])
         model.eval()
+        self.loaded_in_channels = in_ch
         try:
             # NOTE: default mode, NOT mode="reduce-overhead". The latter records
             # CUDA graphs bound to the recording thread's default stream, which
@@ -198,7 +223,10 @@ class UciEngine:
             # ~1.5x kernel-fusion speedup at batch=1 but is thread-safe.
             model = torch.compile(model)
             # Real starting position, not torch.zeros -- see players.py for why.
-            real_one = f.prepare_input(chess.Board(), 0).unsqueeze(0).to(self.device)
+            real_one = f.prepare_input(
+                chess.Board(), 0,
+                history=([] if in_ch == 119 else None),
+            ).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 _ = model(real_one)
             log("torch.compile + warm-up done")
@@ -224,6 +252,9 @@ class UciEngine:
             "device": self.device,
             "value_scalar": str(self.options["ValueScalar"]),
             "batch_size": 8,
+            # 19 (legacy) or 119 (8-frame history) -- decided when the
+            # checkpoint was loaded. MCTS routes board_to_matrix accordingly.
+            "input_planes": getattr(self, "loaded_in_channels", 19),
         }
         assert self.model is not None
         first_build = self.mcts is None
@@ -267,6 +298,8 @@ class UciEngine:
         self._last_bot_chosen_uci = None
         # Start fresh: the starting position has been seen once.
         self._rep_counter = {self.mirror_state._transposition_key(): 1}
+        # Reset canonical board history (used by 119-plane input).
+        self._mirror_history = []
         if self.mcts is not None:
             self.mcts.root = None
         # Tell dashboard: fresh game / position reset.
@@ -294,6 +327,11 @@ class UciEngine:
                 action = f.move_to_alphazero(mir_uci)
             except Exception:
                 action = None
+        # Append the OLD canonical board to history BEFORE push+mirror.
+        # Keep at most 7 entries -- 119-plane uses 8 frames total (current + 7).
+        self._mirror_history.append(self.mirror_state.copy())
+        if len(self._mirror_history) > 7:
+            self._mirror_history.pop(0)
         self.mirror_state.push_uci(mir_uci)
         self.mirror_state = self.mirror_state.mirror()
         self.move_counter += 1
@@ -339,7 +377,10 @@ class UciEngine:
         send("uciok")
 
     def cmd_isready(self, _args: list[str]) -> None:
-        self._ensure_loaded()
+        # Don't load the model here -- lichess-bot's SimpleEngine.popen_uci
+        # caps the full uci/isready handshake at 60s, and torch.compile JIT
+        # on first launch easily exceeds that. cmd_go calls _ensure_loaded
+        # lazily, so the first move pays the load cost (no tight timeout there).
         send("readyok")
 
     def cmd_ucinewgame(self, _args: list[str]) -> None:
@@ -513,8 +554,15 @@ class UciEngine:
         if self.mcts is None or self.mcts.root is None:
             log("ponder: skipped (mcts root is None)")
             return
-        # If a previous ponder is somehow still alive, stop it first.
+        # If a previous ponder is somehow still alive, stop it first. If it
+        # refuses to die (drain timed out), DON'T stack a second thread on top
+        # of it -- two ponder threads both growing the same tree is exactly the
+        # accumulation that leads to OOM. The model lock keeps the straggler
+        # harmless; it will exit on its next chunk boundary.
         self._stop_pondering()
+        if self._ponder_thread is not None and self._ponder_thread.is_alive():
+            log("ponder: previous thread still draining; skip start")
+            return
         max_sims = int(self.options["PonderMaxSims"])
         if max_sims <= 0:
             log(f"ponder: skipped (PonderMaxSims={max_sims})")
@@ -542,8 +590,14 @@ class UciEngine:
         try:
             while not self._ponder_stop.is_set() and done < max_sims:
                 self.mcts.args["num_simulation"] = min(chunk, max_sims - done)
-                with contextlib.redirect_stdout(sys.stderr):
-                    self.mcts.search(self.mirror_state, self.move_counter)
+                # Serialize with the foreground search: never two threads in the
+                # model at once. Re-check the stop flag after acquiring so a
+                # stop requested while we were queued exits before another chunk.
+                with self._model_lock:
+                    if self._ponder_stop.is_set():
+                        break
+                    with contextlib.redirect_stdout(sys.stderr):
+                        self.mcts.search(self.mirror_state, self.move_counter)
                 done += chunk
                 elapsed = time.monotonic() - t0
                 root_N = self.mcts.root.N if self.mcts.root is not None else 0
@@ -575,13 +629,22 @@ class UciEngine:
             })
 
     def _stop_pondering(self) -> None:
-        """Signal the ponder thread and wait for it to exit. Idempotent."""
+        """Signal the ponder thread and wait for it to exit. Idempotent.
+
+        If the thread doesn't exit within the timeout we KEEP its reference
+        rather than nulling it -- losing the handle would let _start_pondering
+        spawn a second thread on top, and orphaned ponder threads accumulating
+        across moves/games is what drives the OOM. The model lock makes a
+        straggler harmless (it can't run the model concurrently), and it exits
+        on its next chunk boundary once it sees the stop flag."""
         if self._ponder_thread is None:
             return
         self._ponder_stop.set()
         self._ponder_thread.join(timeout=5.0)
         if self._ponder_thread.is_alive():
-            log("warning: ponder thread did not exit within 5s")
+            log("warning: ponder thread did not exit within 5s; keeping handle "
+                "so it drains instead of being orphaned")
+            return
         self._ponder_thread = None
 
     def _emit_bot_move(self, real_uci: str) -> None:
@@ -610,6 +673,9 @@ class UciEngine:
             nn_wp = self._pending_bot_eval.get("nn_win_prob")
             if nn_wp is not None:
                 evt["nn_win_prob"] = nn_wp
+            nn_std = self._pending_bot_eval.get("nn_std")
+            if nn_std is not None:
+                evt["nn_std"] = nn_std
         post_event(evt)
 
     # ---------- per-Type search backends ----------
@@ -617,7 +683,11 @@ class UciEngine:
     def _go_mcts(self) -> str:
         assert self.mcts is not None
         self.mcts.set_rep_counter(self._rep_counter)
-        with contextlib.redirect_stdout(sys.stderr):
+        self.mcts.set_history(self._mirror_history)
+        # Hold the model lock for the whole foreground search. If a previous
+        # ponder thread is still draining (e.g. its join timed out), this blocks
+        # until it releases instead of hitting the GPU model concurrently.
+        with self._model_lock, contextlib.redirect_stdout(sys.stderr):
             probs = self.mcts.search(
                 self.mirror_state,
                 self.move_counter,
@@ -654,9 +724,21 @@ class UciEngine:
         # expand_lazy / batched leaf eval; no extra forward.
         nn_v = self.mcts.root.raw_nn_value
         nn_win_prob = (nn_v + 1.0) / 2.0 if nn_v is not None else None
+        # WDL variance band on the win-prob plot. With outcomes scored
+        # +1/0/−1, Var(q) = P(W)+P(L) − q²; win_prob = (q+1)/2 is a linear
+        # transform so std(win_prob) = std(q)/2. Cheap closed-form, no
+        # additional NN call.
+        nn_std = None
+        wdl = self.mcts.root.raw_nn_wdl
+        if wdl is not None:
+            pw, _pd, pl = wdl
+            q_nn = pw - pl
+            var_q = max((pw + pl) - q_nn * q_nn, 0.0)
+            nn_std = math.sqrt(var_q) / 2.0
         self._pending_bot_eval = {
             "q": q, "win_prob": win_prob, "cp": cp, "duration": duration,
             "nn_win_prob": nn_win_prob,
+            "nn_std": nn_std,
         }
 
     # ---------- live monitoring during MCTS search ----------
@@ -818,8 +900,14 @@ class UciEngine:
     @torch.inference_mode()
     def _go_policy_only(self) -> str:
         assert self.model is not None
-        inputs = f.prepare_input(self.mirror_state, self.move_counter).unsqueeze(0).to(self.device)
-        _value, policy_logits = self.model(inputs)
+        hist = self._mirror_history if self.loaded_in_channels == 119 else None
+        rep_now = self._rep_counter.get(self.mirror_state._transposition_key(), 1)
+        inputs = f.prepare_input(
+            self.mirror_state, self.move_counter, history=hist,
+            rep_count=max(rep_now, 1),
+        ).unsqueeze(0).to(self.device)
+        with self._model_lock:
+            _value, policy_logits = self.model(inputs)
         mask = torch.from_numpy(f.legal_mask(self.mirror_state)).to(self.device)
         masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
         probs = torch.softmax(masked_logits, dim=0).cpu().numpy()
@@ -840,10 +928,20 @@ class UciEngine:
             post.push_uci(mir_uci)
             post.apply_mirror()
             post_states.append(post)
-        inputs = torch.stack(
-            [f.prepare_input(s, self.move_counter + 1) for s in post_states]
-        ).to(self.device)
-        values_t, _ = self.model(inputs)
+        # For 119-plane models, each post_state's history is (current history +
+        # current mirror_state) -- the candidate-move state is one ply ahead.
+        if self.loaded_in_channels == 119:
+            post_hist = (self._mirror_history + [self.mirror_state])[-7:]
+            inputs = torch.stack(
+                [f.prepare_input(s, self.move_counter + 1, history=post_hist)
+                 for s in post_states]
+            ).to(self.device)
+        else:
+            inputs = torch.stack(
+                [f.prepare_input(s, self.move_counter + 1) for s in post_states]
+            ).to(self.device)
+        with self._model_lock:
+            values_t, _ = self.model(inputs)
         mode = str(self.options["ValueScalar"])
         # NN values are from post-move state's player-to-move perspective = opponent. Negate.
         opp_values = value_to_scalar(values_t, mode=mode).cpu().numpy().flatten()

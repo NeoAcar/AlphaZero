@@ -21,6 +21,7 @@ missing. PID + socket live in /tmp; engine stderr goes to /tmp/alphazero_uci.log
 import argparse
 import atexit
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -137,10 +138,10 @@ def main():
             except Exception:
                 pass
             break
-        handle_client(client, engine_proc, log_fh)
+        handle_client(client, engine_proc, log_fh, sock)
 
 
-def handle_client(client_sock, engine_proc, log_fh):
+def handle_client(client_sock, engine_proc, log_fh, listen_sock=None):
     """Run one UCI session.
 
     Sync barrier: after the client half-closes its WR side (i.e., it's done
@@ -163,13 +164,28 @@ def handle_client(client_sock, engine_proc, log_fh):
     readyoks_seen = 0
 
     def forward_in():
-        """Client → engine.stdin. The client's `quit` is filtered so the
-        engine subprocess keeps running. Returns on client EOF or `quit`."""
+        """Client → engine.stdin. Returns on client EOF, `quit`, or when a
+        NEW client is detected pending on the listening socket (lichess-bot
+        often keeps its engine_client.py subprocess alive between games but
+        also spawns a fresh subprocess for the next game -- without this
+        check, the daemon would block forever on the old client's recv())."""
         nonlocal client_isready_count
         buf = b""
+        client_sock.settimeout(1.0)
         try:
             while True:
-                data = client_sock.recv(4096)
+                try:
+                    data = client_sock.recv(4096)
+                except socket.timeout:
+                    # Periodic poll: any new client waiting on the listen
+                    # socket? If so, end this session so the new one can connect.
+                    if listen_sock is not None:
+                        r, _, _ = select.select([listen_sock], [], [], 0)
+                        if r:
+                            log_fh.write("[server] new client pending, "
+                                         "ending stale session\n")
+                            return
+                    continue
                 if not data:
                     return
                 buf += data
@@ -244,7 +260,16 @@ def handle_client(client_sock, engine_proc, log_fh):
         engine_proc.stdin.flush()
     except Exception:
         pass
-    tout.join(timeout=60.0)
+    # The barrier needs to outlast the worst-case engine response, which is
+    # cmd_stop -> _stop_pondering -> ponder_thread.join(timeout=5.0): up to 5s
+    # alone, plus the actual cmd_isready that follows. 15s gives clean margin
+    # without coming near lichess-bot's 60s handshake timeout. The earlier 5s
+    # was too tight -- engine output for the old barrier leaked into the next
+    # session's handshake, breaking it.
+    tout.join(timeout=15.0)
+    if tout.is_alive():
+        log_fh.write("[server] WARN: engine did not drain in 15s, "
+                     "proceeding anyway (next session may misbehave)\n")
 
     # Engine is now quiet. Safe to close the client socket -- the client's
     # socket_to_stdout thread will see EOF and the wrapper exits cleanly.

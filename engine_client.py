@@ -5,6 +5,7 @@ rationale (model + JIT compile happen once across all games).
 This script is invoked by alphazero_uci.sh and should look indistinguishable
 from a real UCI engine to whoever spawned it.
 """
+import os
 import socket
 import sys
 import threading
@@ -63,4 +64,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # The stdin-forwarding daemon thread may be blocked in sys.stdin.readline()
+    # at this point. Python's interpreter shutdown can't grab the stdin lock
+    # while the daemon owns it -> "Fatal Python error: _enter_buffered_busy".
+    # os._exit skips Python finalisation and lets the OS reap the thread,
+    # which is the correct behaviour for a thin I/O forwarder anyway.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
