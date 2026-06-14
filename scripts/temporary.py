@@ -4,7 +4,7 @@ Plays a fresh argmax game at each sim count, times each move, plots mean ± std.
 Delete this file (and sim_scaling.png) once you've eyeballed the curve.
 
 Usage:
-    uv run python temporary.py
+    uv run python scripts/temporary.py
 """
 import time
 

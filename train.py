@@ -53,6 +53,12 @@ def parse_args() -> dict:
     p.add_argument("--vals-per-epoch", type=int, default=1,
                    help="how many validation passes to run per epoch (default: 1, "
                         "evenly spaced; the last one lands at the end of the epoch)")
+    p.add_argument("--num-workers", type=int, default=4,
+                   help="DataLoader worker processes (default 4; 0 = main thread)")
+    p.add_argument("--no-amp", dest="amp", action="store_false", default=True,
+                   help="disable fp16 mixed-precision training (AMP on by default on CUDA)")
+    p.add_argument("--no-channels-last", dest="channels_last", action="store_false",
+                   default=True, help="disable channels_last memory format (on by default on CUDA)")
     p.add_argument("--wandb-project", help="wandb project name; if unset, wandb is disabled")
     p.add_argument("--wandb-group", help="wandb group (for grouping runs from runner.py)")
     p.add_argument("--wandb-name", help="wandb run name")
@@ -159,6 +165,11 @@ class Train:
         if self.value_head not in ("scalar", "wdl"):
             raise ValueError(f"value_head must be 'scalar' or 'wdl', got {self.value_head!r}")
         self.vals_per_epoch = int(args.get("vals_per_epoch", 1) or 1)
+        # Throughput knobs (all CUDA-only; no-ops on CPU).
+        self.num_workers = int(args.get("num_workers", 4) or 0)
+        self.pin_memory = self.device.type == "cuda"
+        self.use_amp = bool(args.get("amp", True)) and self.device.type == "cuda"
+        self.channels_last = bool(args.get("channels_last", True)) and self.device.type == "cuda"
         # Resolve data_mix default. self_play_paths and selfplay_dir both flag
         # self-play sources for the default routing.
         mix = args.get("data_mix")
@@ -176,6 +187,13 @@ class Train:
 
         model_cls = SEResNetWDL if self.value_head == "wdl" else SEResNet
         self.model = model_cls(in_channels=in_channels).to(self.device)
+        if self.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+        if self.device.type == "cuda":
+            # TF32 + cuDNN autotune for the static conv shapes; large free win.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
         self.in_channels = in_channels
         print(f"Model: {model_cls.__name__} (value_head={self.value_head}, "
               f"in_channels={in_channels})")
@@ -522,13 +540,31 @@ class Train:
         if self.value_head == "wdl":
             if targets.dim() == 2 and targets.size(1) == 1:
                 z = targets.squeeze(1)
+                # Boundary-INCLUSIVE bucketing. The old strict inequalities left
+                # z == +-0.5 in no class -> an all-zero target row -> zero value
+                # gradient on those positions. Defining D as "whatever's left"
+                # guarantees each row is a valid distribution summing to 1.
                 wdl = torch.zeros(z.size(0), 3, device=z.device, dtype=outputs.dtype)
-                wdl[:, 0] = (z > 0.5).to(outputs.dtype)              # W
-                wdl[:, 1] = ((z > -0.5) & (z < 0.5)).to(outputs.dtype)  # D
-                wdl[:, 2] = (z < -0.5).to(outputs.dtype)             # L
+                wdl[:, 0] = (z >= 0.5).to(outputs.dtype)             # W
+                wdl[:, 2] = (z <= -0.5).to(outputs.dtype)           # L
+                wdl[:, 1] = 1.0 - wdl[:, 0] - wdl[:, 2]             # D
                 targets = wdl
             return self._soft_ce(outputs, targets)
         return criterion_mse(outputs, targets)
+
+    def _prep_boards(self, data: torch.Tensor) -> torch.Tensor:
+        """Move a board batch to the device and convert to float. uint8 shards
+        are rescaled by /255 on the GPU (4x smaller host->device transfer than
+        sending float32); matches gen_sf_data's boards_scale=255. channels_last
+        is applied on CUDA for faster conv kernels."""
+        data = data.to(self.device, non_blocking=True)
+        if data.dtype == torch.uint8:
+            data = data.float().div_(255.0)
+        else:
+            data = data.float()
+        if self.channels_last:
+            data = data.contiguous(memory_format=torch.channels_last)
+        return data
 
     @torch.no_grad()
     def evaluate(self, val_loader, criterion_mse):
@@ -537,15 +573,17 @@ class Train:
         running_mse_loss = 0.0
         running_ce_loss = 0.0
         correct = 0
-        total = 1
+        total = 0
         for data, labels_value, labels_ce, is_high in val_loader:
-            data = data.to(self.device)
-            labels_value = labels_value.to(self.device)
-            labels_ce = labels_ce.to(self.device)
-            is_high = is_high.to(self.device)
-            outputs_value, outputs_ce = self.model(data)
-            loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
-            loss_ce = self._soft_ce(outputs_ce, labels_ce, weights=is_high)
+            data = self._prep_boards(data)
+            labels_value = labels_value.to(self.device, non_blocking=True)
+            labels_ce = labels_ce.to(self.device, non_blocking=True)
+            is_high = is_high.to(self.device, non_blocking=True)
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16,
+                                enabled=self.use_amp):
+                outputs_value, outputs_ce = self.model(data)
+                loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
+                loss_ce = self._soft_ce(outputs_ce, labels_ce, weights=is_high)
             running_loss += (loss_value + loss_ce).item()
             running_mse_loss += loss_value.item()
             running_ce_loss += loss_ce.item()
@@ -553,12 +591,12 @@ class Train:
             target = labels_ce.argmax(dim=1)
             total += labels_ce.size(0)
             correct += (predicted == target).sum().item()
-        n = len(val_loader)
+        n = max(len(val_loader), 1)
         return {
             "loss": running_loss / n,
             "mse": running_mse_loss / n,
             "ce": running_ce_loss / n,
-            "acc": 100.0 * correct / total,
+            "acc": 100.0 * correct / total if total else 0.0,
         }
 
     def train(self, train_dataset, val_dataset) -> None:
@@ -586,13 +624,22 @@ class Train:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self.lr
 
+        # Overlap CPU data loading (incl. the per-item soft-target / mask work)
+        # with GPU compute via worker processes + pinned memory.
+        loader_kwargs = dict(
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
+        if self.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
         train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, shuffle=True,
+            train_dataset, batch_size=self.batch_size, shuffle=True, **loader_kwargs,
         )
         val_loader = None
         if val_dataset is not None:
             val_loader = DataLoader(
-                val_dataset, batch_size=self.batch_size, shuffle=False,
+                val_dataset, batch_size=self.batch_size, shuffle=False, **loader_kwargs,
             )
 
         criterion_mse = nn.MSELoss()
@@ -645,6 +692,7 @@ class Train:
             self.model.train()
             return v
 
+        scaler = torch.amp.GradScaler(enabled=self.use_amp)
         for epoch in range(self.epochs):
             lr = self.optimizer.param_groups[0]["lr"]
             self.model.train()
@@ -652,7 +700,7 @@ class Train:
             running_mse_loss = 0.0
             running_ce_loss = 0.0
             correct = 0
-            total = 1
+            total = 0
 
             n_batches = len(train_loader)
             # Evenly spaced val triggers within the epoch. The Nth trigger lands
@@ -662,22 +710,27 @@ class Train:
             val_trigger_batches = set(
                 max(1, (i + 1) * n_batches // vpe) - 1 for i in range(vpe)
             )
+            # Precompute the trigger ordering once (was re-sorted per trigger).
+            trigger_rank = {b: i for i, b in enumerate(sorted(val_trigger_batches))}
 
             for batch_idx, (data, labels_value, labels_ce, is_high) in enumerate(
                 tqdm(train_loader, desc=f"Epoch {epoch + 1}/{self.epochs}")
             ):
-                data = data.to(self.device)
-                labels_value = labels_value.to(self.device)
-                labels_ce = labels_ce.to(self.device)
-                is_high = is_high.to(self.device)
-                self.optimizer.zero_grad()
+                data = self._prep_boards(data)
+                labels_value = labels_value.to(self.device, non_blocking=True)
+                labels_ce = labels_ce.to(self.device, non_blocking=True)
+                is_high = is_high.to(self.device, non_blocking=True)
+                self.optimizer.zero_grad(set_to_none=True)
 
-                outputs_value, outputs_ce = self.model(data)
-                loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
-                loss_ce = self._soft_ce(outputs_ce, labels_ce, weights=is_high)
-                loss = loss_value + loss_ce
-                loss.backward()
-                self.optimizer.step()
+                with torch.autocast(device_type=self.device.type, dtype=torch.float16,
+                                    enabled=self.use_amp):
+                    outputs_value, outputs_ce = self.model(data)
+                    loss_value = self._value_loss(outputs_value, labels_value, criterion_mse)
+                    loss_ce = self._soft_ce(outputs_ce, labels_ce, weights=is_high)
+                    loss = loss_value + loss_ce
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
 
                 running_loss += loss.item()
                 running_mse_loss += loss_value.item()
@@ -702,7 +755,7 @@ class Train:
 
                 if batch_idx in val_trigger_batches and val_loader is not None:
                     fraction = (batch_idx + 1) / n_batches
-                    label = f"epoch{epoch+1}_val{sorted(val_trigger_batches).index(batch_idx)+1}of{vpe}"
+                    label = f"epoch{epoch+1}_val{trigger_rank[batch_idx]+1}of{vpe}"
                     val_intra = run_validation(label, epoch + 1, fraction)
                     if val_intra is not None:
                         latest_val_dict = val_intra
@@ -715,7 +768,7 @@ class Train:
             train_loss = running_loss / n_batches
             train_mse = running_mse_loss / n_batches
             train_ce = running_ce_loss / n_batches
-            train_acc = 100.0 * correct / total
+            train_acc = 100.0 * correct / total if total else 0.0
 
             # The end-of-epoch val was already run by the trigger landing on
             # the final batch; `latest_val_dict` holds its full result.

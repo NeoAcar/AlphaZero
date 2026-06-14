@@ -32,20 +32,30 @@ class ChessDataset(Dataset):
         return len(self.boards)
 
     def __getitem__(self, idx):
+        # Boards are returned in their stored dtype (uint8 for compact shards).
+        # The uint8 -> float/255 rescale is done in bulk on the GPU in the
+        # training loop so the host->device transfer is 4x smaller. See train.py.
         board = self.boards[idx]
-        if board.dtype == torch.uint8:
-            board = board.float() / 255.0
         value = self.values[idx]
         label = int(self.policy[idx].item())
 
         if self.legal_masks_packed is not None and self.smoothing > 0:
             packed = self.legal_masks_packed[idx].numpy()
+            assert len(packed) * 8 >= self.K, (
+                f"packed legal mask too short: {len(packed) * 8} bits < K={self.K}"
+            )
             mask = np.unpackbits(packed, count=self.K).astype(bool)
             n_legal = int(mask.sum())
-            soft = torch.zeros(self.K, dtype=torch.float32)
-            per_legal = self.smoothing / n_legal
-            soft[torch.from_numpy(mask)] = per_legal
-            soft[label] = 1.0 - self.smoothing + per_legal
+            if n_legal > 0:
+                soft = torch.zeros(self.K, dtype=torch.float32)
+                per_legal = self.smoothing / n_legal
+                soft[torch.from_numpy(mask)] = per_legal
+                soft[label] = 1.0 - self.smoothing + per_legal
+            else:
+                # Defensive: a corrupted mask with no legal moves would divide by
+                # zero; fall back to uniform-over-K smoothing.
+                soft = torch.full((self.K,), self.smoothing / self.K, dtype=torch.float32)
+                soft[label] = 1.0 - self.smoothing + self.smoothing / self.K
         else:
             soft = torch.full((self.K,), self.smoothing / self.K, dtype=torch.float32)
             soft[label] = 1.0 - self.smoothing + self.smoothing / self.K
@@ -89,9 +99,8 @@ class SelfPlayDataset(Dataset):
         return len(self.boards)
 
     def __getitem__(self, idx):
+        # Boards returned in stored dtype (uint8); GPU-side rescale in train.py.
         board = self.boards[idx]
-        if board.dtype == torch.uint8:
-            board = board.float() / 255.0
 
         if self.pi_indices is not None:
             # Sparse → dense reconstruction.

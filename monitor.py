@@ -220,94 +220,148 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
 <style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.4 system-ui, -apple-system, sans-serif;
-         background: #161616; color: #ddd; margin: 0; padding: 20px; }
-  h1 { font-size: 18px; margin: 0 0 16px; color: #fff; font-weight: 500; }
-  .status { display: inline-block; padding: 2px 10px; border-radius: 4px;
-            font-size: 11px; margin-left: 10px; vertical-align: middle; }
-  .status.live { background: #1e7e3a; color: white; }
-  .status.dead { background: #7e1e1e; color: white; }
+  :root {
+    color-scheme: dark;
+    --bg: #121316; --panel: #1b1d22; --panel-2: #232630;
+    --line: #2c2f38; --muted: #8b909b; --text: #e6e8ec;
+    --accent: #6ea8fe; --pos: #5cc46a; --neg: #ef5350; --gold: #ffce54;
+  }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: radial-gradient(1200px 700px at 80% -10%, #1a1d24 0%, var(--bg) 60%);
+         color: var(--text); margin: 0; padding: 22px; }
+  .hdr { display: flex; align-items: center; gap: 12px; margin: 0 0 18px; }
+  h1 { font-size: 17px; margin: 0; color: #fff; font-weight: 600; letter-spacing: .2px; }
+  h1 .az { color: var(--accent); }
+  .status { display: inline-flex; align-items: center; gap: 6px; padding: 3px 11px;
+            border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .03em; }
+  .status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .status.live { background: rgba(92,196,106,.14); color: var(--pos); }
+  .status.dead { background: rgba(239,83,80,.14); color: var(--neg); }
   .grid { display: grid;
-          grid-template-columns: min(calc(88vh + 70px), 870px) 1fr;
-          gap: 24px; max-width: 1600px; }
-  /* Right column fills the same vertical span as the board so the line
-     plot stretches to fill whatever space the stats panel doesn't take. */
+          grid-template-columns: min(calc(88vh + 76px), 880px) 1fr;
+          gap: 22px; max-width: 1640px; }
   .right-col { display: flex; flex-direction: column; gap: 16px;
-               height: min(88vh, 800px); }
-  .right-col #plot { flex: 1 1 auto; min-height: 0; }
+               height: min(88vh, 820px); }
+  .right-col #plot { flex: 1 1 auto; min-height: 180px; }
   .board-area { display: flex; gap: 14px; align-items: flex-start; }
-  #board { width: min(88vh, 800px); }
-  /* chessboard.js square overrides for the dark theme */
-  .white-1e1d7 { background-color: #ebecd0 !important; }
-  .black-3c85d { background-color: #739552 !important; }
-  /* Optional lastmove highlight (squares get .lastmove-from / .lastmove-to). */
-  .lastmove-from { box-shadow: inset 0 0 0 3px #ffd54f80; }
-  .lastmove-to   { box-shadow: inset 0 0 0 3px #ffd54f; }
-  .eval-bar { width: 42px; height: min(88vh, 800px); background: #2a2a2a;
-              border-radius: 4px; position: relative; overflow: hidden;
-              border: 1px solid #3a3a3a; }
-  .eval-fill { position: absolute; bottom: 0; left: 0; right: 0;
-               background: linear-gradient(0deg, #2e7d32 0%, #66bb6a 100%);
-               transition: height 200ms ease; height: 50%; }
-  .meta { margin-top: 14px; color: #aaa; font-size: 12px;
+  #board { width: min(88vh, 800px);
+           border-radius: 8px; overflow: hidden;
+           box-shadow: 0 8px 30px rgba(0,0,0,.45); }
+  .board-wrap { position: relative; width: min(88vh, 800px); }
+  /* SVG overlay for candidate-move arrows; sits above the board, ignores clicks. */
+  #arrows { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 5; }
+  .white-1e1d7 { background-color: #eef0d6 !important; }
+  .black-3c85d { background-color: #6f8f4e !important; }
+  .lastmove-from { box-shadow: inset 0 0 0 3px rgba(255,206,84,.5); }
+  .lastmove-to   { box-shadow: inset 0 0 0 3px var(--gold); }
+  /* Eval bar: bot win-prob fills from the bottom; centre line marks 50%. */
+  .eval-bar { width: 40px; height: min(88vh, 800px); background: #20232b;
+              border-radius: 6px; position: relative; overflow: hidden;
+              border: 1px solid var(--line); }
+  .eval-fill { position: absolute; bottom: 0; left: 0; right: 0; height: 50%;
+               background: linear-gradient(0deg, #2e7d32, #6ee07e);
+               transition: height 220ms ease; }
+  .eval-bar .mid { position: absolute; left: 0; right: 0; top: 50%;
+                   height: 1px; background: rgba(255,255,255,.22); }
+  .eval-bar .pct { position: absolute; left: 0; right: 0; top: 6px; text-align: center;
+                   font: 600 11px ui-monospace, monospace; color: rgba(255,255,255,.8);
+                   text-shadow: 0 1px 2px rgba(0,0,0,.6); }
+  .meta { margin-top: 14px; color: var(--muted); font-size: 12.5px;
           font-family: ui-monospace, monospace; }
-  .stats { background: #1f1f1f; padding: 18px 18px 14px; border-radius: 8px;
-           border: 1px solid #2a2a2a; }
-  .stats .row { display: flex; justify-content: space-between;
-                padding: 7px 0; border-bottom: 1px solid #2a2a2a; }
-  .stats .row:last-child { border: none; }
-  .stats .label { color: #888; font-size: 13px; }
-  .stats .value { font-family: ui-monospace, monospace; font-size: 14px;
-                  color: #ddd; }
-  .stats .value.big { font-size: 22px; font-weight: 500; }
-  .stats .value.eval-pos { color: #66bb6a; }
-  .stats .value.eval-neg { color: #ef5350; }
-  .top-moves { font-family: ui-monospace, monospace; font-size: 12px;
-               color: #bbb; max-width: 320px; text-align: right;
-               word-break: break-all; }
-  #plot { background: #1f1f1f; border-radius: 8px; margin-top: 16px;
-          padding: 8px; border: 1px solid #2a2a2a; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .legend { margin-top: 6px; font-size: 11.5px; color: var(--muted); }
+  .legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+                vertical-align: middle; margin-right: 4px; }
+  .card { background: var(--panel); padding: 16px 16px 12px; border-radius: 10px;
+          border: 1px solid var(--line); }
+  /* Big eval header */
+  .eval-head { display: flex; align-items: baseline; justify-content: space-between;
+               margin-bottom: 12px; }
+  .eval-head .cp { font: 600 30px/1 ui-monospace, monospace; }
+  .eval-head .wp { font: 600 18px/1 ui-monospace, monospace; color: var(--muted); }
+  .eval-pos { color: var(--pos); } .eval-neg { color: var(--neg); }
+  .cp.mate { color: var(--gold); }   /* proven forced mate (M7) */
+  /* Stat tiles */
+  .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .tile { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+          padding: 8px 10px; }
+  .tile .k { color: var(--muted); font-size: 10.5px; text-transform: uppercase;
+             letter-spacing: .06em; }
+  .tile .v { font: 600 16px/1.2 ui-monospace, monospace; color: var(--text); margin-top: 2px; }
+  .tile .v small { font-size: 11px; color: var(--muted); font-weight: 400; }
+  .sect { color: var(--muted); font-size: 10.5px; letter-spacing: .08em;
+          text-transform: uppercase; margin: 14px 0 7px; }
+  /* Candidate move bars */
+  .cand { display: grid; grid-template-columns: 56px 1fr 44px 50px;
+          align-items: center; gap: 9px; padding: 3px 0;
+          font-family: ui-monospace, monospace; font-size: 13px; }
+  .cand-move { color: var(--text); font-weight: 600; }
+  .cand-bar { height: 15px; background: #20232b; border-radius: 4px; overflow: hidden; }
+  .cand-fill { display: block; height: 100%; border-radius: 4px;
+               transition: width 200ms ease; }
+  .cand-n { color: var(--muted); text-align: right; font-size: 12px; }
+  .cand-q { text-align: right; font-weight: 600; }
+  .cand-empty { color: var(--muted); font-family: ui-monospace, monospace; }
+  .pv-line { font-family: ui-monospace, monospace; font-size: 12.5px;
+             color: #9fc0e6; word-break: break-word; line-height: 1.55;
+             background: var(--panel-2); border: 1px solid var(--line);
+             border-radius: 8px; padding: 8px 10px; min-height: 20px; }
+  #plot { background: var(--panel); border-radius: 10px; padding: 8px;
+          border: 1px solid var(--line); }
 </style>
 </head>
 <body>
-<h1>AlphaZero Bot Monitor <span id="status" class="status dead">Disconnected</span></h1>
+<div class="hdr">
+  <h1><span class="az">Alpha</span>Zero Monitor</h1>
+  <span id="status" class="status dead">Disconnected</span>
+</div>
 
 <div class="grid">
   <div>
     <div class="board-area">
-      <div id="board"></div>
-      <div class="eval-bar"><div id="evalFill" class="eval-fill"></div></div>
+      <div class="board-wrap">
+        <div id="board"></div>
+        <svg id="arrows"></svg>
+      </div>
+      <div class="eval-bar">
+        <div id="evalFill" class="eval-fill"></div>
+        <div class="mid"></div>
+        <div id="evalPct" class="pct">50%</div>
+      </div>
     </div>
     <div class="meta">
-      <span id="ply">ply 0</span>
-      &nbsp;·&nbsp; <span id="turn">white to move</span>
-      &nbsp;·&nbsp; bot: <span id="botColor">—</span>
+      <b id="ply">ply 0</b> &nbsp;·&nbsp; <span id="turn">white to move</span>
+      &nbsp;·&nbsp; bot plays <b id="botColor">—</b>
+    </div>
+    <div class="meta legend">
+      <span class="sw" style="background:#5cc46a"></span>bot candidates (Q-coloured)
+      &nbsp;·&nbsp;
+      <span class="sw" style="background:#5b9bd5"></span>predicted opponent (while pondering)
     </div>
   </div>
 
   <div class="right-col">
-    <div class="stats">
-      <div class="row"><span class="label">Bot eval (cp)</span>
-        <span id="evalText" class="value big">+0.00</span></div>
-      <div class="row"><span class="label">Win prob (bot)</span>
-        <span id="winProb" class="value">50.0%</span></div>
-      <div class="row"><span class="label">MCTS depth</span>
-        <span id="depth" class="value">0</span></div>
-      <div class="row"><span class="label">Sims&nbsp;/&nbsp;NPS</span>
-        <span class="value"><span id="sims">0</span>
-          &nbsp;·&nbsp; <span id="nps">0</span></span></div>
-      <div class="row"><span class="label">Pondering</span>
-        <span class="value"><span id="ponderSims">—</span>
-          &nbsp;sims&nbsp;·&nbsp;<span id="ponderNps">—</span>&nbsp;nps</span></div>
-      <div class="row"><span class="label">Move time</span>
-        <span class="value"><span id="goTime">—</span>
-          &nbsp;·&nbsp; <span id="lastMoveTime">—</span></span></div>
-      <div class="row"><span class="label">Clock&nbsp;&nbsp;W&nbsp;/&nbsp;B</span>
-        <span class="value"><span id="wclock">—</span>
-          &nbsp;/&nbsp; <span id="bclock">—</span></span></div>
-      <div class="row"><span class="label">Top moves</span>
-        <span id="topMoves" class="top-moves">—</span></div>
+    <div class="card">
+      <div class="eval-head">
+        <span id="evalText" class="cp">+0.00</span>
+        <span id="winProb" class="wp">50.0%</span>
+      </div>
+      <div class="tiles">
+        <div class="tile"><div class="k">Depth</div><div class="v" id="depth">0</div></div>
+        <div class="tile"><div class="k">Sims</div><div class="v" id="sims">0</div></div>
+        <div class="tile"><div class="k">NPS</div><div class="v" id="nps">0</div></div>
+        <div class="tile"><div class="k">Move time</div>
+          <div class="v"><span id="goTime">—</span> <small id="lastMoveTime">—</small></div></div>
+        <div class="tile"><div class="k">Ponder</div>
+          <div class="v"><span id="ponderSims">—</span> <small><span id="ponderNps">—</span> nps</small></div></div>
+        <div class="tile"><div class="k">Clock W / B</div>
+          <div class="v"><span id="wclock">—</span> <small>/</small> <span id="bclock">—</span></div></div>
+      </div>
+      <div class="sect">Candidate moves &nbsp;<small style="text-transform:none;letter-spacing:0">(visits · Q)</small></div>
+      <div id="candidates"><div class="cand-empty">—</div></div>
+      <div class="sect">Principal variation</div>
+      <div id="pv" class="pv-line">—</div>
     </div>
     <div id="plot"></div>
   </div>
@@ -355,7 +409,10 @@ function highlightLastmove(uci) {
 
 function setBoardOrientation(botColor) {
   const want = botColor === 'black' ? 'black' : 'white';
-  if (board.orientation() !== want) board.orientation(want);
+  if (board.orientation() !== want) {
+    board.orientation(want);
+    setTimeout(() => drawArrows(lastTop, lastOpp), 0);   // re-map arrows to new orientation
+  }
 }
 
 // Board size is derived from viewport height (88vh up to 800px). When the
@@ -366,6 +423,7 @@ window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
     board.resize();
+    drawArrows(lastTop, lastOpp);
     if (plotInitialised) Plotly.Plots.resize('plot');
   }, 80);
 });
@@ -434,31 +492,134 @@ function fmtClock(ms) {
   return `${m}:${s.toString().padStart(2,'0')}`;
 }
 
-function setEval(cp, winProb) {
+function setEval(cp, winProb, mate) {
+  if (mate != null) {
+    // Proven forced mate: show "M7" (bot mates) or "-M7" (bot mated) instead of
+    // a saturated centipawn value, and peg the eval bar full/empty.
+    const txt = (mate > 0 ? 'M' : '-M') + Math.abs(mate);
+    $('evalText').textContent = txt;
+    $('evalText').className = 'cp ' + (mate > 0 ? 'mate' : 'eval-neg');
+    const p = mate > 0 ? 100 : 0;
+    $('evalFill').style.height = p + '%';
+    $('evalPct').textContent = txt;
+    $('winProb').textContent = (mate > 0 ? '100' : '0') + '%';
+    return;
+  }
   if (cp != null) {
     const sign = cp >= 0 ? '+' : '';
     $('evalText').textContent = sign + (cp/100).toFixed(2);
-    $('evalText').className = 'value big ' + (cp >= 0 ? 'eval-pos' : 'eval-neg');
+    $('evalText').className = 'cp ' + (cp >= 0 ? 'eval-pos' : 'eval-neg');
   }
   if (winProb != null) {
-    $('winProb').textContent = (winProb * 100).toFixed(1) + '%';
-    $('evalFill').style.height = (winProb * 100).toFixed(1) + '%';
+    const p = winProb * 100;
+    $('winProb').textContent = p.toFixed(1) + '%';
+    $('evalFill').style.height = p.toFixed(1) + '%';
+    $('evalPct').textContent = Math.round(p) + '%';
   }
+}
+
+// Map Q in [-1,1] to a red -> yellow -> green hue for the candidate bars.
+function qColor(q) {
+  const h = clamp01((q + 1) / 2) * 130;   // 0 = red, 130 = green
+  return `hsl(${h.toFixed(0)}, 60%, 46%)`;
+}
+
+// --- Candidate-move arrows on the board ----------------------------------
+const SVGNS = 'http://www.w3.org/2000/svg';
+let lastTop = [];     // latest candidates, so we can redraw on resize / flip
+let lastOpp = false;  // are the current arrows predicted-opponent (vs bot) moves?
+const OPP_COLOR = '#5b9bd5';   // cool blue: predicted opponent replies (vs warm Q-coloured bot arrows)
+
+function squareCenter(square, sq, orient) {
+  // square like "e2" -> pixel centre, accounting for board orientation.
+  const file = square.charCodeAt(0) - 97;        // a=0..h=7
+  const rank = parseInt(square[1], 10) - 1;       // rank1=0..rank8=7
+  let col, row;
+  if (orient === 'white') { col = file;     row = 7 - rank; }
+  else                    { col = 7 - file; row = rank; }
+  return { x: (col + 0.5) * sq, y: (row + 0.5) * sq };
+}
+
+function drawArrows(top, opp) {
+  const svg = $('arrows');
+  if (!svg) return;
+  const size = $('board').clientWidth || 0;
+  svg.setAttribute('width', size);
+  svg.setAttribute('height', size);
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  svg.innerHTML = '';
+  if (!top || !top.length || !size) return;
+  const sq = size / 8;
+  const orient = board.orientation();
+  const maxN = Math.max(...top.map(m => m.N || 0)) || 1;
+  // Draw weakest first so the most-visited arrow ends up on top.
+  const ordered = [...top].sort((a, b) => (a.N || 0) - (b.N || 0));
+  for (const m of ordered) {
+    if (!m.uci || m.uci.length < 4) continue;
+    const from = squareCenter(m.uci.slice(0, 2), sq, orient);
+    const to   = squareCenter(m.uci.slice(2, 4), sq, orient);
+    const share = (m.N || 0) / maxN;             // relative to the best move
+    const w  = sq * (0.10 + 0.16 * share);       // thickness scales with visits
+    const op = 0.28 + 0.55 * share;              // opacity scales with visits
+    // Bot's own moves: colour by Q (red->green). Predicted opponent replies:
+    // a single cool blue, so they're clearly not the bot's choices.
+    const col = opp ? OPP_COLOR : qColor(m.q != null ? m.q : 0);
+    let dx = to.x - from.x, dy = to.y - from.y;
+    const L = Math.hypot(dx, dy) || 1, ux = dx / L, uy = dy / L;
+    const head = w * 2.4;
+    const tipX = to.x - ux * sq * 0.16, tipY = to.y - uy * sq * 0.16;  // tip inside target
+    const baseX = tipX - ux * head, baseY = tipY - uy * head;
+    const nx = -uy, ny = ux, hw = head * 0.6;    // perpendicular for the head
+    const line = document.createElementNS(SVGNS, 'line');
+    line.setAttribute('x1', from.x); line.setAttribute('y1', from.y);
+    line.setAttribute('x2', baseX);  line.setAttribute('y2', baseY);
+    line.setAttribute('stroke', col); line.setAttribute('stroke-width', w);
+    line.setAttribute('stroke-linecap', 'round'); line.setAttribute('opacity', op);
+    svg.appendChild(line);
+    const poly = document.createElementNS(SVGNS, 'polygon');
+    poly.setAttribute('points',
+      `${tipX},${tipY} ${baseX + nx * hw},${baseY + ny * hw} ${baseX - nx * hw},${baseY - ny * hw}`);
+    poly.setAttribute('fill', col); poly.setAttribute('opacity', op);
+    svg.appendChild(poly);
+  }
+}
+
+function renderCandidates(top) {
+  const el = $('candidates');
+  if (!top || !top.length) { el.innerHTML = '<div class="cand-empty">—</div>'; return; }
+  const totalN = top.reduce((s, m) => s + (m.N || 0), 0) || 1;
+  el.innerHTML = top.map(m => {
+    const share = (m.N || 0) / totalN;
+    const q = (m.q != null) ? m.q : 0;
+    const qtxt = (q >= 0 ? '+' : '') + q.toFixed(2);
+    const qcls = q >= 0 ? 'eval-pos' : 'eval-neg';
+    return `<div class="cand">
+      <span class="cand-move">${m.uci}</span>
+      <span class="cand-bar"><span class="cand-fill"
+        style="width:${(share*100).toFixed(1)}%;background:${qColor(q)}"></span></span>
+      <span class="cand-n">${(m.N || 0).toLocaleString()}</span>
+      <span class="cand-q ${qcls}">${qtxt}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderPV(pv) {
+  $('pv').textContent = (pv && pv.length) ? pv.join('  ') : '—';
 }
 
 function applyTick(t) {
-  setEval(t.cp, t.win_prob);
+  setEval(t.cp, t.win_prob, t.mate);
   if (t.depth !== undefined) $('depth').textContent = t.depth;
   if (t.sims !== undefined) $('sims').textContent = t.sims.toLocaleString();
   if (t.nps !== undefined) $('nps').textContent = t.nps.toLocaleString();
-  if (t.top && t.top.length) {
-    $('topMoves').textContent = t.top
-      .map(m => `${m.uci}(N=${m.N})`)
-      .join(' ');
-  }
+  if (t.top) renderCandidates(t.top);
+  if (t.pv) renderPV(t.pv);
 }
 
 function applyMove(m) {
+  // The position is about to change -- clear stale candidate arrows; the next
+  // search's ticks (or ponder ticks) will draw fresh ones for the new position.
+  lastTop = []; lastOpp = false; drawArrows([]);
   if (m.fen) setBoardFen(m.fen, true);   // animate
   // chessboard.js redraws on .position(); apply highlight after a tick so the
   // new square divs are in place before we paint .lastmove-* classes.
@@ -471,7 +632,7 @@ function applyMove(m) {
   if (m.win_prob !== undefined && m.ply !== undefined && plotInitialised) {
     Plotly.extendTraces('plot',
       { x: [[m.ply]], y: [[m.win_prob]] }, [0]);
-    setEval(m.cp, m.win_prob);
+    setEval(m.cp, m.win_prob, m.mate);
   }
   if (m.nn_win_prob !== undefined && m.ply !== undefined && plotInitialised) {
     // Extend NN lower/upper bound + center together so the band stays in sync.
@@ -510,7 +671,9 @@ function applyState(s) {
     $('ponderSims').textContent = '—';
     $('ponderNps').textContent = '—';
     $('lastMoveTime').textContent = '—';
-    $('topMoves').textContent = '—';
+    renderCandidates([]);
+    renderPV([]);
+    lastTop = []; lastOpp = false; drawArrows([]);
   }
 }
 
@@ -548,6 +711,10 @@ function applySnapshot(s) {
   if (s.last_ponder_tick && s.last_ponder_tick.status !== 'stopped') {
     $('ponderSims').textContent = s.last_ponder_tick.sims.toLocaleString();
     $('ponderNps').textContent = s.last_ponder_tick.nps.toLocaleString();
+    // Restore predicted-opponent arrows if we refreshed mid-ponder.
+    if (s.last_ponder_tick.top) {
+      lastTop = s.last_ponder_tick.top; lastOpp = true; drawArrows(lastTop, true);
+    }
   } else {
     $('ponderSims').textContent = '—';
     $('ponderNps').textContent = '—';
@@ -567,7 +734,8 @@ es.onmessage = e => {
   let ev;
   try { ev = JSON.parse(e.data); } catch { return; }
   switch (ev.kind) {
-    case 'tick':     applyTick(ev); break;
+    case 'tick':     applyTick(ev); lastTop = ev.top || []; lastOpp = false;
+                     drawArrows(lastTop, false); break;
     case 'move':     applyMove(ev); break;
     case 'state':    applyState(ev); break;
     case 'clock':    applyClock(ev); break;
@@ -579,6 +747,8 @@ es.onmessage = e => {
       if (ev.status === 'running') {
         $('ponderSims').textContent = ev.sims.toLocaleString();
         $('ponderNps').textContent = ev.nps.toLocaleString();
+        // Predicted opponent replies, drawn in the opponent (blue) colour.
+        if (ev.top) { lastTop = ev.top; lastOpp = true; drawArrows(lastTop, true); }
       }
       break;
     case 'go_start':

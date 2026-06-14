@@ -38,14 +38,27 @@ def value_to_scalar(value_t: torch.Tensor, mode: str = "expected") -> torch.Tens
 
     Scalar (B,1) outputs are returned unchanged regardless of mode.
     """
+    scalar, _ = value_scalar_and_wdl(value_t, mode)
+    return scalar
+
+
+def value_scalar_and_wdl(value_t: torch.Tensor, mode: str = "expected"):
+    """Like value_to_scalar but also returns the WDL probabilities so callers
+    that need both (MCTS caches raw_nn_wdl for dashboards) don't softmax twice.
+
+    Returns (scalar (B,), wdl_probs (B,3) | None). wdl_probs is None for plain
+    tanh-scalar heads.
+    """
     if value_t.shape[-1] == 3:
         wdl = torch.softmax(value_t, dim=-1)
         if mode == "expected":
-            return wdl[..., 0] - wdl[..., 2]
-        if mode == "win_only":
-            return wdl[..., 0]
-        raise ValueError(f"unknown value_scalar mode: {mode!r}")
-    return value_t.squeeze(-1)
+            scalar = wdl[..., 0] - wdl[..., 2]
+        elif mode == "win_only":
+            scalar = wdl[..., 0]
+        else:
+            raise ValueError(f"unknown value_scalar mode: {mode!r}")
+        return scalar, wdl
+    return value_t.squeeze(-1), None
 
 
 class ResNet(nn.Module):
@@ -236,4 +249,3 @@ class SEResNetWDL(nn.Module):
         policy = self.policyHead(x)
         value = self.valueHead(x)
         return value, policy
-

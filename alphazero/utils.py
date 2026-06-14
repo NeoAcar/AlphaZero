@@ -53,12 +53,21 @@ def _board_to_matrix_19(board: chess.Board, move_counter: int) -> np.ndarray:
     # "Colour" plane (AZ S1): real side-to-move (player-to-move's actual color
     # in the un-mirrored game), NOT the canonical board.turn (always True here).
     matrix[12, :, :] = 1.0 if (move_counter % 2 == 0) else 0.0
-    matrix[13, :, :] = move_counter / 300
+    # Keep the /300 scale that 19-plane checkpoints were trained on, but CLAMP to
+    # [0,1]. Pre-clamp this was move_counter/300 unclamped at inference while the
+    # training data was clipped to 1.0 at uint8 quantization -> a train/inference
+    # mismatch (and uint8 overflow) for games past ply 300. Clamping fixes that
+    # WITHOUT changing the scale, so it stays backward-compatible with existing
+    # 19-plane models. (The 119-plane path uses /500 to match 119-plane models;
+    # the two representations are separate families, hence the different scales.)
+    matrix[13, :, :] = min(move_counter / 300.0, 1.0)
     matrix[14, :, :] = board.has_kingside_castling_rights(True)
     matrix[15, :, :] = board.has_queenside_castling_rights(True)
     matrix[16, :, :] = board.has_kingside_castling_rights(False)
     matrix[17, :, :] = board.has_queenside_castling_rights(False)
-    matrix[18, :, :] = board.halfmove_clock / 100
+    # Clamp: halfmove_clock can exceed 100 under the 75-move rule, which would
+    # push the plane >1 (and overflow uint8 at quantization). Keep it in [0,1].
+    matrix[18, :, :] = min(board.halfmove_clock / 100.0, 1.0)
     return matrix
 
 
@@ -120,7 +129,7 @@ def _board_to_matrix_119(board: chess.Board, move_counter: int,
     planes[115, :, :] = float(board.has_queenside_castling_rights(True))
     planes[116, :, :] = float(board.has_kingside_castling_rights(False))
     planes[117, :, :] = float(board.has_queenside_castling_rights(False))
-    planes[118, :, :] = board.halfmove_clock / 100.0
+    planes[118, :, :] = min(board.halfmove_clock / 100.0, 1.0)  # clamp (75-move rule)
     return planes
 
 
@@ -242,6 +251,22 @@ def legal_mask(board: chess.Board) -> np.ndarray:
     return mask
 
 
+def valid_policy(policy: np.ndarray, board: chess.Board) -> np.ndarray:
+    """Zero the illegal indices of a (4672,) policy and renormalise to sum 1.
+
+    Always apply this before sampling from a raw policy-head output. Returns a
+    new float array. If the policy has no mass on legal moves (degenerate /
+    fully-masked), falls back to a uniform distribution over legal moves."""
+    mask = legal_mask(board)
+    masked = np.where(mask, policy, 0.0).astype(np.float32)
+    total = masked.sum()
+    if total > 0:
+        return masked / total
+    legal = mask.astype(np.float32)
+    n = legal.sum()
+    return legal / n if n > 0 else legal
+
+
 def prepare_input(board: chess.Board, move_counter: int,
                   history: list | None = None,
                   rep_count: int = 1) -> torch.Tensor:
@@ -249,7 +274,9 @@ def prepare_input(board: chess.Board, move_counter: int,
     planes (omit for legacy 19); `rep_count` populates the current-frame
     repetition flags when running 119-plane."""
     matrix = board_to_matrix(board, move_counter, history=history, rep_count=rep_count)
-    return torch.tensor(matrix, dtype=torch.float32)
+    # board_to_matrix already returns a fresh, contiguous float32 array, so
+    # from_numpy (zero-copy) is safe and avoids torch.tensor's extra copy.
+    return torch.from_numpy(matrix)
 
 
 def mirror_move(move: str) -> str:

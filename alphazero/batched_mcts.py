@@ -33,6 +33,7 @@ Notes:
     - All proven_value / discount / force-win-on-proof logic from mcts.py
       carries over unchanged via shared Node class.
 """
+import logging
 import math
 import time
 from typing import Callable, Optional
@@ -42,93 +43,89 @@ import numpy as np
 import torch
 
 from . import utils as f
-from .mcts import Node
-from .nn import value_to_scalar
+from .mcts import MCTSBase, Node, _amp_ctx
+from .nn import value_scalar_and_wdl
+
+_log = logging.getLogger(__name__)
 
 
-class BatchedMCTS:
+def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
+    """Run ONE batched NN forward over `leaves` (distinct unexpanded Nodes),
+    cache their priors / value / WDL on each leaf (if not already set), and
+    return {id(leaf): collapsed_value}.
+
+    Tree-independent: single-game BatchedMCTS and the cross-game
+    MultiGameSearcher both route their evaluation phase through this so a batch
+    can span many games' leaves in one forward. Single GPU→CPU sync."""
+    if not leaves:
+        return {}
+    use_history = args.get("input_planes") == 119
+    inputs = torch.stack([
+        f.prepare_input(
+            leaf.state, leaf.move_counter,
+            history=(leaf.history if use_history else None),
+            rep_count=max(leaf.rep_count, 1),
+        )
+        for leaf in leaves
+    ]).to(args["device"])
+    if inputs.device.type == "cuda" and args.get("channels_last", True):
+        inputs = inputs.contiguous(memory_format=torch.channels_last)
+    with torch.inference_mode(), _amp_ctx(inputs.device):
+        value_t, policy_t = model(inputs)
+
+    masks_np = np.stack([
+        (leaf.legal_mask_np if leaf.legal_mask_np is not None
+         else f.legal_mask(leaf.state))
+        for leaf in leaves
+    ])
+    masks_t = torch.from_numpy(masks_np).to(policy_t.device, non_blocking=True)
+
+    # One softmax for both the collapsed scalar and the cached WDL probs.
+    values_t, wdl_t = value_scalar_and_wdl(
+        value_t, mode=args.get("value_scalar", "expected")
+    )
+    values_t = values_t.reshape(-1, 1).float()
+    masked_logits = policy_t.float().masked_fill(~masks_t, float("-inf"))
+    policies_t = torch.softmax(masked_logits, dim=1)
+
+    # WDL probs ride along in the same single GPU→CPU sync. .float() guards
+    # fp16 autocast outputs from leaking into numpy storage.
+    if wdl_t is not None:
+        combined = torch.cat([values_t, wdl_t.float(), policies_t], dim=1).cpu().numpy()
+        values = combined[:, 0]
+        wdl_probs = combined[:, 1:4]
+        policies = combined[:, 4:]
+    else:
+        combined = torch.cat([values_t, policies_t], dim=1).cpu().numpy()
+        values = combined[:, 0]
+        wdl_probs = None
+        policies = combined[:, 1:]
+
+    leaf_value: dict[int, float] = {}
+    for i, leaf in enumerate(leaves):
+        val = float(values[i])
+        if leaf.raw_policy is None:
+            leaf.raw_policy = policies[i]
+            leaf.policy = policies[i].copy()
+            leaf.n_legal = int(masks_np[i].sum())
+            leaf.legal_mask_np = masks_np[i]
+            leaf.raw_nn_value = val
+            if wdl_probs is not None:
+                leaf.raw_nn_wdl = (
+                    float(wdl_probs[i, 0]), float(wdl_probs[i, 1]), float(wdl_probs[i, 2])
+                )
+        leaf_value[id(leaf)] = val
+    return leaf_value
+
+
+class BatchedMCTS(MCTSBase):
+    """Batched MCTS. Shares all state/tree-reuse/proof/finalisation machinery
+    with sequential MCTS via MCTSBase; only leaf evaluation is batched."""
+
     def __init__(self, args: dict, model) -> None:
-        self.args = args
-        self.model = model.to(args["device"])
-        self.model.eval()  # defensive: ensure no train-mode BN/dropout during batched eval
-        self.root: Node | None = None
+        super().__init__(args, model)
+        self.model.eval()  # defensive: no train-mode BN/dropout during batched eval
         self.batch_size = int(args.get("batch_size", 8))
-        self.last_max_depth = 0
-        self.last_was_proven_mate: bool = False
-        # Per-search set of leaf depths; cleared at the start of `search`.
-        self._visited_depths: set[int] = set()
-        # Repetition tracking -- see mcts.MCTS for details.
-        self._ext_rep: dict = {}
-        # Board history for the 119-plane representation; see mcts.MCTS.
-        self._ext_history: list = []
-
-    def set_rep_counter(self, counter) -> None:
-        self._ext_rep = dict(counter) if counter else {}
-
-    def set_history(self, history) -> None:
-        self._ext_history = list(history) if history else []
-
-    def _compute_rep_count(self, node: Node) -> int:
-        tk = node.tk
-        extra = 0
-        cur = node
-        while cur.parent is not None:
-            if cur.tk == tk:
-                extra += 1
-            cur = cur.parent
-        return self._ext_rep.get(tk, 0) + extra
-
-    def apply_action(self, action: int) -> None:
-        """O(1) walk by known action -- see mcts.MCTS.apply_action."""
-        if self.root is None:
-            return
-        child = self.root.children.get(action)
-        if child is None:
-            self.root = None
-            return
-        self.root = child
-        self.root.parent = None
-
-    def update_root(self, state: chess.Board, move_counter: int | None = None) -> None:
-        """Walk to the descendant whose position matches `state` (within two
-        levels) and make it the new root. Reset if no match.
-
-        Depth 1: self-play (search called every half-move). Depth 2:
-        match.py / uci.py / lichess-bot, where search runs only on our turn
-        and the new state is a grandchild of the previous root (our move +
-        opp's reply). Without the depth-2 walk, the entire tree was being
-        discarded every move in those contexts.
-
-        Idempotent: if root already matches `state`, no-op (allows callers
-        to pre-walk via `apply_action`).
-
-        See mcts.py:MCTS.update_root for full rationale.
-        """
-        if self.root is None:
-            return
-        # Already at the right state.
-        if self.root.state == state and (
-            move_counter is None or self.root.move_counter == move_counter
-        ):
-            return
-        # Depth 1: direct child (self-play half-move transition).
-        for child in self.root.children.values():
-            if child.state == state and (
-                move_counter is None or child.move_counter == move_counter
-            ):
-                self.root = child
-                self.root.parent = None
-                return
-        # Depth 2: grandchild (bot's move + opp's reply between searches).
-        for child in self.root.children.values():
-            for grandchild in child.children.values():
-                if grandchild.state == state and (
-                    move_counter is None or grandchild.move_counter == move_counter
-                ):
-                    self.root = grandchild
-                    self.root.parent = None
-                    return
-        self.root = None
 
     # ---------- selection with virtual loss ----------
 
@@ -217,29 +214,7 @@ class BatchedMCTS:
         mu_used: float = float(child_Q[best_local])
         return chosen_action, mu_used
 
-    # ---------- proof propagation (mirrors mcts.MCTS._try_prove) ----------
-
-    @staticmethod
-    def _try_prove(node: Node) -> None:
-        """Proven value from THIS node's player-to-move perspective.
-        Perspective-free, no dependency on tree root.
-        OR-rule: any child whose player (opp) loses (proven_value=-1) →
-                 this player wins → node.proven_value=+1.
-        Otherwise need all legal moves expanded; node.proven_value
-                 = -min(child.proven_value)."""
-        if node.proven_value is not None:
-            return
-        if not node.children:
-            return
-        if any(c.proven_value == -1 for c in node.children.values()):
-            node.proven_value = 1
-            return
-        if node.n_legal is None or len(node.children) < node.n_legal:
-            return
-        child_provens = [c.proven_value for c in node.children.values()]
-        if any(pv is None for pv in child_provens):
-            return
-        node.proven_value = -min(child_provens)  # type: ignore
+    # _try_prove is inherited from MCTSBase (identical proof propagation).
 
     # ---------- one batch of sims ----------
 
@@ -264,15 +239,16 @@ class BatchedMCTS:
         # peer batched sims that bottom-out at root (none in practice, but
         # keeps the bookkeeping symmetric with the rest of the path).
         node.virtual_loss += 1
+        trunc = int(self.args.get("truncation_halfmoves", 1000))
         while True:
-            if node.is_terminal():
-                value: float = float(
-                    f.game_result(node.state, node.move_counter, 1000, node.rep_count)[0]
-                )
-                # value is from current player's POV: -1 mated, 0 drawn.
-                if value == 0.0 or value == -1.0:
-                    node.proven_value = int(value)
-                return path, node, "terminal", value
+            # Single game_result call. value is from current player's POV:
+            # -1 mated, 0 drawn / truncated.
+            term_value, is_term = f.game_result(
+                node.state, node.move_counter, trunc, node.rep_count
+            )
+            if is_term:
+                node.proven_value = int(term_value)
+                return path, node, "terminal", float(term_value)
             if not node.is_expanded():
                 return path, node, "needs_eval", None
             action, mu_used = self._select_action_with_vloss(node)
@@ -285,118 +261,57 @@ class BatchedMCTS:
             node.virtual_Q += mu_used
             path.append((node, mu_used))
 
-    def _simulate_batch(self, root: Node, sims_remaining: int) -> int:
-        """Run up to `min(batch_size, sims_remaining)` parallel sims.
-        Returns the number of sims that actually contributed (duplicates
-        whose leaf is already in the batch are skipped to avoid double-
-        backprop of the same value)."""
-        batch_target: int = min(self.batch_size, sims_remaining)
+    # The batch loop is split into three phases so a cross-game coordinator
+    # (MultiGameSearcher) can run the *selection* and *backprop* phases per tree
+    # while coalescing the *evaluation* phase (the only GPU step) across many
+    # games into a single NN forward. Single-game search calls all three here.
 
-        # Phase 1: selection. Each entry is (path, leaf, status, value-or-None).
-        # `path` is a list of (node, mu_used) tuples produced by _select_one_leaf;
-        # mu_used is the Virtual-Mean Q value added to that node's virtual_Q.
-        in_flight: list[tuple[list[tuple[Node, float]], Node, str, float | None]] = []
+    def _collect_batch(self, root: Node, batch_target: int) -> list:
+        """Phase 1: selection. Returns `in_flight`, a list of
+        (path, leaf, status, value-or-None). Applies virtual loss along each
+        descent; the caller must eventually backprop every entry to revert it."""
+        in_flight = []
         for _ in range(batch_target):
             in_flight.append(self._select_one_leaf(root))
+        return in_flight
 
-        # Deduplicate needs_eval leaves: if two sims hit the same unexpanded
-        # leaf, only the first one is evaluated/backpropagated. The duplicate
-        # has its virtual stats undone and is skipped. This matches sequential
-        # MCTS semantics where after expanding a leaf, subsequent sims descend
-        # deeper rather than re-evaluating the same position.
-        seen_leaves: set[int] = set()
-        skip: set[int] = set()
-        unique_eval: list[tuple[int, Node]] = []
-        for sim_idx, (_, leaf, status, _) in enumerate(in_flight):
+    @staticmethod
+    def _unique_needs_eval(in_flight) -> list[Node]:
+        """Distinct unexpanded leaves in `in_flight` (deduped by identity) that
+        need an NN forward. Duplicates still backprop (see _backprop_batch); we
+        only dedup the *evaluation* to save GPU compute."""
+        seen: set[int] = set()
+        leaves: list[Node] = []
+        for _, leaf, status, _ in in_flight:
+            if status == "needs_eval" and id(leaf) not in seen:
+                seen.add(id(leaf))
+                leaves.append(leaf)
+        return leaves
+
+    def _backprop_batch(self, in_flight, leaf_value: dict) -> int:
+        """Phase 3: backprop every sim + revert its virtual stats + propagate
+        proofs. `leaf_value` maps id(leaf)->value for evaluated leaves. EVERY
+        needs_eval sim (including dedup duplicates) backprops the shared value,
+        so visit counts are not undercounted; double-counting the identical
+        value is safe (Q/N average and sign alternation hold)."""
+        # Hand the evaluated value to every needs_eval sim (unique + duplicates).
+        for sim_idx, (path, leaf, status, _) in enumerate(in_flight):
             if status == "needs_eval":
-                lid: int = id(leaf)
-                if lid in seen_leaves:
-                    skip.add(sim_idx)
-                    continue
-                seen_leaves.add(lid)
-                unique_eval.append((sim_idx, leaf))
+                v = leaf_value.get(id(leaf))
+                if v is not None:
+                    in_flight[sim_idx] = (path, leaf, "evaluated", v)
 
-        # Phase 2: batched NN evaluation for unique needs_eval leaves.
-        # Single GPU→CPU sync: concat values + policies into one (B, 4673)
-        # tensor and pull across PCIe once. Same idea as mcts.py:expand_lazy.
-        if unique_eval:
-            use_history = self.args.get("input_planes") == 119
-            inputs: torch.Tensor = torch.stack([
-                f.prepare_input(
-                    leaf.state, leaf.move_counter,
-                    history=(leaf.history if use_history else None),
-                    rep_count=max(leaf.rep_count, 1),
-                )
-                for _, leaf in unique_eval
-            ]).to(self.args["device"])
-            with torch.inference_mode():
-                value_t, policy_t = self.model(inputs)
-
-            masks_np: np.ndarray = np.stack(
-                [f.legal_mask(leaf.state) for _, leaf in unique_eval]
-            )
-            masks_t: torch.Tensor = torch.from_numpy(masks_np).to(policy_t.device)
-
-            values_t: torch.Tensor = value_to_scalar(
-                value_t, mode=self.args.get("value_scalar", "expected")
-            ).reshape(-1, 1)                                    # (B, 1) on GPU
-            masked_logits: torch.Tensor = policy_t.masked_fill(~masks_t, float("-inf"))
-            policies_t: torch.Tensor = torch.softmax(masked_logits, dim=1)  # (B, 4672)
-
-            # WDL probs ride along in the same single GPU→CPU sync so we can
-            # cache them on the leaf for variance-band rendering. For non-WDL
-            # heads (single scalar) we skip this slot and `wdl_probs` is None.
-            is_wdl: bool = value_t.shape[-1] == 3
-            if is_wdl:
-                wdl_t: torch.Tensor = torch.softmax(value_t, dim=-1)  # (B, 3)
-                combined: np.ndarray = torch.cat(
-                    [values_t, wdl_t, policies_t], dim=1
-                ).cpu().numpy()
-                values: np.ndarray = combined[:, 0]
-                wdl_probs: np.ndarray | None = combined[:, 1:4]
-                policies: np.ndarray = combined[:, 4:]
-            else:
-                combined = torch.cat(
-                    [values_t, policies_t], dim=1
-                ).cpu().numpy()
-                values = combined[:, 0]
-                wdl_probs = None
-                policies = combined[:, 1:]
-
-            for i, (sim_idx, leaf) in enumerate(unique_eval):
-                val = values[i]
-                pol = policies[i]
-                mask_row = masks_np[i]
-                if leaf.raw_policy is None:
-                    leaf.raw_policy = pol
-                    leaf.policy = pol.copy()
-                    leaf.n_legal = int(mask_row.sum())
-                    leaf.raw_nn_value = float(val)
-                    if wdl_probs is not None:
-                        leaf.raw_nn_wdl = (
-                            float(wdl_probs[i, 0]),
-                            float(wdl_probs[i, 1]),
-                            float(wdl_probs[i, 2]),
-                        )
-                path, _, _, _ = in_flight[sim_idx]
-                in_flight[sim_idx] = (path, leaf, "evaluated", float(val))
-
-        # Phase 3: backprop + virtual-stat revert + proven-value propagation.
-        # Every in-flight sim -- whether successfully backpropagated or skipped
-        # -- MUST revert both virtual_loss (-1) and virtual_Q (-mu_used) on
-        # every (node, mu_used) pair in its path, or the in-flight stats leak
-        # into future batches and corrupt selection.
         gamma: float = self.args.get("discount", 1.0)
         effective: int = 0
         for sim_idx, (path, leaf, _status, value) in enumerate(in_flight):
-            if sim_idx in skip or value is None:
-                # Duplicate (or unexpected): undo virtual stats, don't backprop.
+            if value is None:
+                # No value available (shouldn't normally happen): revert virtual
+                # stats only, don't backprop.
                 for n, mu_used in path:
                     if n.virtual_loss > 0:
                         n.virtual_loss -= 1
                         n.virtual_Q -= mu_used
                 continue
-            # Successful sim: real backprop + virtual revert in the same walk.
             sign: float = -1.0
             for n, mu_used in reversed(path):
                 n.N += 1
@@ -409,8 +324,16 @@ class BatchedMCTS:
             for n, _mu in reversed(path):
                 self._try_prove(n)
             effective += 1
-
         return effective
+
+    def _simulate_batch(self, root: Node, sims_remaining: int) -> int:
+        """Run up to `min(batch_size, sims_remaining)` parallel sims through the
+        three phases. Returns the number of sims backpropagated."""
+        batch_target: int = min(self.batch_size, sims_remaining)
+        in_flight = self._collect_batch(root, batch_target)
+        leaves = self._unique_needs_eval(in_flight)
+        leaf_value = evaluate_leaves(self.model, leaves, self.args)
+        return self._backprop_batch(in_flight, leaf_value)
 
     # ---------- top-level search ----------
 
@@ -422,6 +345,8 @@ class BatchedMCTS:
         info_interval_s: float = 0.2,
     ) -> np.ndarray:
         root_state = state.copy()
+        if not self.args.get("tree_reuse", True):
+            self.root = None          # reuse disabled -> always search a fresh tree
         if self.root is not None:
             self.update_root(state, move_counter)
 
@@ -435,34 +360,35 @@ class BatchedMCTS:
             min_depth = 0
         else:
             min_depth = self.root.depth
+            # Reused subtree: refresh rep_counts across the whole subtree against
+            # the current external counter (stored values are relative to a prior
+            # root). Fixes 3-fold/terminal detection deep in the reused tree.
+            old_root_rep = self.root.rep_count
+            self._refresh_rep_counts(self.root)
+            if self.args.get("input_planes") == 119 and self.root.rep_count != old_root_rep:
+                self.root.expand_lazy(self.model)
 
-        # Dirichlet noise over LEGAL moves only (sampling over the full 4672
-        # action space would waste ~99% of the noise mass on illegal indices).
-        eps = self.args["dirichlet_epsilon"]
-        assert self.root.raw_policy is not None
-        if eps > 0:
-            legal_idx = np.nonzero(self.root.raw_policy)[0]
-            if len(legal_idx) > 0:
-                noise = np.random.dirichlet([self.args["dirichlet_alpha"]] * len(legal_idx))
-                mixed = self.root.raw_policy.copy()
-                mixed[legal_idx] = (1 - eps) * mixed[legal_idx] + eps * noise
-                total = mixed.sum()
-                self.root.policy = mixed / total if total > 0 else mixed
-            else:
-                self.root.policy = self.root.raw_policy.copy()
-        else:
-            self.root.policy = self.root.raw_policy.copy()
+        self._apply_root_dirichlet()
 
         self._visited_depths.clear()
-        total_sims = int(self.args["num_simulation"])
+        base = int(self.args["num_simulation"])
+        es = bool(self.args.get("early_stop", False))
+        # Floor defaults to one batch so the eval/PV isn't from a near-empty search.
+        min_sims = max(int(self.args.get("early_stop_min_sims", self.batch_size)), 1)
+        max_borrow = int(self.args.get("max_borrow", 0))
+        # Budget = base + borrowed-from-bank (capped). Easy positions early-stop
+        # and refund to the bank; hard ones spend it -- allocation is emergent.
+        target = base + (min(self.sim_bank, max_borrow) if es else 0)
         completed = 0
         t_start = time.monotonic()
         t_last_report = t_start
-        while completed < total_sims:
-            completed += self._simulate_batch(self.root, total_sims - completed)
+        while completed < target:
+            completed += self._simulate_batch(self.root, target - completed)
             # Update last_max_depth incrementally so live info_callback can read it.
             if self._visited_depths:
                 self.last_max_depth = max(self._visited_depths) - min_depth
+            if es and completed >= min_sims and self._early_stop_decided(completed, target):
+                break
             if info_callback is not None:
                 now = time.monotonic()
                 if now - t_last_report >= info_interval_s:
@@ -470,8 +396,10 @@ class BatchedMCTS:
                         info_callback(self, completed, now - t_start, self.last_max_depth)
                     except Exception:
                         # Never let monitoring break the search.
-                        pass
+                        _log.exception("info_callback failed (mid-search); continuing")
                     t_last_report = now
+        if es:
+            self.sim_bank = max(0, self.sim_bank + base - completed)
         self.last_max_depth = (
             max(self._visited_depths) - min_depth if self._visited_depths else 0
         )
@@ -480,29 +408,73 @@ class BatchedMCTS:
             try:
                 info_callback(self, completed, time.monotonic() - t_start, self.last_max_depth)
             except Exception:
-                pass
+                _log.exception("info_callback failed (final); continuing")
 
-        # Force-mate: bot wins by playing into a child whose player (opp) is
-        # proven losing -- child.proven_value == -1 in the perspective-free
-        # convention. child.Q is still from PARENT's (= bot's) POV; pick the
-        # child with the highest Q/N (most-confident win, shortest mate under
-        # depth discount).
-        action_probs = np.zeros(self.args["action_space"])
-        proven_winners = [
-            (action, child) for action, child in self.root.children.items()
-            if child.proven_value == -1 and child.N > 0
-        ]
-        if proven_winners:
-            best_action, _ = max(proven_winners, key=lambda ac: ac[1].Q / ac[1].N)
-            action_probs[best_action] = 1.0
-            self.last_was_proven_mate = True
-            return action_probs
+        return self._finalize_action_probs()
 
-        # Otherwise, visit-count distribution.
-        self.last_was_proven_mate = False
-        for action, child in self.root.children.items():
-            action_probs[action] = child.N
-        total = action_probs.sum()
-        if total > 0:
-            action_probs /= total
-        return action_probs
+
+class MultiGameSearcher:
+    """Run the search step for several concurrent games, coalescing ALL games'
+    leaf evaluations into one NN forward per simulation round.
+
+    A single game's batch (batch_size leaves) underfills the GPU; running G
+    games together puts ~G*batch_size leaves in each forward, which is what
+    actually saturates the GPU and gives the self-play throughput win. Each
+    game keeps its OWN independent BatchedMCTS tree and its own per-move sim
+    budget (PCR) / Dirichlet eps; only the NN forward is shared, so per-game
+    results are identical to searching each game on its own.
+
+    Usage (one move across all active games):
+        searcher = MultiGameSearcher(model)
+        pis = searcher.search_all(engines, states, move_counters)
+    Set each engine's args["num_simulation"] / ["dirichlet_epsilon"] before the
+    call (e.g. for PCR). Pass only the currently-active (non-terminal) games.
+    """
+
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def search_all(self, engines: list, states: list, move_counters: list) -> list:
+        if not engines:
+            return []
+        args0 = engines[0].args
+
+        # 1. Root setup. Reuse the prior tree where possible, build+expand fresh
+        #    roots otherwise, batching all fresh root evaluations into one forward.
+        roots_to_eval: list[Node] = []
+        for eng, st, mc in zip(engines, states, move_counters):
+            if eng.root is not None:
+                eng.update_root(st, mc)
+            if eng.root is None:
+                eng.root = Node(eng.args, st, mc, history=eng._ext_history)
+                eng.root.rep_count = eng._compute_rep_count(eng.root)
+            if eng.root.raw_policy is None:
+                roots_to_eval.append(eng.root)
+        evaluate_leaves(self.model, roots_to_eval, args0)
+        for eng in engines:
+            eng._apply_root_dirichlet()
+            eng._visited_depths.clear()
+
+        # 2. Simulation rounds. Each round: every active game selects a batch
+        #    (CPU), all their leaves are evaluated in ONE forward, then each game
+        #    backprops its own batch. Per-engine sim budgets may differ (PCR).
+        totals = [int(eng.args["num_simulation"]) for eng in engines]
+        completed = [0] * len(engines)
+        while any(completed[i] < totals[i] for i in range(len(engines))):
+            in_flights: list = [None] * len(engines)
+            all_leaves: list[Node] = []
+            for i, eng in enumerate(engines):
+                rem = totals[i] - completed[i]
+                if rem <= 0:
+                    continue
+                bt = min(eng.batch_size, rem)
+                infl = eng._collect_batch(eng.root, bt)
+                in_flights[i] = infl
+                all_leaves.extend(eng._unique_needs_eval(infl))
+            leaf_value = evaluate_leaves(self.model, all_leaves, args0)
+            for i, eng in enumerate(engines):
+                if in_flights[i] is not None:
+                    completed[i] += eng._backprop_batch(in_flights[i], leaf_value)
+
+        # 3. Finalise each game's move distribution.
+        return [eng._finalize_action_probs() for eng in engines]

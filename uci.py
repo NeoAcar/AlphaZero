@@ -42,6 +42,7 @@ import torch
 from alphazero import utils as f
 #from alphazero.mcts import MCTS
 from alphazero.batched_mcts import BatchedMCTS as MCTS
+from alphazero.mcts import _amp_ctx
 from alphazero.nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
 
 
@@ -55,6 +56,10 @@ PLAYER_TYPES = {"mcts", "policy_only", "value_only"}
 
 
 torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    # TF32 on cuDNN convolutions + autotune for the static inference shapes.
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
 
 ENGINE_NAME = "AlphaZeroBot"
@@ -129,8 +134,17 @@ class UciEngine:
         # Engine-driven background pondering. NOT the same as the standard UCI
         # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
         # disables by default). Rename avoids the conflict.
-        "BackgroundPonder": "true",
-        "PonderMaxSims": 1800,
+        "BackgroundPonder": "false",
+        "PonderMaxSims": 3600,
+        # Early stop: cut a search once the most-visited move can't be overtaken
+        # within the remaining sims, and bank the saved sims to spend on harder
+        # positions later (up to MaxBorrow extra on any single move). Play-only;
+        # never used in self-play. MaxBorrow 0 = early-stop without lending.
+        "EarlyStop": "false",
+        "MaxBorrow": 4800,
+        # Reuse the search tree (incl. the pondered subtree) across moves.
+        # false = fresh tree every move (for A/B testing reuse's effect).
+        "TreeReuse": "true",
     }
     OPT_TYPES = {
         "Type": ("string", None, None),
@@ -146,6 +160,9 @@ class UciEngine:
         "CFPU": ("string", None, None),
         "BackgroundPonder": ("string", None, None),
         "PonderMaxSims": ("spin", 0, 1000000),
+        "EarlyStop": ("string", None, None),
+        "MaxBorrow": ("spin", 0, 1000000),
+        "TreeReuse": ("string", None, None),
     }
 
     def __init__(self) -> None:
@@ -154,6 +171,9 @@ class UciEngine:
         self.model = None
         self.loaded_arch: str | None = None
         self.loaded_checkpoint: str | None = None
+        # Plane count of the loaded model; set in _ensure_loaded. Initialised so
+        # policy/value paths that read it never hit AttributeError before a load.
+        self.loaded_in_channels: int = 19
         self.mcts: MCTS | None = None
         self.real_board = chess.Board()
         self.mirror_state = chess.Board()
@@ -193,10 +213,43 @@ class UciEngine:
         # crash / OOM that bricks the engine for the rest of the session). Both
         # paths must hold this lock around their search() call.
         self._model_lock = threading.Lock()
+        # Serializes model (re)loading so a background warm-up thread and the
+        # foreground `go` never load at the same time / double-load.
+        self._load_lock = threading.Lock()
+        self._warm_thread: threading.Thread | None = None
 
     # ---------- model / mcts plumbing ----------
 
     def _ensure_loaded(self) -> None:
+        """Load (or refresh) the model, holding the load lock so a concurrent
+        background warm-up and the foreground go() coordinate safely."""
+        with self._load_lock:
+            self._load_locked()
+
+    def _safe_ensure_loaded(self) -> None:
+        """_ensure_loaded that never raises -- for the background warm-up thread
+        (a load failure there must not crash the process; go() will retry)."""
+        try:
+            self._ensure_loaded()
+        except Exception as e:
+            log(f"background warm-up failed (will retry on go): {e}")
+
+    def _warm_async(self) -> None:
+        """Kick off model load + compile + warm-up in a background daemon thread
+        so the first `go` doesn't pay the ~20s JIT trace on the clock. Idempotent:
+        no-op if the right model is already loaded or a warm-up is in flight."""
+        ckpt = str(self.options["Checkpoint"])
+        arch = str(self.options["Architecture"]).lower()
+        if (self.model is not None and self.loaded_checkpoint == ckpt
+                and self.loaded_arch == arch):
+            return
+        if self._warm_thread is not None and self._warm_thread.is_alive():
+            return
+        self._warm_thread = threading.Thread(target=self._safe_ensure_loaded, daemon=True)
+        self._warm_thread.start()
+        log("background warm-up started")
+
+    def _load_locked(self) -> None:
         ckpt = str(self.options["Checkpoint"])
         arch = str(self.options["Architecture"]).lower()
         if self.model is not None and self.loaded_checkpoint == ckpt and self.loaded_arch == arch:
@@ -213,6 +266,8 @@ class UciEngine:
         log(f"  input_planes = {in_ch}")
         model = ARCHITECTURES[arch](in_channels=in_ch).to(self.device)
         model.load_state_dict(state["model_state_dict"])
+        if self.device.type == "cuda":
+            model = model.to(memory_format=torch.channels_last)
         model.eval()
         self.loaded_in_channels = in_ch
         try:
@@ -227,7 +282,9 @@ class UciEngine:
                 chess.Board(), 0,
                 history=([] if in_ch == 119 else None),
             ).unsqueeze(0).to(self.device)
-            with torch.inference_mode():
+            if self.device.type == "cuda":
+                real_one = real_one.contiguous(memory_format=torch.channels_last)
+            with torch.inference_mode(), _amp_ctx(self.device):
                 _ = model(real_one)
             log("torch.compile + warm-up done")
         except Exception as e:
@@ -255,24 +312,34 @@ class UciEngine:
             # 19 (legacy) or 119 (8-frame history) -- decided when the
             # checkpoint was loaded. MCTS routes board_to_matrix accordingly.
             "input_planes": getattr(self, "loaded_in_channels", 19),
+            # Early-stop + sim-bank (play only; never set by self-play).
+            "early_stop": str(self.options["EarlyStop"]).lower() == "true",
+            "max_borrow": int(self.options["MaxBorrow"]),
+            "tree_reuse": str(self.options["TreeReuse"]).lower() == "true",
         }
         assert self.model is not None
-        first_build = self.mcts is None
+        # Reuse the existing engine when the model is unchanged so the search
+        # tree (tree-reuse + the pondered subtree) AND the early-stop sim bank
+        # survive across moves -- otherwise both are thrown away every move.
+        # update_root() resets safely if the new position isn't in the tree.
+        # Only rebuild on first use or after a checkpoint/architecture reload.
+        if self.mcts is not None and self.mcts.model is self.model:
+            self.mcts.args.update(args)
+            return
         self.mcts = MCTS(args, self.model)
         # MCTS pipeline pre-warm on first build. The forward warm-up alone
         # doesn't cover the masked_fill/softmax-with-inf, torch.cat + cpu(),
         # and legal_mask numpy paths that fire only on the first real search.
         # A 4-sim throwaway absorbs ~6s into isready so move 1 isn't stalled.
-        if first_build:
-            try:
-                orig_sims = args["num_simulation"]
-                args["num_simulation"] = 4
-                self.mcts.search(chess.Board(), 0)
-                args["num_simulation"] = orig_sims
-                self.mcts.root = None
-                log("mcts pre-warm done")
-            except Exception as e:
-                log(f"mcts pre-warm skipped: {e}")
+        try:
+            self.mcts.args["num_simulation"] = 4
+            self.mcts.search(chess.Board(), 0)
+            self.mcts.args["num_simulation"] = int(self.options["Sims"])
+            self.mcts.root = None
+            self.mcts.sim_bank = 0
+            log("mcts pre-warm done")
+        except Exception as e:
+            log(f"mcts pre-warm skipped: {e}")
 
     # ---------- position tracking ----------
 
@@ -329,9 +396,13 @@ class UciEngine:
                 action = None
         # Append the OLD canonical board to history BEFORE push+mirror.
         # Keep at most 7 entries -- 119-plane uses 8 frames total (current + 7).
-        self._mirror_history.append(self.mirror_state.copy())
-        if len(self._mirror_history) > 7:
-            self._mirror_history.pop(0)
+        # Only maintain history for 119-plane models (it's unused by 19-plane).
+        # Default to accumulating when the plane count isn't known yet (model
+        # not loaded), so we never lose history a 119-plane model would need.
+        if getattr(self, "loaded_in_channels", 119) == 119:
+            self._mirror_history.append(self.mirror_state.copy())
+            if len(self._mirror_history) > 7:
+                self._mirror_history.pop(0)
         self.mirror_state.push_uci(mir_uci)
         self.mirror_state = self.mirror_state.mirror()
         self.move_counter += 1
@@ -377,16 +448,24 @@ class UciEngine:
         send("uciok")
 
     def cmd_isready(self, _args: list[str]) -> None:
-        # Don't load the model here -- lichess-bot's SimpleEngine.popen_uci
-        # caps the full uci/isready handshake at 60s, and torch.compile JIT
-        # on first launch easily exceeds that. cmd_go calls _ensure_loaded
-        # lazily, so the first move pays the load cost (no tight timeout there).
+        # Don't BLOCK here -- lichess-bot's SimpleEngine.popen_uci caps the full
+        # uci/isready handshake at 60s and the torch.compile JIT can exceed it.
+        # Answer immediately, then warm the model in the BACKGROUND (off the
+        # clock) so the first move usually finds it ready. cmd_go also calls
+        # _ensure_loaded as a fallback if warm-up hasn't finished.
         send("readyok")
+        self._warm_async()
 
     def cmd_ucinewgame(self, _args: list[str]) -> None:
         self._stop_pondering()
         self._reset_position()
+        # New game: drop the reused tree and the sim bank (both are per-game).
+        if self.mcts is not None:
+            self.mcts.root = None
+            self.mcts.sim_bank = 0
         log("ucinewgame: reset")
+        # Warm up now (off the clock); options are final by this point.
+        self._warm_async()
 
     def cmd_setoption(self, args: list[str]) -> None:
         self._stop_pondering()
@@ -410,6 +489,9 @@ class UciEngine:
                 log(f"bad int for {name}: {value!r}")
                 return
         else:
+            if name == "ValueScalar" and value not in ("expected", "win_only"):
+                log(f"bad ValueScalar {value!r}; expected 'expected' or 'win_only'")
+                return
             self.options[name] = value
         log(f"set {name} = {self.options[name]!r}")
         # If model checkpoint or architecture changed, force reload on next isready/go
@@ -495,14 +577,20 @@ class UciEngine:
             "bot_color": self._bot_color,
             "ply": self.move_counter,
         })
-        self._ensure_loaded()
-        assert self.model is not None
         ptype = str(self.options["Type"]).lower()
         if ptype not in PLAYER_TYPES:
             log(f"unknown Type {ptype!r}; falling back to mcts")
             ptype = "mcts"
 
+        # Produce a move. EVERY failure path (model load, search, illegal move)
+        # is funnelled into a guaranteed-legal bestmove below -- the engine must
+        # NEVER finish cmd_go without emitting exactly one `bestmove`, or the GUI
+        # / lichess-bot hangs waiting for it ("bot doesn't play").
+        real_uci = None
         try:
+            self._ensure_loaded()          # lazy fallback if warm-up hasn't finished
+            if self.model is None:
+                raise RuntimeError("model failed to load")
             if ptype == "mcts":
                 real_uci = self._go_mcts()
             elif ptype == "policy_only":
@@ -510,36 +598,49 @@ class UciEngine:
             else:  # value_only
                 real_uci = self._go_value_only()
         except Exception as e:
-            log(f"search failed ({ptype}): {e}\n{traceback.format_exc()}")
-            legal = list(self.real_board.legal_moves)
-            real_uci = legal[0].uci() if legal else "0000"
+            log(f"go failed ({ptype}): {e}\n{traceback.format_exc()}")
+            real_uci = None
 
-        # Sanity: verify legal on real board; fall back to any legal otherwise.
-        try:
-            move = chess.Move.from_uci(real_uci)
-            if move not in self.real_board.legal_moves:
-                log(f"chose illegal {real_uci}; falling back to a legal move")
-                real_uci = next(iter(self.real_board.legal_moves)).uci()
-        except Exception:
-            log(f"chose unparseable {real_uci}; bailing")
-            legal = list(self.real_board.legal_moves)
-            real_uci = legal[0].uci() if legal else "0000"
+        real_uci = self._ensure_legal_move(real_uci)
+
         # Dashboard: emit the bot's move now (post-move FEN, eval, duration)
         # so the browser shows it as a distinct frame rather than getting
         # batched together with the opponent's reply in the next position cmd.
         self._last_bot_chosen_uci = real_uci
-        self._emit_bot_move(real_uci)
+        try:
+            self._emit_bot_move(real_uci)
+        except Exception as e:
+            log(f"emit_bot_move failed: {e}")
         send(f"bestmove {real_uci}")
         # Pre-push the bot's own move so the MCTS root advances to "after our
         # move." The next `position` from the GUI will see this move already
         # in _move_history and only push opp's reply on top -- existing
         # extension detection in cmd_position handles that case.
-        if ptype == "mcts":
+        if ptype == "mcts" and real_uci != "0000":
             try:
                 self._push_move(real_uci)
             except Exception as e:
                 log(f"local push after bestmove failed: {e}")
-            self._start_pondering()
+            try:
+                self._start_pondering()
+            except Exception as e:
+                log(f"start pondering failed: {e}")
+
+    def _ensure_legal_move(self, real_uci: str | None) -> str:
+        """Return `real_uci` if it's legal on the real board; else any legal
+        move; else '0000' (UCI null = no legal move / game already over). This
+        is the single guarantee that cmd_go always has something legal to send."""
+        if real_uci:
+            try:
+                if chess.Move.from_uci(real_uci) in self.real_board.legal_moves:
+                    return real_uci
+            except Exception:
+                pass
+            log(f"chose illegal/unparseable {real_uci!r}; falling back to a legal move")
+        try:
+            return next(iter(self.real_board.legal_moves)).uci()
+        except StopIteration:
+            return "0000"
 
     def _start_pondering(self) -> None:
         """Spawn a background thread that keeps running MCTS sims from the
@@ -550,6 +651,12 @@ class UciEngine:
         bp = str(self.options.get("BackgroundPonder", "true")).lower()
         if bp != "true":
             log(f"ponder: skipped (BackgroundPonder={bp!r})")
+            return
+        # Pondering only pays off if its grown tree is reused next move; with
+        # TreeReuse off the next search discards it, so pondering would just burn
+        # GPU on the opponent's clock for nothing. No-op in that case.
+        if str(self.options.get("TreeReuse", "true")).lower() != "true":
+            log("ponder: skipped (TreeReuse is off -- pondered tree would be discarded)")
             return
         if self.mcts is None or self.mcts.root is None:
             log("ponder: skipped (mcts root is None)")
@@ -585,6 +692,14 @@ class UciEngine:
         # at 64 sims/chunk with batch=8 that's ~240ms worst-case lag, fine.
         chunk = max(64, int(self.mcts.args.get("batch_size", 8)) * 8)
         orig_sims = int(self.mcts.args["num_simulation"])
+        # CRITICAL: pondering runs on the OPPONENT's clock. It must NOT touch the
+        # foreground early-stop sim bank -- otherwise it banks free opp-time sims
+        # that the next foreground move then spends on OUR clock (flagging). Run
+        # ponder searches with early-stop OFF so the bank is fed/spent by real
+        # moves only. (Pondering also genuinely wants to keep searching to fill
+        # the opponent's time, not early-stop.)
+        orig_es = self.mcts.args.get("early_stop", False)
+        self.mcts.args["early_stop"] = False
         done = 0
         t0 = time.monotonic()
         try:
@@ -601,6 +716,15 @@ class UciEngine:
                 done += chunk
                 elapsed = time.monotonic() - t0
                 root_N = self.mcts.root.N if self.mcts.root is not None else 0
+                # Ponder root = the post-our-move position (opponent to move), so
+                # its top children are the bot's PREDICTED opponent replies. Reuse
+                # _top_k_children (frame-correct for the current real/mirror state).
+                opp_top = []
+                try:
+                    opp_top = [{"uci": u, "N": n, "q": qv}
+                               for u, n, qv in self._top_k_children(self.mcts, k=3)]
+                except Exception:
+                    pass
                 post_event({
                     "kind": "ponder_tick",
                     "status": "running",
@@ -608,11 +732,13 @@ class UciEngine:
                     "elapsed_s": round(elapsed, 3),
                     "nps": int(done / max(elapsed, 0.001)),
                     "root_N": root_N,
+                    "top": opp_top,
                 })
         except Exception as e:
             log(f"ponder thread crashed: {e}\n{traceback.format_exc()}")
         finally:
             self.mcts.args["num_simulation"] = orig_sims
+            self.mcts.args["early_stop"] = orig_es
             log(f"ponder stopped after {done} sims")
             root_N = (
                 self.mcts.root.N
@@ -676,6 +802,9 @@ class UciEngine:
             nn_std = self._pending_bot_eval.get("nn_std")
             if nn_std is not None:
                 evt["nn_std"] = nn_std
+            mate = self._pending_bot_eval.get("mate")
+            if mate is not None:
+                evt["mate"] = mate
         post_event(evt)
 
     # ---------- per-Type search backends ----------
@@ -739,7 +868,24 @@ class UciEngine:
             "q": q, "win_prob": win_prob, "cp": cp, "duration": duration,
             "nn_win_prob": nn_win_prob,
             "nn_std": nn_std,
+            "mate": self._mate_in(),          # signed mate-in-N, or None
         }
+
+    # ---------- mate-distance from the proof tree ----------
+
+    def _mate_in(self) -> int | None:
+        """Signed mate distance in MOVES from the current root, or None.
+        +N = bot mates in N, -N = bot is mated in N. Used to show 'M7' on the
+        dashboard instead of a saturated centipawn value. Mate-depth walk lives
+        in MCTSBase (shared with the fastest-mate move selection)."""
+        mcts = self.mcts
+        if mcts is None or mcts.root is None or mcts.root.proven_value in (None, 0):
+            return None
+        plies = mcts._mate_plies(mcts.root)
+        if plies is None:
+            return None
+        moves = (plies + 1) // 2            # ceil(plies / 2)
+        return moves if mcts.root.proven_value == 1 else -moves
 
     # ---------- live monitoring during MCTS search ----------
 
@@ -834,6 +980,7 @@ class UciEngine:
             "elapsed_s": round(elapsed_s, 3),
             "pv": pv,
             "top": [{"uci": u, "N": n, "q": qv} for u, n, qv in top],
+            "mate": self._mate_in(),    # show 'M7' live if a mate is already proven
         })
 
     def _emit_mcts_info(self, action: int, real_uci: str) -> None:
@@ -906,10 +1053,12 @@ class UciEngine:
             self.mirror_state, self.move_counter, history=hist,
             rep_count=max(rep_now, 1),
         ).unsqueeze(0).to(self.device)
-        with self._model_lock:
+        if self.device.type == "cuda":
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
+        with self._model_lock, _amp_ctx(self.device):
             _value, policy_logits = self.model(inputs)
-        mask = torch.from_numpy(f.legal_mask(self.mirror_state)).to(self.device)
-        masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
+        mask = torch.from_numpy(f.legal_mask(self.mirror_state)).to(self.device, non_blocking=True)
+        masked_logits = policy_logits.squeeze(0).float().masked_fill(~mask, float("-inf"))
         probs = torch.softmax(masked_logits, dim=0).cpu().numpy()
         action = self._select_action(probs)
         mir_uci = f.alphazero_to_move(action, self.mirror_state)
@@ -940,11 +1089,13 @@ class UciEngine:
             inputs = torch.stack(
                 [f.prepare_input(s, self.move_counter + 1) for s in post_states]
             ).to(self.device)
-        with self._model_lock:
+        if self.device.type == "cuda":
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
+        with self._model_lock, _amp_ctx(self.device):
             values_t, _ = self.model(inputs)
         mode = str(self.options["ValueScalar"])
         # NN values are from post-move state's player-to-move perspective = opponent. Negate.
-        opp_values = value_to_scalar(values_t, mode=mode).cpu().numpy().flatten()
+        opp_values = value_to_scalar(values_t.float(), mode=mode).cpu().numpy().flatten()
         mover_values = -opp_values
         # Mate-in-1 wins outright.
         for i, ps in enumerate(post_states):

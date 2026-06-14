@@ -7,7 +7,7 @@ See players.py and configs/ for the available types and templates.
 Usage:
     uv run python match.py --player1 configs/new_mcts.json --player2 configs/random.json --games 20
 
-Players alternate colours (player1 plays white in games 0, 2, ...).
+Players alternate colours (player1 plays white in odd-numbered games: 1, 3, 5, ...).
 """
 import argparse
 import json
@@ -55,6 +55,10 @@ def play_game(p1, p2, p1_color: chess.Color, truncation: int) -> tuple[int, ches
     move_counter = 0
     # Per-game repetition counter (see alphazero/mcts.py rationale).
     rep_counter: dict = {mirrored_state._transposition_key(): 1}
+    # Chronological list of prior canonical boards (excluding the current root),
+    # fed to MCTS so 119-plane models get their 8-frame history context. Without
+    # this, fresh roots would start with zero-padded history (weaker search).
+    history: list = []
 
     while not f.game_result(
         mirrored_state, move_counter, truncation,
@@ -63,7 +67,12 @@ def play_game(p1, p2, p1_color: chess.Color, truncation: int) -> tuple[int, ches
         active = p1 if real_board.turn == p1_color else p2
         if hasattr(active, "mcts"):
             active.mcts.set_rep_counter(rep_counter)
+            active.mcts.set_history(history)
         real_uci, mir_uci = active.select_move(real_board, mirrored_state, move_counter)
+        # The canonical state we just searched from becomes history for the next root.
+        history.append(mirrored_state.copy())
+        if len(history) > 7:
+            history.pop(0)
         real_board.push_uci(real_uci)
         mirrored_state.push_uci(mir_uci)
         mirrored_state = mirrored_state.mirror()

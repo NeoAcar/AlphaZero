@@ -6,7 +6,7 @@ lineage. Every subsequent checkpoint is the output of a training run --
 this script is never invoked again unless you start a brand-new lineage.
 
 Usage:
-    uv run python bootstrap.py \\
+    uv run python scripts/bootstrap.py \\
         --architecture seresnetwdl \\
         --in-channels 119 \\
         --output models/v00_seed.pth

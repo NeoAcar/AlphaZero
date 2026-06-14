@@ -343,10 +343,22 @@ UCI_MONITOR_URL= ./alphazero_uci.sh
 - **`torch.compile(mode="reduce-overhead")`** — applied in
   `alphazero/players.py` model load paths. ~1.5-3× speedup at batch=1 GPU.
   First forward is slow (JIT trace ~20s), so we warm up immediately after
-  compile.
-- **`torch.set_float32_matmul_precision("high")`** — enables TF32 on
-  Ampere+ GPUs. ~2× matmul speedup, ~1e-3 logit precision loss
-  (irrelevant for move selection). Set globally in `alphazero/players.py`.
+  compile. **`uci.py` deliberately uses the default compile mode** (no
+  `reduce-overhead`): its CUDA graphs would be bound to the recording thread
+  and crash the background ponder thread that shares the model.
+- **`torch.set_float32_matmul_precision("high")` + cuDNN TF32/benchmark** —
+  enables TF32 on Ampere+ GPUs (matmul *and* convolutions via
+  `torch.backends.cudnn.allow_tf32`), plus `cudnn.benchmark` autotune for the
+  static inference shapes. Set globally in `players.py`, `uci.py`, `train.py`.
+- **fp16 autocast + `channels_last`** — inference forwards (MCTS, batched MCTS,
+  uci, value/policy players) run under `torch.autocast(fp16)` and the conv
+  models/inputs use `channels_last`, both CUDA-only (no-ops on CPU). Training
+  uses AMP (`autocast` + `GradScaler`) — toggle with `--no-amp` /
+  `--no-channels-last`.
+- **Cross-game batched self-play** — `selfplay.py --concurrent-games N` plays N
+  games at once, coalescing every game's MCTS leaf evals into one NN forward per
+  round (`MultiGameSearcher`). Keeps the GPU saturated (~2-5× throughput) with
+  per-game results identical to playing them separately.
 - **Batched MCTS** (`"batched": true` in config) — 5-10× faster per
   wall-clock but ~weaker per-sim. Best for self-play throughput, not
   per-game strength matches.

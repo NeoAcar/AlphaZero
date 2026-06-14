@@ -239,6 +239,7 @@ def process_chunk(cfg: dict) -> dict:
     total_games = 0
     total_positions = 0
     total_failures = 0
+    total_missing_wdl = 0
     games_skipped_for_bad_header = 0
     t0 = time.time()
 
@@ -299,12 +300,18 @@ def process_chunk(cfg: dict) -> dict:
                 )
                 if failed:
                     total_failures += 1
+                # NaN sentinel (NAN_WDL) means the engine gave no WDL for this
+                # position; track it so data quality is auditable.
+                if wdl is not None and len(wdl) and wdl[0] != wdl[0]:
+                    total_missing_wdl += 1
 
                 # Quantize to uint8 and bit-pack the mask immediately, so per-shard
                 # accumulation memory stays ~5x smaller (uint8 boards + packed
                 # masks instead of float32 + bool arrays in Python lists).
+                # board_to_matrix output is clamped to [0,1] in utils, so the
+                # earlier defensive np.clip is redundant here.
                 b = f.board_to_matrix(mirror_board, move_counter)
-                shard_boards.append((np.clip(b, 0.0, 1.0) * 255.0).round().astype(np.uint8))
+                shard_boards.append((b * 255.0).round().astype(np.uint8))
                 shard_masks.append(np.packbits(f.legal_mask(mirror_board)))
                 mover_was_white = (move_counter % 2 == 0)
                 mir_move_str = move_str if mover_was_white else f.mirror_move(move_str)
@@ -362,10 +369,12 @@ def process_chunk(cfg: dict) -> dict:
 
     log(f"done in {time.time()-t0:.0f}s: {total_games} games, "
         f"{total_positions} positions, {total_failures} fails, "
+        f"{total_missing_wdl} missing-WDL, "
         f"{games_skipped_for_bad_header} bad headers, {shard_idx} shards")
 
     return {"games": total_games, "positions": total_positions,
-            "shards": shard_idx, "failures": total_failures}
+            "shards": shard_idx, "failures": total_failures,
+            "missing_wdl": total_missing_wdl}
 
 
 def main() -> None:
@@ -446,9 +455,11 @@ def main() -> None:
     total_positions = sum(r["positions"] for r in results)
     total_shards = sum(r["shards"] for r in results)
     total_failures = sum(r["failures"] for r in results)
+    total_missing_wdl = sum(r.get("missing_wdl", 0) for r in results)
     print(f"\nAll workers done in {elapsed:.0f}s")
     print(f"  games: {total_games}, positions: {total_positions}, "
-          f"shards: {total_shards}, failures: {total_failures}")
+          f"shards: {total_shards}, failures: {total_failures}, "
+          f"missing-WDL: {total_missing_wdl}")
     print(f"  effective throughput: {total_positions/elapsed:.0f} positions/sec")
 
 

@@ -111,7 +111,7 @@ def build_mcts(model: torch.nn.Module, in_channels: int, batch_size: int,
     args = dict(DEFAULT_MCTS_ARGS)
     args["device"]        = device
     args["batch_size"]    = batch_size
-    args["truncation"]    = 1000               # we apply our own max_plies cap
+    args["truncation_halfmoves"] = 1000        # we apply our own max_plies cap
     args["input_planes"]  = in_channels
     args["num_simulation"] = 1                  # placeholder; overridden per-move
     return MCTS(args, model)
@@ -296,6 +296,129 @@ def play_one_game(mcts: MCTS, in_channels: int, cli, rng: np.random.Generator,
         mcts.apply_action(action)
 
 
+def _terminal_reason(board: chess.Board, move_counter: int, max_plies: int,
+                     rep_now: int) -> str:
+    """Categorise a terminal position for analytics (mirrors play_one_game)."""
+    if board.is_checkmate():
+        return "checkmate"
+    if move_counter >= max_plies:
+        return "truncation"
+    if rep_now >= 3:
+        return "3-fold"
+    if board.is_fifty_moves():
+        return "50-move"
+    return "draw_rule"
+
+
+def play_games_multigame(engines: list, in_channels: int, cli, rng,
+                         allow_resign: list[bool]) -> list:
+    """Play len(engines) self-play games concurrently, coalescing every active
+    game's MCTS leaf evaluations into a single NN forward per simulation round
+    (via MultiGameSearcher). Returns a list of per-game result tuples in the
+    same format as play_one_game: (positions, plies, final_value, reason,
+    real_moves). Behaviour per game is identical to play_one_game; only the GPU
+    batching differs."""
+    from alphazero.batched_mcts import MultiGameSearcher
+    searcher = MultiGameSearcher(engines[0].model)
+    use_history = (in_channels == 119)
+
+    games = []
+    for e, ar in zip(engines, allow_resign):
+        e.root = None
+        b = chess.Board()
+        games.append({
+            "eng": e, "board": b, "mc": 0,
+            "rep": {b._transposition_key(): 1}, "hist": [],
+            "consec_low": 0, "positions": [], "real_moves": [],
+            "allow_resign": ar, "done": False, "result": None,
+        })
+
+    while not all(g["done"] for g in games):
+        # 1. Terminal check + PCR / search setup for every still-active game.
+        active = []
+        for g in games:
+            if g["done"]:
+                continue
+            rep_now = g["rep"].get(g["board"]._transposition_key(), 0)
+            val, terminal = f.game_result(g["board"], g["mc"], cli.max_plies, rep_now)
+            if terminal:
+                reason = _terminal_reason(g["board"], g["mc"], cli.max_plies, rep_now)
+                g["done"] = True
+                g["result"] = (g["positions"], g["mc"], val, reason, g["real_moves"])
+                continue
+            use_high = rng.random() < cli.high_prob
+            e = g["eng"]
+            e.args["num_simulation"]    = cli.high_sims if use_high else cli.low_sims
+            e.args["dirichlet_epsilon"] = cli.dirichlet_eps if use_high else 0.0
+            e.set_rep_counter(g["rep"])
+            if use_history:
+                e.set_history(g["hist"])
+            g["use_high"] = use_high
+            g["rep_now"] = rep_now
+            active.append(g)
+        if not active:
+            break
+
+        # 2. One batched search step across all active games.
+        pis = searcher.search_all(
+            [g["eng"] for g in active],
+            [g["board"] for g in active],
+            [g["mc"] for g in active],
+        )
+
+        # 3. Per-game: record position, resign check, play the sampled move.
+        for g, pi in zip(active, pis):
+            e = g["eng"]
+            rep_now, use_high = g["rep_now"], g["use_high"]
+            board_planes = f.board_to_matrix(
+                g["board"], g["mc"],
+                history=(g["hist"] if use_history else None),
+                rep_count=max(rep_now, 1),
+            )
+            idx, val_arr = encode_pi_sparse(pi)
+            g["positions"].append({
+                "board": board_planes,
+                "pi_idx": idx, "pi_val": val_arr,
+                "is_high_sim": np.uint8(1 if use_high else 0),
+            })
+
+            if g["allow_resign"] and use_high:
+                v = root_value_from_pov(e)
+                if v < cli.resign_threshold:
+                    g["consec_low"] += 1
+                    if g["consec_low"] >= cli.resign_consecutive:
+                        g["done"] = True
+                        g["result"] = (g["positions"], g["mc"], -1, "resign", g["real_moves"])
+                        continue
+                else:
+                    g["consec_low"] = 0
+            else:
+                g["consec_low"] = 0
+
+            if g["mc"] < cli.temperature_moves:
+                action = sample_action(pi, cli.temperature, rng)
+            else:
+                action = int(np.argmax(pi))
+            uci_mirrored = f.alphazero_to_move(action, g["board"])
+            mover_was_white = (g["mc"] % 2 == 0)
+            uci_real = uci_mirrored if mover_was_white else f.mirror_move(uci_mirrored)
+            g["real_moves"].append(uci_real)
+
+            if use_history:
+                g["hist"].append(g["board"].copy())
+                if len(g["hist"]) > 7:
+                    g["hist"].pop(0)
+
+            g["board"].push_uci(uci_mirrored)
+            g["board"] = g["board"].mirror()
+            g["mc"] += 1
+            tk = g["board"]._transposition_key()
+            g["rep"][tk] = g["rep"].get(tk, 0) + 1
+            e.apply_action(action)
+
+    return [g["result"] for g in games]
+
+
 # ---------- session bookkeeping + serialisation -------------------------------
 
 def build_pgn(real_moves: list[str], headers: dict) -> str:
@@ -324,21 +447,11 @@ def per_position_zs(plies: int, final_value: int) -> list[float]:
     ]
 
 
-def write_session(out_dir: Path, ckpt_path: str, session_positions: list,
-                  game_pgns: list[str], session_stats: dict, cli) -> Path:
-    """Write the session's .pt + .pgn + .json side-car. Returns the .pt path."""
-    ckpt_dir = out_dir / checkpoint_dir_name(ckpt_path)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # Include microseconds + PID so multiple parallel selfplay.py processes
-    # writing into the same checkpoint dir never collide on filenames.
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    n_games = int(session_stats["meta"].get("games_completed", 0))
-    base = f"games_{ts}_pid{os.getpid()}_n{n_games}"
-    pt_path   = ckpt_dir / f"{base}.pt"
-    pgn_path  = ckpt_dir / f"{base}.pgn"
-    json_path = ckpt_dir / f"{base}.json"
-
+def _save_payload(pt_path: Path, pgn_path: Path, json_path: Path,
+                  session_positions: list, game_pgns: list[str],
+                  session_stats: dict) -> Path:
+    """Stack the session arrays and write the .pt + .pgn + .json side-cars to
+    the given paths. Returns the .pt path."""
     # Stack arrays. Boards stored uint8 (4x shrink); pi sparse; values float32.
     N = len(session_positions)
     boards_u8 = np.stack([np.clip(p["board"] * 255, 0, 255).astype(np.uint8)
@@ -368,6 +481,36 @@ def write_session(out_dir: Path, ckpt_path: str, session_positions: list,
     return pt_path
 
 
+def write_session(out_dir: Path, ckpt_path: str, session_positions: list,
+                  game_pgns: list[str], session_stats: dict, cli) -> Path:
+    """Write a session fragment under out_dir/<checkpoint_dir>/games_*.pt
+    (the default fragmented layout). Returns the .pt path."""
+    ckpt_dir = out_dir / checkpoint_dir_name(ckpt_path)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # Include microseconds + PID so multiple parallel selfplay.py processes
+    # writing into the same checkpoint dir never collide on filenames.
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    n_games = int(session_stats["meta"].get("games_completed", 0))
+    base = f"games_{ts}_pid{os.getpid()}_n{n_games}"
+    return _save_payload(
+        ckpt_dir / f"{base}.pt", ckpt_dir / f"{base}.pgn", ckpt_dir / f"{base}.json",
+        session_positions, game_pgns, session_stats,
+    )
+
+
+def write_flat(out_path: Path, session_positions: list, game_pgns: list[str],
+               session_stats: dict) -> Path:
+    """Write the whole session to a single .pt at exactly out_path (plus sibling
+    .pgn/.json). This is the flat layout runner.py expects (iter_dir/selfplay.pt);
+    selected via --output. Pair with --flush-every 0 so there's one file."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return _save_payload(
+        out_path, out_path.with_suffix(".pgn"), out_path.with_suffix(".json"),
+        session_positions, game_pgns, session_stats,
+    )
+
+
 # ---------- CLI + main loop ---------------------------------------------------
 
 def main() -> None:
@@ -379,6 +522,11 @@ def main() -> None:
     p.add_argument("--games", type=int, default=10, help="games to generate this session")
     p.add_argument("--output-dir", default="data/selfplay",
                    help="root dir; a per-checkpoint subdir is created automatically")
+    p.add_argument("--output", default=None,
+                   help="flat mode: write the whole session to this single .pt path "
+                        "(plus sibling .pgn/.json) instead of the fragmented --output-dir "
+                        "layout. Used by runner.py (iter_dir/selfplay.pt). Forces a single "
+                        "end-of-session write (overrides --flush-every).")
 
     # PCR (KataGo defaults for our scale: 1200/300, p=0.25).
     p.add_argument("--high-sims",   type=int,   default=1200)
@@ -404,12 +552,21 @@ def main() -> None:
                    help="plies of stochastic sampling at start (AZ-style)")
 
     p.add_argument("--batch-size", type=int, default=8, help="BatchedMCTS batch size")
+    p.add_argument("--concurrent-games", type=int, default=1,
+                   help="play this many games at once, coalescing all games' MCTS "
+                        "leaf evals into one NN forward per round (cross-game batching). "
+                        ">1 keeps the GPU busy for ~2-5x self-play throughput. Default 1.")
     p.add_argument("--flush-every", type=int, default=5,
                    help="write a fragment to disk after every N completed games. "
                         "Smaller = less work lost on Ctrl-C, more files. 0 disables "
                         "(only writes at session end). Default 5.")
     p.add_argument("--seed", type=int, default=None)
     cli = p.parse_args()
+
+    # Flat mode accumulates everything and writes one file at the end, so
+    # disable periodic fragment flushing.
+    if cli.output:
+        cli.flush_every = 0
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -496,10 +653,15 @@ def main() -> None:
                 **pending_stats,
             }
         }
-        pt_path = write_session(
-            Path(cli.output_dir), cli.checkpoint,
-            pending_positions, pending_pgns, frag_stats, cli,
-        )
+        if cli.output:
+            pt_path = write_flat(
+                Path(cli.output), pending_positions, pending_pgns, frag_stats,
+            )
+        else:
+            pt_path = write_session(
+                Path(cli.output_dir), cli.checkpoint,
+                pending_positions, pending_pgns, frag_stats, cli,
+            )
         fragments_written.append(pt_path)
         tqdm.write(f"  → flushed {pending_stats['games_completed']} games to {pt_path.name} "
                    f"({pt_path.stat().st_size / 1e6:.1f} MB)")
@@ -511,72 +673,97 @@ def main() -> None:
         pending_t_start = time.time()
         return pt_path
 
+    # Engine pool for concurrent self-play (all share the one compiled model).
+    n_concurrent = max(1, int(cli.concurrent_games))
+    engine_pool = ([mcts] if n_concurrent == 1
+                   else [build_mcts(model, in_ch, cli.batch_size, device)
+                         for _ in range(n_concurrent)])
+
     t_session = time.time()
-    pbar = tqdm(range(cli.games), desc="self-play", unit="game")
-    try:
-        for g in pbar:
-            allow_resign = (rng.random() >= cli.resign_disabled_fraction)
-            if not allow_resign:
-                pending_stats["resign_disabled_games"] += 1
-                total_stats["resign_disabled_games"] += 1
-            t0 = time.time()
-            positions, plies, final_value, reason, real_moves = play_one_game(
-                mcts, in_ch, cli, rng, allow_resign,
-            )
-            dt = time.time() - t0
+    pbar = tqdm(total=cli.games, desc="self-play", unit="game")
 
-            zs = per_position_zs(plies, final_value)
-            pending_positions.extend(positions)
-            pending_zs.extend(zs)
+    def record_game(round_idx: int, result, dt: float) -> None:
+        """Consume one play_one_game/play_games_multigame result tuple: append
+        positions + z-targets, update stats, build the PGN, advance the bar."""
+        positions, plies, final_value, reason, real_moves = result
+        zs = per_position_zs(plies, final_value)
+        pending_positions.extend(positions)
+        pending_zs.extend(zs)
 
-            hi_n = sum(1 for p in positions if p["is_high_sim"])
-            lo_n = len(positions) - hi_n
-            for s in (pending_stats, total_stats):
-                s["positions_total"] += len(positions)
-                s["games_completed"] += 1
-                s["high_sim_positions"] += hi_n
-                s["low_sim_positions"]  += lo_n
-                if final_value == -1:
-                    if reason == "checkmate":
-                        s["checkmated"] += 1
-                    elif reason == "resign":
-                        s["resigned"] += 1
-                    if plies % 2 == 0:
-                        s["wins_black"] += 1
-                    else:
-                        s["wins_white"] += 1
-                elif reason == "truncation":
-                    s["truncated"] += 1
+        hi_n = sum(1 for p in positions if p["is_high_sim"])
+        lo_n = len(positions) - hi_n
+        for s in (pending_stats, total_stats):
+            s["positions_total"] += len(positions)
+            s["games_completed"] += 1
+            s["high_sim_positions"] += hi_n
+            s["low_sim_positions"]  += lo_n
+            if final_value == -1:
+                if reason == "checkmate":
+                    s["checkmated"] += 1
+                elif reason == "resign":
+                    s["resigned"] += 1
+                if plies % 2 == 0:
+                    s["wins_black"] += 1
                 else:
-                    s["rule_draws"] += 1
-                    s["draws"] += 1
+                    s["wins_white"] += 1
+            elif reason == "truncation":
+                s["truncated"] += 1
+            else:
+                s["rule_draws"] += 1
+                s["draws"] += 1
 
-            pgn_headers = {
-                "Event":   "Self-play",
-                "Site":    "local",
-                "Date":    datetime.datetime.now().strftime("%Y.%m.%d"),
-                "Round":   str(g + 1),
-                "White":   "AZBot",
-                "Black":   "AZBot",
-                "Result":  ("1-0" if (final_value == -1 and plies % 2 == 1)
-                            else "0-1" if (final_value == -1 and plies % 2 == 0)
-                            else "1/2-1/2"),
-                "Plies":   str(plies),
-                "Reason":  reason,
-                "Sims":    f"{cli.high_sims}/{cli.low_sims}@p={cli.high_prob}",
-                "Ckpt":    Path(cli.checkpoint).name,
-            }
-            pending_pgns.append(build_pgn(real_moves, pgn_headers))
+        pgn_headers = {
+            "Event":   "Self-play",
+            "Site":    "local",
+            "Date":    datetime.datetime.now().strftime("%Y.%m.%d"),
+            "Round":   str(round_idx + 1),
+            "White":   "AZBot",
+            "Black":   "AZBot",
+            "Result":  ("1-0" if (final_value == -1 and plies % 2 == 1)
+                        else "0-1" if (final_value == -1 and plies % 2 == 0)
+                        else "1/2-1/2"),
+            "Plies":   str(plies),
+            "Reason":  reason,
+            "Sims":    f"{cli.high_sims}/{cli.low_sims}@p={cli.high_prob}",
+            "Ckpt":    Path(cli.checkpoint).name,
+        }
+        pending_pgns.append(build_pgn(real_moves, pgn_headers))
 
-            pbar.set_postfix(
-                plies=plies, reason=reason,
-                cm=total_stats["checkmated"], rs=total_stats["resigned"],
-                d=total_stats["draws"], t=total_stats["truncated"],
-                frag=pending_stats["games_completed"],
-                tdt=f"{time.time()-t_session:.0f}s",
-            )
-            tqdm.write(f"  game {g+1:>3}/{cli.games}: {plies:>3} plies, "
-                       f"{reason:<10} z_next={final_value:+d}  ({dt:5.1f}s)")
+        pbar.update(1)
+        pbar.set_postfix(
+            plies=plies, reason=reason,
+            cm=total_stats["checkmated"], rs=total_stats["resigned"],
+            d=total_stats["draws"], t=total_stats["truncated"],
+            frag=pending_stats["games_completed"],
+            tdt=f"{time.time()-t_session:.0f}s",
+        )
+        tqdm.write(f"  game {round_idx+1:>3}/{cli.games}: {plies:>3} plies, "
+                   f"{reason:<10} z_next={final_value:+d}  ({dt:5.1f}s)")
+
+    try:
+        produced = 0
+        while produced < cli.games:
+            wave = min(n_concurrent, cli.games - produced)
+            allow = []
+            for _ in range(wave):
+                ar = (rng.random() >= cli.resign_disabled_fraction)
+                allow.append(ar)
+                if not ar:
+                    pending_stats["resign_disabled_games"] += 1
+                    total_stats["resign_disabled_games"] += 1
+            t0 = time.time()
+            if n_concurrent == 1:
+                results = [play_one_game(engine_pool[0], in_ch, cli, rng, allow[0])]
+            else:
+                results = play_games_multigame(
+                    engine_pool[:wave], in_ch, cli, rng, allow,
+                )
+            dt = time.time() - t0
+            # Share the wall-clock across the wave for the per-game log line.
+            per_game_dt = dt / max(wave, 1)
+            for k, res in enumerate(results):
+                record_game(produced + k, res, per_game_dt)
+            produced += wave
 
             # Periodic flush -- so Ctrl-C only loses at most --flush-every games.
             if cli.flush_every > 0 and pending_stats["games_completed"] >= cli.flush_every:

@@ -199,10 +199,15 @@ def main() -> None:
                 python, "selfplay.py",
                 "--checkpoint", str(best_path),
                 "--games", str(cli.selfplay_games),
-                "--sims", str(cli.sims),
+                # PCR (KataGo-style): full search on a fraction of moves, fast
+                # search on the rest. Map runner's single --sims knob to a 4:1
+                # high/low split.
+                "--high-sims", str(cli.sims),
+                "--low-sims", str(max(1, cli.sims // 4)),
                 "--temperature-moves", str(cli.temperature_moves),
                 "--dirichlet-eps", str(cli.dirichlet_eps),
-                "--truncation", str(cli.selfplay_truncation),
+                "--max-plies", str(cli.selfplay_truncation),
+                # Flat single-file output (iter_dir/selfplay.pt) for discovery below.
                 "--output", str(selfplay_out),
             ], log_path=str(iter_dir / "selfplay.log"), stream_stderr=True)
             if rc != 0:

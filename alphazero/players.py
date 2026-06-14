@@ -28,10 +28,29 @@ import numpy as np
 import torch
 
 torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    # TF32 on cuDNN convolutions (matmul TF32 set above) + autotune for the
+    # static inference shapes. Free forward-pass speedup on Ampere+.
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
 from . import utils as f
-from .mcts import MCTS
+from .mcts import MCTS, _amp_ctx
 from .nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
+
+
+def _channels_last_model(model, device):
+    """Convert a conv model to channels_last on CUDA (no-op on CPU)."""
+    if torch.device(device).type == "cuda":
+        return model.to(memory_format=torch.channels_last)
+    return model
+
+
+def _channels_last_input(x):
+    """channels_last for a 4D NCHW input on CUDA (no-op otherwise)."""
+    if x.device.type == "cuda" and x.dim() == 4:
+        return x.contiguous(memory_format=torch.channels_last)
+    return x
 
 
 _ARCH_CLASSES = {
@@ -187,8 +206,12 @@ class ValueOnlyPlayer:
         self.in_channels = int(cfg.get("_in_channels", 19))
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
+        self.model = _channels_last_model(self.model, self.device)
         self.model.eval()
         try:
+            # Default mode (not reduce-overhead): this player evaluates a batch
+            # of size = #legal-moves, which varies per position. reduce-overhead's
+            # CUDA graphs are shape-specialized and would recapture every batch.
             self.model = torch.compile(self.model)
         except Exception:
             pass
@@ -208,11 +231,12 @@ class ValueOnlyPlayer:
         # moves), so 119-plane models get zero-padded historical frames. Less
         # strong than MCTS path but works.
         hist = [] if self.in_channels == 119 else None
-        inputs = torch.stack(
+        inputs = _channels_last_input(torch.stack(
             [f.prepare_input(s, move_counter, history=hist) for s in mirrored_states]
-        ).to(self.device)
-        values, _ = self.model(inputs)
-        return value_to_scalar(values, mode=self.value_scalar).cpu().numpy().flatten()
+        ).to(self.device))
+        with _amp_ctx(inputs.device):
+            values, _ = self.model(inputs)
+        return value_to_scalar(values.float(), mode=self.value_scalar).cpu().numpy().flatten()
 
     def select_move(self, real_board, mirrored_state, move_counter):
         mover_was_white = real_board.turn == chess.WHITE
@@ -269,11 +293,14 @@ class PolicyOnlyPlayer:
         self.in_channels = int(cfg.get("_in_channels", 19))
         state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
+        self.model = _channels_last_model(self.model, self.device)
         self.model.eval()
         try:
-            self.model = torch.compile(self.model)
+            self.model = torch.compile(self.model, mode="reduce-overhead")
             with torch.inference_mode():
-                _ = self.model(torch.zeros(1, self.in_channels, 8, 8, device=self.device))
+                warm = _channels_last_input(
+                    torch.zeros(1, self.in_channels, 8, 8, device=self.device))
+                _ = self.model(warm)
         except Exception:
             pass
         # Temperature controls policy sampling for the first temperature_moves plies;
@@ -285,12 +312,13 @@ class PolicyOnlyPlayer:
     @torch.inference_mode()
     def select_move(self, real_board, mirrored_state, move_counter):
         hist = [] if self.in_channels == 119 else None
-        inputs = f.prepare_input(
+        inputs = _channels_last_input(f.prepare_input(
             mirrored_state, move_counter, history=hist,
-        ).unsqueeze(0).to(self.device)
-        _value, policy_logits = self.model(inputs)
+        ).unsqueeze(0).to(self.device))
+        with _amp_ctx(inputs.device):
+            _value, policy_logits = self.model(inputs)
         mask = torch.from_numpy(f.legal_mask(mirrored_state)).to(self.device)
-        masked_logits = policy_logits.squeeze(0).masked_fill(~mask, float("-inf"))
+        masked_logits = policy_logits.squeeze(0).float().masked_fill(~mask, float("-inf"))
         policy = torch.softmax(masked_logits, dim=0).cpu().numpy()
 
         if self.temperature > 0 and move_counter < self.temperature_moves:
@@ -334,6 +362,7 @@ class MctsPlayer:
         args["input_planes"] = in_ch                # MCTS routes board_to_matrix accordingly
         state = torch.load(args["checkpoint"], map_location=args["device"], weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
+        self.model = _channels_last_model(self.model, args["device"])
         self.model.eval()
 
         # Optional optimizations. compile is on by default; batched is opt-in.
@@ -343,16 +372,22 @@ class MctsPlayer:
 
         if use_compile:
             try:
-                self.model = torch.compile(self.model)
+                # reduce-overhead (CUDA graphs) only for the fixed batch=1
+                # sequential path; batched MCTS has a variable batch, so use the
+                # default mode there to avoid per-shape graph recapture.
+                if use_batched:
+                    self.model = torch.compile(self.model)
+                else:
+                    self.model = torch.compile(self.model, mode="reduce-overhead")
                 warm_bs = batch_size if use_batched else 1
                 # Warm with a real starting position, not torch.zeros: the JIT
                 # trace specializes on input content too (BN/SE paths behave
                 # differently on all-zero input), so a zeros-warmup leaves the
                 # first REAL forward to pay a ~6s re-trace cost on move 1.
-                real_one = f.prepare_input(
+                real_one = _channels_last_input(f.prepare_input(
                     chess.Board(), 0,
                     history=([] if in_ch == 119 else None),
-                ).unsqueeze(0).to(args["device"])
+                ).unsqueeze(0).to(args["device"]))
                 with torch.inference_mode():
                     if warm_bs > 1:
                         _ = self.model(real_one.expand(warm_bs, -1, -1, -1).contiguous())

@@ -1,3 +1,5 @@
+import contextlib
+import logging
 import math
 import time
 from typing import Callable, Optional
@@ -7,7 +9,16 @@ import numpy as np
 import torch
 
 from . import utils as f
-from .nn import ResNet, value_to_scalar
+from .nn import ResNet, value_scalar_and_wdl
+
+_log = logging.getLogger(__name__)
+
+
+def _amp_ctx(device: torch.device):
+    """fp16 autocast on CUDA, no-op elsewhere. Used to wrap inference forwards."""
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
 
 
 class Node:
@@ -66,6 +77,10 @@ class Node:
         # Lets the dashboard compute variance for the win-prob band without
         # a second forward pass.
         self.raw_nn_wdl: tuple[float, float, float] | None = None
+        # Cached legal-move mask (bool (4672,)) computed once in expand_lazy.
+        # The board state is immutable, so the mask never needs invalidation;
+        # lets batched dedup / repeat visits reuse it without recomputing.
+        self.legal_mask_np: np.ndarray | None = None
         # Virtual loss counter for batched MCTS (number of in-flight sims
         # that have passed through this node). Always 0 in sequential MCTS.
         self.virtual_loss: int = 0
@@ -86,7 +101,8 @@ class Node:
         self.rep_count: int = 0
 
     def is_terminal(self) -> bool:
-        return f.game_result(self.state, self.move_counter, 1000, self.rep_count)[1]
+        trunc = int(self.args.get("truncation_halfmoves", 1000))
+        return f.game_result(self.state, self.move_counter, trunc, self.rep_count)[1]
 
     def is_expanded(self) -> bool:
         return self.policy is not None
@@ -183,23 +199,29 @@ class Node:
             self.state, self.move_counter, history=hist,
             rep_count=max(self.rep_count, 1),
         ).unsqueeze(0).to(self.args["device"])
-        value_t, policy_t = model(inputs)
+        if inputs.device.type == "cuda" and self.args.get("channels_last", True):
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
+        with _amp_ctx(inputs.device):
+            value_t, policy_t = model(inputs)
 
         legal_mask_np = f.legal_mask(self.state)
         self.n_legal = int(legal_mask_np.sum())
-        mask = torch.from_numpy(legal_mask_np).to(policy_t.device)
+        self.legal_mask_np = legal_mask_np
+        mask = torch.from_numpy(legal_mask_np).to(policy_t.device, non_blocking=True)
 
-        value_scalar = value_to_scalar(
+        # One softmax for both the collapsed scalar and the cached WDL probs.
+        value_scalar, wdl = value_scalar_and_wdl(
             value_t, mode=self.args.get("value_scalar", "expected")
-        ).flatten()                                         # (1,) on GPU
-        masked_logits = policy_t.squeeze(0).masked_fill(~mask, float("-inf"))
-        policy_probs = torch.softmax(masked_logits, dim=0)  # (4672,) on GPU
+        )
+        value_scalar = value_scalar.flatten().float()       # (1,) fp32 on GPU
+        masked_logits = policy_t.squeeze(0).float().masked_fill(~mask, float("-inf"))
+        policy_probs = torch.softmax(masked_logits, dim=0)   # (4672,) on GPU
 
-        # If this is a WDL head (value_t shape (..., 3)), pull the softmax'd
-        # W/D/L probs across the *same* CPU sync — no extra GPU→CPU round-trip.
-        if value_t.shape[-1] == 3:
-            wdl_probs = torch.softmax(value_t.flatten(), dim=0)   # (3,) on GPU
-            combined = torch.cat([value_scalar, wdl_probs, policy_probs]).cpu().numpy()
+        # Single GPU→CPU sync: concat value scalar (+ optional WDL probs) with
+        # the policy probs and pull across the PCIe boundary once. .float()
+        # guards against fp16 autocast outputs leaking into numpy storage.
+        if wdl is not None:
+            combined = torch.cat([value_scalar, wdl.flatten().float(), policy_probs]).cpu().numpy()
             value = float(combined[0])
             self.raw_nn_wdl = (
                 float(combined[1]), float(combined[2]), float(combined[3])
@@ -214,8 +236,16 @@ class Node:
         return value
 
 
-class MCTS:
-    def __init__(self, args: dict, model: ResNet) -> None:
+class MCTSBase:
+    """Shared state + tree-reuse machinery for sequential and batched MCTS.
+
+    Holds everything independent of HOW leaves are evaluated: external
+    repetition / history injection, O(1) and state-based tree reuse, root
+    Dirichlet noise, proof propagation, and final action-prob extraction.
+    Subclasses add the per-engine `_simulate*` and `search` loop.
+    """
+
+    def __init__(self, args: dict, model) -> None:
         self.args = args
         self.model = model.to(args["device"])
         self.root: Node | None = None
@@ -232,6 +262,11 @@ class MCTS:
         # by callers via set_history() so a fresh root knows its 8-frame
         # history context for the 119-plane representation.
         self._ext_history: list = []
+        # Early-stop sim bank: sims saved on "decided" positions, lent to harder
+        # ones later in the game. Only used when args["early_stop"] is on (play
+        # only -- never in self-play, where the full visit distribution is the
+        # policy target). Reset per game by the caller (uci.cmd_ucinewgame).
+        self.sim_bank: int = 0
 
     def set_rep_counter(self, counter) -> None:
         """Inject the game-level Counter[transposition_key] before search.
@@ -263,6 +298,30 @@ class MCTS:
             cur = cur.parent
         return self._ext_rep.get(tk, 0) + extra
 
+    def _refresh_rep_counts(self, root: "Node") -> None:
+        """Recompute rep_count for the ENTIRE reused subtree against the current
+        external counter. Stored rep_counts were computed relative to a PREVIOUS
+        root + a stale ext_rep, so after a reroot they'd misfire the 3-fold /
+        terminal check deep in the tree. One O(subtree) iterative DFS, once per
+        search; equivalent to calling _compute_rep_count on every node but linear
+        instead of O(N*depth). `path[tk]` = count of that key among non-root
+        nodes on the current path (matching _compute_rep_count's convention)."""
+        path: dict = {}
+        stack = [(root, True, False)]   # (node, is_root, is_exit_marker)
+        while stack:
+            node, is_root, exiting = stack.pop()
+            if exiting:
+                path[node.tk] -= 1
+                continue
+            if not is_root:
+                path[node.tk] = path.get(node.tk, 0) + 1
+                node.rep_count = self._ext_rep.get(node.tk, 0) + path[node.tk]
+                stack.append((node, False, True))   # exit marker to decrement on the way out
+            else:
+                node.rep_count = self._ext_rep.get(node.tk, 0)
+            for c in node.children.values():
+                stack.append((c, False, False))
+
     def apply_action(self, action: int) -> None:
         """O(1) tree walk by known action: set the action's child as new root,
         drop the rest. Use this from callers that *know* the action played
@@ -293,7 +352,7 @@ class MCTS:
         losing the hundreds of visits accumulated for likely opponent replies.
 
         If `move_counter` is given, also require it to match -- prevents reusing
-        a subtree with stale counter that would feed the wrong move_counter/300
+        a subtree with stale counter that would feed the wrong move-counter
         plane into board_to_matrix.
 
         Idempotent: if root already matches `state`, no-op. This lets callers
@@ -328,16 +387,178 @@ class MCTS:
                     return
         self.root = None
 
+    @staticmethod
+    def _try_prove(node: Node) -> None:
+        """If `node`'s status can be inferred from its expanded children, set
+        node.proven_value (from THIS node's player-to-move perspective).
+
+        OR-rule: any child where opp proves to lose (proven_value=-1) means
+                 this player can force a win → node.proven_value = +1.
+        Otherwise need all legal moves expanded and proven:
+            node.proven_value = -min(child.proven_value over all children).
+        """
+        if node.proven_value is not None:
+            return
+        if not node.children:
+            return
+        # OR-rule first (cheap): any child where opp is proven losing.
+        if any(c.proven_value == -1 for c in node.children.values()):
+            node.proven_value = 1
+            return
+        # For -1 or 0 proofs we need all legal moves expanded and proven.
+        if node.n_legal is None or len(node.children) < node.n_legal:
+            return
+        child_provens = [c.proven_value for c in node.children.values()]
+        if any(pv is None for pv in child_provens):
+            return
+        node.proven_value = -min(child_provens)  # type: ignore
+
+    def _apply_root_dirichlet(self) -> None:
+        """Mix Dirichlet noise into the root's *raw* (un-noised) policy each
+        call so tree reuse doesn't compound noise. Noise is sampled over LEGAL
+        moves only -- sampling the full 4672 space wastes ~99% of the mass on
+        illegal indices (already softmax(-inf)=0), cutting effective noise 100x.
+        """
+        eps = self.args["dirichlet_epsilon"]
+        assert self.root is not None and self.root.raw_policy is not None
+        if eps > 0:
+            legal_idx = np.nonzero(self.root.raw_policy)[0]
+            if len(legal_idx) > 0:
+                noise = np.random.dirichlet([self.args["dirichlet_alpha"]] * len(legal_idx))
+                mixed = self.root.raw_policy.copy()
+                mixed[legal_idx] = (1 - eps) * mixed[legal_idx] + eps * noise
+                total = mixed.sum()
+                # Fall back to the (already-normalised) raw policy rather than
+                # leaving an unnormalised distribution if total underflows to 0.
+                self.root.policy = mixed / total if total > 0 else self.root.raw_policy.copy()
+            else:
+                self.root.policy = self.root.raw_policy.copy()
+        else:
+            # Reset to raw in case this node previously served as a noised root.
+            self.root.policy = self.root.raw_policy.copy()
+
+    def _early_stop_decided(self, completed: int, target: int) -> bool:
+        """True if the played move (most-visited child) can no longer change
+        within the remaining budget. The runner-up is the only move that could
+        overtake #1; if even pouring ALL remaining sims into it can't catch up,
+        the argmax is locked and we can stop. Also stops once the root is proven
+        (the forced result is fixed). Exact -> never changes the chosen move."""
+        root = self.root
+        if root is None:
+            return False
+        if root.proven_value is not None:
+            return True
+        n1 = n2 = 0
+        for c in root.children.values():
+            if c.N >= n1:
+                n2 = n1
+                n1 = c.N
+            elif c.N > n2:
+                n2 = c.N
+        return (n1 - n2) > (target - completed)
+
+    @staticmethod
+    def _mate_plies(node: Node) -> int | None:
+        """Plies to checkmate from `node` along the proven line, or None if not
+        a proven win/loss. The proven-mate subtree is fully materialised (that's
+        how the proof was established), so this recursion stays in the tree and
+        is bounded by the (short) mate depth.
+
+        proven_value is from node's player-to-move POV:
+          +1 win  -> deliver via the FASTEST mating child (opp proven losing),
+          -1 loss -> opponent delays the LONGEST,
+          terminal checkmate (proven -1, no children) -> 0 plies."""
+        pv = node.proven_value
+        if pv is None or pv == 0:
+            return None
+        if not node.children:
+            return 0 if pv == -1 else None
+        if pv == 1:
+            ds = [MCTSBase._mate_plies(c) for c in node.children.values()
+                  if c.proven_value == -1]
+            ds = [d for d in ds if d is not None]
+            return 1 + min(ds) if ds else None
+        ds = [MCTSBase._mate_plies(c) for c in node.children.values()]
+        ds = [d for d in ds if d is not None]
+        return 1 + max(ds) if ds else None
+
+    def _finalize_action_probs(self, verbose: bool = False) -> np.ndarray:
+        """Extract the move distribution after search, honouring the solver:
+
+        1. WIN: if any root child has proven_value == -1 (opp loses there),
+           force-play the FASTEST mate -- the child with the shortest distance to
+           checkmate (tie-break: highest Q/N). With discount==1 every forced win
+           has Q ~= +1, so ranking by Q alone can't tell M1 from M9; rank by
+           proof depth instead.
+        2. AVOID MATE: otherwise, never play a move that is a PROVEN LOSS
+           (child.proven_value == +1) while any non-losing move exists.
+        3. LOST: if every move is a proven loss, force-play the LONGEST defence
+           (deepest forced mate against us).
+        Else: the normalised visit-count distribution over the eligible moves."""
+        action_probs = np.zeros(self.args["action_space"])
+        children = self.root.children
+
+        # 1. Fastest proven mate.
+        winners = [(a, c) for a, c in children.items()
+                   if c.proven_value == -1 and c.N > 0]
+        if winners:
+            def _win_key(ac):
+                d = self._mate_plies(ac[1])
+                return (d if d is not None else 1 << 30, -(ac[1].Q / ac[1].N))
+            best_action, best_child = min(winners, key=_win_key)
+            if verbose:
+                d = self._mate_plies(best_child)
+                mtxt = f"M{(d + 1) // 2 + 1}" if d is not None else "M?"
+                print(f"Proven win: force-playing fastest mate ({mtxt}) "
+                      f"among {len(winners)} winning move(s)")
+            action_probs[best_action] = 1.0
+            self.last_was_proven_mate = True
+            return action_probs
+
+        self.last_was_proven_mate = False
+
+        # 2/3. Avoid proven losses; if all moves lose, delay the longest.
+        losing = {a for a, c in children.items() if c.proven_value == 1}
+        non_losing = [a for a in children if a not in losing]
+        if losing and not non_losing:
+            best_action = max(children.items(),
+                              key=lambda ac: (self._mate_plies(ac[1]) or 0))[0]
+            if verbose:
+                print(f"Proven loss in all {len(losing)} move(s); playing longest defence")
+            action_probs[best_action] = 1.0
+            return action_probs
+
+        for a, c in children.items():
+            if a not in losing:
+                action_probs[a] = c.N
+        total = action_probs.sum()
+        if total <= 0:
+            # Degenerate (e.g. eligible moves had 0 visits): fall back to raw
+            # visit counts over all children so we always return a valid move.
+            action_probs[:] = 0.0
+            for a, c in children.items():
+                action_probs[a] = c.N
+            total = action_probs.sum()
+        if total > 0:
+            action_probs /= total
+        return action_probs
+
+
+class MCTS(MCTSBase):
     def _simulate(self, root: Node) -> None:
+        trunc = int(self.args.get("truncation_halfmoves", 1000))
         path = [root]
         node = root
         while True:
-            if node.is_terminal():
-                # value is already from node's player-to-move perspective:
-                # -1 = current player is mated, 0 = drawn (stalemate / etc.)
-                value = float(f.game_result(node.state, node.move_counter, 1000, node.rep_count)[0])
-                if value == 0.0 or value == -1.0:
-                    node.proven_value = int(value)
+            # Single game_result call (was previously is_terminal() + a second
+            # game_result for the value). value is from node's player-to-move
+            # perspective: -1 = current player mated, 0 = drawn / truncated.
+            term_value, is_term = f.game_result(
+                node.state, node.move_counter, trunc, node.rep_count
+            )
+            if is_term:
+                value = float(term_value)
+                node.proven_value = int(value)
                 break
             if not node.is_expanded():
                 value = node.expand_lazy(self.model)
@@ -369,40 +590,6 @@ class MCTS:
         for n in reversed(path):
             self._try_prove(n)
 
-    def _try_prove(self, node: Node) -> None:
-        """If `node`'s status can be inferred from its expanded children,
-        set node.proven_value.
-
-        Convention: proven_value is from THIS node's player-to-move perspective.
-        node's player picks a move, then opp moves at the resulting child.
-        node's value from playing move m = -child_m.proven_value
-        (child_m.proven_value is from opp's perspective).
-
-        OR-rule: any child where opp proves to lose (proven_value=-1) means
-                 this player can force a win → node.proven_value = +1.
-        Otherwise need all legal moves expanded to claim 0 or -1:
-            node.proven_value = -min(child.proven_value over all children)
-        """
-        if node.proven_value is not None:
-            return
-        if not node.children:
-            return
-
-        # OR-rule first (cheap): any child where opp is proven losing.
-        if any(c.proven_value == -1 for c in node.children.values()):
-            node.proven_value = 1
-            return
-
-        # For -1 or 0 proofs we need all legal moves expanded and proven.
-        if node.n_legal is None or len(node.children) < node.n_legal:
-            return
-        child_provens = [c.proven_value for c in node.children.values()]
-        if any(pv is None for pv in child_provens):
-            return
-
-        # All expanded and proven. value = max(-child.proven_value) = -min(child.proven_value)
-        node.proven_value = -min(child_provens)
-
     def search(
         self,
         state: chess.Board,
@@ -411,6 +598,8 @@ class MCTS:
         info_interval_s: float = 0.2,
     ) -> np.ndarray:
         root_state = state.copy()
+        if not self.args.get("tree_reuse", True):
+            self.root = None          # reuse disabled -> always search a fresh tree
         if self.root is not None:
             self.update_root(state, move_counter)
 
@@ -424,34 +613,36 @@ class MCTS:
             min_depth = 0
         else:
             min_depth = self.root.depth
+            # Reused subtree: rep_counts were computed in a PRIOR search's context
+            # (old root + stale ext_rep). Refresh the WHOLE subtree so 3-fold /
+            # terminal detection is correct everywhere, not just at the root.
+            old_root_rep = self.root.rep_count
+            self._refresh_rep_counts(self.root)
+            # If the root's repetition planes changed (119-plane only), the cached
+            # NN eval is stale -> refresh it.
+            if self.args.get("input_planes") == 119 and self.root.rep_count != old_root_rep:
+                self.root.expand_lazy(self.model)
 
-        # Dirichlet noise at the root, mixed into the *raw* (un-noised) policy
-        # each call so tree reuse doesn't compound noise. Critically, we sample
-        # noise over LEGAL moves only -- sampling over the full 4672 action
-        # space wastes ~99% of the noise mass on illegal indices (which are
-        # already softmax(-inf) = 0), reducing effective noise by 100x.
-        eps = self.args["dirichlet_epsilon"]
-        if eps > 0:
-            legal_idx = np.nonzero(self.root.raw_policy)[0]
-            if len(legal_idx) > 0:
-                noise = np.random.dirichlet([self.args["dirichlet_alpha"]] * len(legal_idx))
-                mixed = self.root.raw_policy.copy()
-                mixed[legal_idx] = (1 - eps) * mixed[legal_idx] + eps * noise
-                total = mixed.sum()
-                self.root.policy = mixed / total if total > 0 else mixed
-            else:
-                self.root.policy = self.root.raw_policy.copy()
-        else:
-            # Reset policy to raw in case this node previously served as root
-            # with noise applied.
-            self.root.policy = self.root.raw_policy.copy()
+        self._apply_root_dirichlet()
 
         self._visited_depths.clear()
-        total_sims = int(self.args["num_simulation"])
+        base = int(self.args["num_simulation"])
+        es = bool(self.args.get("early_stop", False))
+        min_sims = max(int(self.args.get("early_stop_min_sims", 1)), 1)
+        max_borrow = int(self.args.get("max_borrow", 0))
+        # Budget = base sims + whatever we can borrow from the bank (capped by
+        # max_borrow for clock safety). Easy positions early-stop well short and
+        # refund the unused sims to the bank; hard ones keep searching and spend
+        # it -- the allocation is emergent, no "is this hard?" check needed.
+        target = base + (min(self.sim_bank, max_borrow) if es else 0)
+        completed = 0
         t_start = time.monotonic()
         t_last_report = t_start
-        for completed in range(1, total_sims + 1):
+        while completed < target:
             self._simulate(self.root)
+            completed += 1
+            if es and completed >= min_sims and self._early_stop_decided(completed, target):
+                break
             if info_callback is not None:
                 now = time.monotonic()
                 if now - t_last_report >= info_interval_s:
@@ -460,39 +651,19 @@ class MCTS:
                     try:
                         info_callback(self, completed, now - t_start, self.last_max_depth)
                     except Exception:
-                        pass
+                        _log.exception("info_callback failed (mid-search); continuing")
                     t_last_report = now
+        if es:
+            # Bank unused sims (completed < base) or repay borrowed ones
+            # (completed > base). Clamp at 0.
+            self.sim_bank = max(0, self.sim_bank + base - completed)
         self.last_max_depth = (
             max(self._visited_depths) - min_depth if self._visited_depths else 0
         )
         if info_callback is not None:
             try:
-                info_callback(self, total_sims, time.monotonic() - t_start, self.last_max_depth)
+                info_callback(self, completed, time.monotonic() - t_start, self.last_max_depth)
             except Exception:
-                pass
+                _log.exception("info_callback failed (final); continuing")
 
-        # If the solver has proven that bot wins, play it.
-        # Bot wins by playing into a child whose player (opp) is proven losing,
-        # i.e., child.proven_value == -1 (perspective: child's player = opp).
-        # child.Q is stored from PARENT's (= bot's) POV unchanged; among proven
-        # winners pick the highest Q/N (most confident win, shortest mate under
-        # depth discount).
-        action_probs = np.zeros(self.args["action_space"])
-        proven_winners = [
-            (action, child) for action, child in self.root.children.items()
-            if child.proven_value == -1 and child.N > 0
-        ]
-        if proven_winners:
-            print(f"Proven win found among {len(proven_winners)} children; picking best Q/N")
-            best_action, _ = max(proven_winners, key=lambda ac: ac[1].Q / ac[1].N)
-            action_probs[best_action] = 1.0
-            self.last_was_proven_mate = True
-            return action_probs
-
-        self.last_was_proven_mate = False
-        for action, child in self.root.children.items():
-            action_probs[action] = child.N
-        total = action_probs.sum()
-        if total > 0:
-            action_probs /= total
-        return action_probs
+        return self._finalize_action_probs(verbose=True)
