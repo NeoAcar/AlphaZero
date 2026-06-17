@@ -144,7 +144,7 @@ class UciEngine:
         "MaxBorrow": 4800,
         # Reuse the search tree (incl. the pondered subtree) across moves.
         # false = fresh tree every move (for A/B testing reuse's effect).
-        "TreeReuse": "true",
+        "TreeReuse": "false",
     }
     OPT_TYPES = {
         "Type": ("string", None, None),
