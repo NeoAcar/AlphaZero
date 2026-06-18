@@ -154,12 +154,13 @@ class BatchedMCTS(MCTSBase):
         """
         c_base: float = node.args["c_base"]
         c_init: float = node.args["c_init"]
+        c_factor: float = node.args.get("c_factor", 1.0)
         t: float = node.args["t"]
         # PUCT invariant: N(parent) = sum_a N(parent, a). With virtual loss
         # inflating child denominators, the parent numerator must inflate too
         # so the exploration term scales correctly with in-flight visits.
         parent_N_eff: int = node.N + node.virtual_loss
-        c_puct: float = math.log((1 + parent_N_eff + c_base) / c_base) + c_init
+        c_puct: float = c_init + c_factor * math.log((1 + parent_N_eff + c_base) / c_base)
         sqrt_parent_N: float = math.sqrt(max(parent_N_eff, 1))
 
         assert node.policy is not None

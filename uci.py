@@ -12,7 +12,8 @@ Configuration via UCI setoption:
     TempMoves        (spin)    plies of stochastic play default: 0
     DirichletEps     (string)  root noise weight        default: 0.0
     DirichletAlpha   (string)  Dirichlet concentration  default: 0.3
-    CInit            (string)  PUCT exploration         default: 1.25
+    CInit            (string)  PUCT exploration         default: 1.745
+    CFactor          (string)  PUCT log-scaling factor  default: 3.894
 
 Wire it up to a GUI: most GUIs let you "add an engine" by pointing
 at a command. For Cute Chess:
@@ -126,7 +127,8 @@ class UciEngine:
         "TempMoves": 6,
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
-        "CInit": 1.5,
+        "CInit": 1.745,     # LC0 log-scaling defaults (with CFactor + c_base 38739)
+        "CFactor": 3.894,   # coefficient on the log term; 1.0 = pre-LC0 behaviour
         "CFPU": 0.2,
         # Engine-driven background pondering. NOT the same as the standard UCI
         # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
@@ -154,6 +156,7 @@ class UciEngine:
         "DirichletEps": ("string", None, None),
         "DirichletAlpha": ("string", None, None),
         "CInit": ("string", None, None),
+        "CFactor": ("string", None, None),
         "CFPU": ("string", None, None),
         "BackgroundPonder": ("string", None, None),
         "PonderMaxSims": ("spin", 0, 1000000),
@@ -295,8 +298,9 @@ class UciEngine:
         args = {
             "num_simulation": int(self.options["Sims"]),
             "truncation": 1000,
-            "c_base": 19652,
+            "c_base": 38739,
             "c_init": float(self.options["CInit"]),
+            "c_factor": float(self.options["CFactor"]),
             "c_fpu": float(self.options["CFPU"]),
             "dirichlet_epsilon": float(self.options["DirichletEps"]),
             "dirichlet_alpha": float(self.options["DirichletAlpha"]),

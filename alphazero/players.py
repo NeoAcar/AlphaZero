@@ -104,8 +104,9 @@ INF = 1e9
 DEFAULT_MCTS_ARGS = {
     "num_simulation": 200,
     "truncation": 200,
-    "c_base": 19652,
-    "c_init": 1.25,
+    "c_base": 38739,    # LC0 log-scaling defaults
+    "c_init": 1.745,
+    "c_factor": 3.894,  # coefficient on the log term; 1.0 = pre-LC0 behaviour
     "c_fpu": 0.2,  # Leela/KataGo FPU-reduction; 0.0 falls back to plain μ-FPU
     "dirichlet_epsilon": 0.0,
     "dirichlet_alpha": 0.3,

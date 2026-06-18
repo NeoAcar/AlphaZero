@@ -113,8 +113,9 @@ class Node:
         """
         c_base: float = self.args["c_base"]
         c_init: float = self.args["c_init"]
+        c_factor: float = self.args.get("c_factor", 1.0)
         t: float = self.args["t"]
-        c_puct: float = math.log((1 + self.N + c_base) / c_base) + c_init
+        c_puct: float = c_init + c_factor * math.log((1 + self.N + c_base) / c_base)
         sqrt_N: float = math.sqrt(max(self.N, 1))
 
         legal: np.ndarray = np.nonzero(self.policy)[0]
