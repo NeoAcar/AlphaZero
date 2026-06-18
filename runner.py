@@ -34,7 +34,6 @@ defaults to self_play.
 """
 import argparse
 import json
-import os
 import shlex
 import shutil
 import subprocess

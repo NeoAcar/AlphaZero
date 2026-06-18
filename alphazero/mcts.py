@@ -100,10 +100,6 @@ class Node:
         self.tk = state._transposition_key()
         self.rep_count: int = 0
 
-    def is_terminal(self) -> bool:
-        trunc = int(self.args.get("truncation_halfmoves", 1000))
-        return f.game_result(self.state, self.move_counter, trunc, self.rep_count)[1]
-
     def is_expanded(self) -> bool:
         return self.policy is not None
 

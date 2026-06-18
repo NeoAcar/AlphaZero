@@ -40,7 +40,6 @@ import numpy as np
 import torch
 
 from alphazero import utils as f
-#from alphazero.mcts import MCTS
 from alphazero.batched_mcts import BatchedMCTS as MCTS
 from alphazero.mcts import _amp_ctx
 from alphazero.nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
@@ -87,11 +86,9 @@ def send(msg: str) -> None:
     sys.__stdout__.flush()
 
 
-def send_raw(msg: str) -> None:
-    """Alias for send(): protocol output to the true stdout. Kept as a separate
-    name for the live info_callback call sites that documented the intent."""
-    sys.__stdout__.write(msg + "\n")
-    sys.__stdout__.flush()
+# Alias for send(): protocol output to the true stdout. Kept as a separate
+# name for the live info_callback call sites that documented the intent.
+send_raw = send
 
 
 # Dashboard telemetry: POST JSON events to monitor.py. Fail-fast (50ms) so
@@ -124,12 +121,12 @@ class UciEngine:
         "Checkpoint": "models/model_best_combined_wdl.pth",
         "Architecture": "seresnetwdl",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
-        "Sims": 1800,
+        "Sims": 3800,
         "Temperature": 0.6,
         "TempMoves": 6,
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
-        "CInit": 1.33,
+        "CInit": 1.5,
         "CFPU": 0.2,
         # Engine-driven background pondering. NOT the same as the standard UCI
         # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
@@ -140,8 +137,8 @@ class UciEngine:
         # within the remaining sims, and bank the saved sims to spend on harder
         # positions later (up to MaxBorrow extra on any single move). Play-only;
         # never used in self-play. MaxBorrow 0 = early-stop without lending.
-        "EarlyStop": "false",
-        "MaxBorrow": 4800,
+        "EarlyStop": "true",
+        "MaxBorrow": 24000,
         # Reuse the search tree (incl. the pondered subtree) across moves.
         # false = fresh tree every move (for A/B testing reuse's effect).
         "TreeReuse": "true",
@@ -1079,16 +1076,14 @@ class UciEngine:
             post_states.append(post)
         # For 119-plane models, each post_state's history is (current history +
         # current mirror_state) -- the candidate-move state is one ply ahead.
-        if self.loaded_in_channels == 119:
-            post_hist = (self._mirror_history + [self.mirror_state])[-7:]
-            inputs = torch.stack(
-                [f.prepare_input(s, self.move_counter + 1, history=post_hist)
-                 for s in post_states]
-            ).to(self.device)
-        else:
-            inputs = torch.stack(
-                [f.prepare_input(s, self.move_counter + 1) for s in post_states]
-            ).to(self.device)
+        post_hist = (
+            (self._mirror_history + [self.mirror_state])[-7:]
+            if self.loaded_in_channels == 119 else None
+        )
+        inputs = torch.stack(
+            [f.prepare_input(s, self.move_counter + 1, history=post_hist)
+             for s in post_states]
+        ).to(self.device)
         if self.device.type == "cuda":
             inputs = inputs.contiguous(memory_format=torch.channels_last)
         with self._model_lock, _amp_ctx(self.device):

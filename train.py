@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -105,34 +106,17 @@ def parse_args() -> dict:
     cfg.setdefault("selfplay_dir", None)
     cfg.setdefault("selfplay_last_gens", -1)
 
-    # CLI overrides (only when explicitly given).
-    overrides = {
-        "epochs": cli.epochs,
-        "batch_size": cli.batch_size,
-        "learning_rate": cli.learning_rate,
-        "l2_weight": cli.l2_weight,
-        "log_step": cli.log_step,
-        "label_smoothing": cli.label_smoothing,
-        "checkpoint_dir": cli.checkpoint_dir,
-        "log_dir": cli.log_dir,
-        "resume": cli.resume,
-        "val_fraction": cli.val_fraction,
-        "split_seed": cli.split_seed,
-        "self_play_data": cli.self_play_data,
-        "data_mix": cli.data_mix,
-        "wandb_project": cli.wandb_project,
-        "wandb_group": cli.wandb_group,
-        "wandb_name": cli.wandb_name,
-        "shards_dir": cli.shards_dir,
-        "max_shards": cli.max_shards,
-        "value_head": cli.value_head,
-        "vals_per_epoch": cli.vals_per_epoch,
-        "optimizer": cli.optimizer,
-        "momentum": cli.momentum,
-        "selfplay_dir": cli.selfplay_dir,
-        "selfplay_last_gens": cli.selfplay_last_gens,
-    }
-    for k, v in overrides.items():
+    # CLI overrides (only when explicitly given). Every key below names both a
+    # cli attribute and a cfg key; --config is excluded (it's not a cfg key).
+    override_keys = [
+        "epochs", "batch_size", "learning_rate", "l2_weight", "log_step",
+        "label_smoothing", "checkpoint_dir", "log_dir", "resume", "val_fraction",
+        "split_seed", "self_play_data", "data_mix", "wandb_project", "wandb_group",
+        "wandb_name", "shards_dir", "max_shards", "value_head", "vals_per_epoch",
+        "optimizer", "momentum", "selfplay_dir", "selfplay_last_gens",
+    ]
+    for k in override_keys:
+        v = getattr(cli, k)
         if v is not None:
             cfg[k] = v
     return cfg
@@ -251,8 +235,7 @@ class Train:
         # 2) --selfplay-dir's first .pt
         sd = args.get("selfplay_dir")
         if sd:
-            from pathlib import Path as _P
-            for ptf in sorted(_P(sd).rglob("games_*.pt")):
+            for ptf in sorted(Path(sd).rglob("games_*.pt")):
                 try:
                     d = torch.load(ptf, map_location="cpu", weights_only=False)
                     return int(d["boards"].shape[1])
@@ -326,7 +309,6 @@ class Train:
         that produced its games). If selfplay_last_gens > 0, only the most
         recently-modified N subdirs are loaded -- this is the AGZ-style
         sliding-window mechanism."""
-        from pathlib import Path
         root = Path(self.selfplay_dir)
         if not root.exists():
             raise RuntimeError(f"--selfplay-dir not found: {root}")
@@ -416,8 +398,6 @@ class Train:
         train/val using --val-fraction and --split-seed, so positions from a
         single game stay together.
         """
-        from pathlib import Path
-
         # Match both flat layout (shard_*.pt at top) and multi-worker layout
         # (worker_*/shard_*.pt). rglob handles both.
         shard_paths = sorted(Path(self.shards_dir).rglob("shard_*.pt"))

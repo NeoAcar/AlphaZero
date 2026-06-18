@@ -10,7 +10,6 @@ Usage:
 Players alternate colours (player1 plays white in odd-numbered games: 1, 3, 5, ...).
 """
 import argparse
-import json
 import time
 
 import chess

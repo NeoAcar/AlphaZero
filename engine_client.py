@@ -21,8 +21,6 @@ def main() -> int:
         print(f"engine_client: cannot connect to {SOCKET_PATH}: {e}", file=sys.stderr)
         return 1
 
-    stdin_done = threading.Event()
-
     def stdin_to_socket():
         try:
             while True:
@@ -36,7 +34,6 @@ def main() -> int:
                 except (BrokenPipeError, OSError):
                     break
         finally:
-            stdin_done.set()
             # Half-close so the server knows no more input is coming.
             try:
                 s.shutdown(socket.SHUT_WR)

@@ -50,12 +50,10 @@ torch.set_float32_matmul_precision("high")
 from alphazero import utils as f
 from alphazero.batched_mcts import BatchedMCTS as MCTS
 from alphazero.nn import (
-    INPUT_PLANES_HISTORY,
     ResNet,
     SEResNet,
     SEResNetWDL,
     detect_in_channels,
-    value_to_scalar,
 )
 
 
@@ -189,6 +187,20 @@ def root_value_from_pov(mcts: MCTS) -> float:
     return -root.Q / root.N
 
 
+def _terminal_reason(board: chess.Board, move_counter: int, max_plies: int,
+                     rep_now: int) -> str:
+    """Categorise a terminal position for analytics."""
+    if board.is_checkmate():
+        return "checkmate"
+    if move_counter >= max_plies:
+        return "truncation"
+    if rep_now >= 3:
+        return "3-fold"
+    if board.is_fifty_moves():
+        return "50-move"
+    return "draw_rule"
+
+
 def play_one_game(mcts: MCTS, in_channels: int, cli, rng: np.random.Generator,
                   allow_resign: bool):
     """Run one self-play game. Returns:
@@ -218,17 +230,7 @@ def play_one_game(mcts: MCTS, in_channels: int, cli, rng: np.random.Generator,
             mirrored_state, move_counter, cli.max_plies, rep_now,
         )
         if terminal:
-            # Categorise the reason for analytics.
-            if mirrored_state.is_checkmate():
-                reason = "checkmate"
-            elif move_counter >= cli.max_plies:
-                reason = "truncation"
-            elif rep_now >= 3:
-                reason = "3-fold"
-            elif mirrored_state.is_fifty_moves():
-                reason = "50-move"
-            else:
-                reason = "draw_rule"
+            reason = _terminal_reason(mirrored_state, move_counter, cli.max_plies, rep_now)
             return positions, move_counter, val, reason, real_moves
 
         # ---- PCR: pick sim count for this move ------------------------------
@@ -299,20 +301,6 @@ def play_one_game(mcts: MCTS, in_channels: int, cli, rng: np.random.Generator,
         rep_counter[tk] = rep_counter.get(tk, 0) + 1
         # O(1) tree walk for reuse on the next search call.
         mcts.apply_action(action)
-
-
-def _terminal_reason(board: chess.Board, move_counter: int, max_plies: int,
-                     rep_now: int) -> str:
-    """Categorise a terminal position for analytics (mirrors play_one_game)."""
-    if board.is_checkmate():
-        return "checkmate"
-    if move_counter >= max_plies:
-        return "truncation"
-    if rep_now >= 3:
-        return "3-fold"
-    if board.is_fifty_moves():
-        return "50-move"
-    return "draw_rule"
 
 
 def play_games_multigame(engines: list, in_channels: int, cli, rng,

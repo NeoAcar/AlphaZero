@@ -283,7 +283,7 @@ def process_chunk(cfg: dict) -> dict:
 
             try:
                 result_str = game.headers["Result"]
-                _ = float(eval(result_str.split("-")[0])) * 2 - 1  # noqa: S307
+                float(eval(result_str.split("-")[0]))  # noqa: S307 -- validate header parses
             except (KeyError, SyntaxError, ValueError, ZeroDivisionError, NameError):
                 games_skipped_for_bad_header += 1
                 continue
@@ -302,7 +302,7 @@ def process_chunk(cfg: dict) -> dict:
                     total_failures += 1
                 # NaN sentinel (NAN_WDL) means the engine gave no WDL for this
                 # position; track it so data quality is auditable.
-                if wdl is not None and len(wdl) and wdl[0] != wdl[0]:
+                if wdl[0] != wdl[0]:  # NaN check
                     total_missing_wdl += 1
 
                 # Quantize to uint8 and bit-pack the mask immediately, so per-shard

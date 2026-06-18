@@ -344,7 +344,6 @@ class BatchedMCTS(MCTSBase):
         info_callback: Optional[Callable[["BatchedMCTS", int, float, int], None]] = None,
         info_interval_s: float = 0.2,
     ) -> np.ndarray:
-        root_state = state.copy()
         if not self.args.get("tree_reuse", True):
             self.root = None          # reuse disabled -> always search a fresh tree
         if self.root is not None:

@@ -23,7 +23,7 @@ DEFAULT_ARGS = {
 }
 
 
-def load_bot(checkpoint_path: str, sims: int) -> tuple[MCTS, dict]:
+def load_bot(checkpoint_path: str, sims: int) -> MCTS:
     args = dict(DEFAULT_ARGS)
     args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args["num_simulation"] = sims
@@ -31,7 +31,7 @@ def load_bot(checkpoint_path: str, sims: int) -> tuple[MCTS, dict]:
     state = torch.load(checkpoint_path, map_location=args["device"], weights_only=False)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
-    return MCTS(args, model), args
+    return MCTS(args, model)
 
 
 def render(board: chess.Board, last_move: chess.Move | None = None) -> None:
@@ -101,7 +101,7 @@ def announce_result(real_board: chess.Board, move_counter: int, truncation: int)
 
 
 def play_human_vs_bot(checkpoint: str, sims: int, human_color: chess.Color, truncation: int) -> None:
-    mcts, args = load_bot(checkpoint, sims)
+    mcts = load_bot(checkpoint, sims)
     real_board = chess.Board()
     mirrored_state = chess.Board()
     move_counter = 0
@@ -141,7 +141,7 @@ def play_human_vs_bot(checkpoint: str, sims: int, human_color: chess.Color, trun
 
 
 def play_bot_vs_bot(checkpoint: str, sims: int, truncation: int, delay: float) -> None:
-    mcts, args = load_bot(checkpoint, sims)
+    mcts = load_bot(checkpoint, sims)
     real_board = chess.Board()
     mirrored_state = chess.Board()
     move_counter = 0

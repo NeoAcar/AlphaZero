@@ -25,7 +25,6 @@ import argparse
 import json
 import queue
 import threading
-import time
 from typing import Iterator, Optional
 
 import chess

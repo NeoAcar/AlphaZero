@@ -28,7 +28,6 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-import chess
 import chess.pgn
 
 
@@ -152,8 +151,8 @@ def load_opening_lines(selfplay_root: Path, max_plies: int = 6,
         top_pct = [(seq, n, n * 100.0 / n_games) for seq, n in top]
         in_top = sum(n for _, n in top)
         # Full-game dup stats.
-        dup_top_raw = [(k, v) for k, v in full_counter.most_common(5) if v > 1]
-        dup_top = [(full_preview[k], v) for k, v in dup_top_raw]
+        dup_top = [(full_preview[k], v)
+                   for k, v in full_counter.most_common(5) if v > 1]
         out[gen_dir.name] = {
             "games":        n_games,
             "top":          top_pct,
@@ -247,7 +246,6 @@ def _format_opening_html(openings: dict) -> str:
         n_games = data["games"]
         unique_games = data["unique_games"]
         dup_max = data["dup_max"]
-        dup_html = ""
         if dup_max > 1:
             dup_rows = "".join(
                 f"<tr><td>{count}</td><td style='font-family:ui-monospace,"

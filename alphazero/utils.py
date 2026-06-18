@@ -163,7 +163,7 @@ def move_to_alphazero(move: str) -> int:
                 move_type_index = 49 + abs(rank_diff) - 1  # South-west
 
         else:  # Knight moves
-            move_type_index = 56 + (file_diff == 2) * 0 + (file_diff == 1) * 1 + (file_diff == -1) * 2 + (file_diff == -2) * 3
+            move_type_index = 56 + (file_diff == 1) * 1 + (file_diff == -1) * 2 + (file_diff == -2) * 3
             if rank_diff < 0:
                 move_type_index += 4
 

@@ -53,6 +53,16 @@ def _channels_last_input(x):
     return x
 
 
+def _load_model(cfg: dict, device):
+    """Build the NN, load cfg['checkpoint'] weights, set channels_last + eval."""
+    model = build_model(cfg).to(device)
+    state = torch.load(cfg["checkpoint"], map_location=device, weights_only=False)
+    model.load_state_dict(state["model_state_dict"])
+    model = _channels_last_model(model, device)
+    model.eval()
+    return model
+
+
 _ARCH_CLASSES = {
     "resnet":      ResNet,
     "seresnet":    SEResNet,
@@ -202,12 +212,8 @@ class ValueOnlyPlayer:
         if "checkpoint" not in cfg:
             raise ValueError("value_only config needs 'checkpoint'")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = build_model(cfg).to(self.device)
+        self.model = _load_model(cfg, self.device)
         self.in_channels = int(cfg.get("_in_channels", 19))
-        state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
-        self.model.load_state_dict(state["model_state_dict"])
-        self.model = _channels_last_model(self.model, self.device)
-        self.model.eval()
         try:
             # Default mode (not reduce-overhead): this player evaluates a batch
             # of size = #legal-moves, which varies per position. reduce-overhead's
@@ -289,12 +295,8 @@ class PolicyOnlyPlayer:
         if "checkpoint" not in cfg:
             raise ValueError("policy_only config needs 'checkpoint'")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = build_model(cfg).to(self.device)
+        self.model = _load_model(cfg, self.device)
         self.in_channels = int(cfg.get("_in_channels", 19))
-        state = torch.load(cfg["checkpoint"], map_location=self.device, weights_only=False)
-        self.model.load_state_dict(state["model_state_dict"])
-        self.model = _channels_last_model(self.model, self.device)
-        self.model.eval()
         try:
             self.model = torch.compile(self.model, mode="reduce-overhead")
             with torch.inference_mode():
@@ -357,13 +359,9 @@ class MctsPlayer:
         args.update(cfg)
         args["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = build_model(cfg).to(args["device"])
+        self.model = _load_model(cfg, args["device"])
         in_ch = int(cfg.get("_in_channels", 19))
         args["input_planes"] = in_ch                # MCTS routes board_to_matrix accordingly
-        state = torch.load(args["checkpoint"], map_location=args["device"], weights_only=False)
-        self.model.load_state_dict(state["model_state_dict"])
-        self.model = _channels_last_model(self.model, args["device"])
-        self.model.eval()
 
         # Optional optimizations. compile is on by default; batched is opt-in.
         use_compile = bool(cfg.get("compile", True))

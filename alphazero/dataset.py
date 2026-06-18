@@ -39,6 +39,7 @@ class ChessDataset(Dataset):
         value = self.values[idx]
         label = int(self.policy[idx].item())
 
+        soft = None
         if self.legal_masks_packed is not None and self.smoothing > 0:
             packed = self.legal_masks_packed[idx].numpy()
             assert len(packed) * 8 >= self.K, (
@@ -51,12 +52,8 @@ class ChessDataset(Dataset):
                 per_legal = self.smoothing / n_legal
                 soft[torch.from_numpy(mask)] = per_legal
                 soft[label] = 1.0 - self.smoothing + per_legal
-            else:
-                # Defensive: a corrupted mask with no legal moves would divide by
-                # zero; fall back to uniform-over-K smoothing.
-                soft = torch.full((self.K,), self.smoothing / self.K, dtype=torch.float32)
-                soft[label] = 1.0 - self.smoothing + self.smoothing / self.K
-        else:
+            # else: corrupted mask with no legal moves -> uniform-over-K fallback below.
+        if soft is None:
             soft = torch.full((self.K,), self.smoothing / self.K, dtype=torch.float32)
             soft[label] = 1.0 - self.smoothing + self.smoothing / self.K
         # Supervised positions always contribute to policy loss -> is_high_sim=1.
@@ -86,12 +83,9 @@ class SelfPlayDataset(Dataset):
         self.pi_indices = pi_indices            # sparse (new)
         self.pi_values = pi_values
         self.K = action_space
-        if is_high_sim is None:
-            # Default to 1.0 if not provided -- treat every position as high-sim
-            # (matches pre-PCR behaviour).
-            self.is_high_sim = None
-        else:
-            self.is_high_sim = is_high_sim
+        # None -> __getitem__ defaults hi to 1.0 (treat every position as
+        # high-sim; matches pre-PCR behaviour).
+        self.is_high_sim = is_high_sim
         if pis is None and pi_indices is None:
             raise ValueError("SelfPlayDataset needs either pis or pi_indices")
 

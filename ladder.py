@@ -18,7 +18,6 @@ Usage:
 import argparse
 import json
 import math
-import os
 import signal
 import subprocess
 import sys
@@ -141,7 +140,6 @@ def main() -> None:
     matches = []
     total_w = total_d = total_l = 0
     t_session = time.time()
-    pgn_dir = out_path.parent
 
     interrupted = False
     for opp in cli.opponents:
@@ -153,7 +151,7 @@ def main() -> None:
                                cli.dirichlet_eps, cli.architecture),
             tmp_dir, f"opp_{opp_name}",
         )
-        pgn_path = pgn_dir / f"{new_name}_vs_{opp_name}.pgn"
+        pgn_path = tmp_dir / f"{new_name}_vs_{opp_name}.pgn"
         cmd = [
             sys.executable, cli.match_py,
             "--player1", str(new_cfg_path),
