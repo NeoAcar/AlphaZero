@@ -81,6 +81,11 @@ DEFAULT_MCTS_ARGS = {
     "memory_size":  1000,
     "action_space": 4672,
     "t": 1,
+    # Self-play runs the FULL visit budget every move -- the visit distribution
+    # is the policy target, so no proven-mate instant-stop and no early-stop
+    # (early_stop is also off by default; spelled out here for clarity).
+    "mate_stop":  False,
+    "early_stop": False,
 }
 
 

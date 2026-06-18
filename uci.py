@@ -124,7 +124,7 @@ class UciEngine:
         "Checkpoint": "models/model_best_combined_wdl.pth",
         "Architecture": "seresnetwdl",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
-        "Sims": 1200,
+        "Sims": 1800,
         "Temperature": 0.6,
         "TempMoves": 6,
         "DirichletEps": 0.0,
@@ -134,7 +134,7 @@ class UciEngine:
         # Engine-driven background pondering. NOT the same as the standard UCI
         # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
         # disables by default). Rename avoids the conflict.
-        "BackgroundPonder": "false",
+        "BackgroundPonder": "true",
         "PonderMaxSims": 3600,
         # Early stop: cut a search once the most-visited move can't be overtaken
         # within the remaining sims, and bank the saved sims to spend on harder
@@ -144,7 +144,7 @@ class UciEngine:
         "MaxBorrow": 4800,
         # Reuse the search tree (incl. the pondered subtree) across moves.
         # false = fresh tree every move (for A/B testing reuse's effect).
-        "TreeReuse": "false",
+        "TreeReuse": "true",
     }
     OPT_TYPES = {
         "Type": ("string", None, None),

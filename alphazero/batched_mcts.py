@@ -387,6 +387,13 @@ class BatchedMCTS(MCTSBase):
             # Update last_max_depth incrementally so live info_callback can read it.
             if self._visited_depths:
                 self.last_max_depth = max(self._visited_depths) - min_depth
+            # Forced mate FOR US proven -> stop instantly and play it. On for
+            # play (uci/match), OFF in self-play via args["mate_stop"]=False
+            # (self-play needs the full visit distribution as its policy target).
+            # Independent of EarlyStop. Proven LOSS keeps searching -- only our
+            # own mates trigger the instant play.
+            if self.args.get("mate_stop", True) and self.root.proven_value == 1:
+                break
             if es and completed >= min_sims and self._early_stop_decided(completed, target):
                 break
             if info_callback is not None:
