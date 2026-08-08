@@ -23,6 +23,7 @@ import json
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -450,21 +451,116 @@ def batch_losses(model: torch.nn.Module, batch, device: torch.device,
             + args.wdl_weight * wdl
             + args.moves_left_weight * moves_left
         )
+
+    # Diagnostic metrics are detached so they do not enlarge the autograd
+    # graph. Expected WDL score (P(W)-P(L)) gives us an MSE that is close to
+    # the old scalar value-head metric, while Brier score measures calibration
+    # of the complete soft W/D/L distribution.
+    with torch.no_grad():
+        policy_prediction = policy_logits.detach().argmax(dim=1)
+        wdl_probabilities = F.softmax(wdl_logits.detach().float(), dim=1)
+        wdl_targets = wdls.float()
+        predicted_score = wdl_probabilities[:, 0] - wdl_probabilities[:, 2]
+        target_score = wdl_targets[:, 0] - wdl_targets[:, 2]
+        value_error = predicted_score - target_score
+
+        mu = aux["moves_left_mu"].detach().squeeze(1).float()
+        alpha = aux["moves_left_alpha"].detach().squeeze(1).float()
+        moves_left_error = mu - remaining
+        predicted_variance = mu + alpha * mu.square()
+
     metrics = {
         "loss": total,
         "policy_loss": policy,
         "wdl_loss": wdl,
         "moves_left_loss": moves_left,
-        "policy_correct": (policy_logits.argmax(dim=1) == moves).sum(),
-        "wdl_correct": (wdl_logits.argmax(dim=1) == wdls.argmax(dim=1)).sum(),
-        "moves_left_abs_error": (
-            aux["moves_left_mu"].squeeze(1).float() - remaining
-        ).abs().sum(),
+        "policy_correct": (policy_prediction == moves).sum(),
+        "wdl_correct": (
+            wdl_probabilities.argmax(dim=1) == wdl_targets.argmax(dim=1)
+        ).sum(),
+        "value_expected_sq_error": value_error.square().sum(),
+        "value_expected_abs_error": value_error.abs().sum(),
+        "wdl_brier_sum": (wdl_probabilities - wdl_targets).square().sum(),
+        "moves_left_abs_error": moves_left_error.abs().sum(),
+        "moves_left_sq_error": moves_left_error.square().sum(),
+        "moves_left_target_sum": remaining.sum(),
+        "moves_left_predicted_variance_sum": predicted_variance.sum(),
         "batch_size": boards.size(0),
-        "mu_sum": aux["moves_left_mu"].sum(),
-        "alpha_sum": aux["moves_left_alpha"].sum(),
+        "mu_sum": mu.sum(),
+        "alpha_sum": alpha.sum(),
     }
     return metrics
+
+
+LOSS_METRIC_KEYS = ("loss", "policy_loss", "wdl_loss", "moves_left_loss")
+SUM_METRIC_KEYS = (
+    "policy_correct",
+    "wdl_correct",
+    "value_expected_sq_error",
+    "value_expected_abs_error",
+    "wdl_brier_sum",
+    "moves_left_abs_error",
+    "moves_left_sq_error",
+    "moves_left_target_sum",
+    "moves_left_predicted_variance_sum",
+    "mu_sum",
+    "alpha_sum",
+)
+
+
+def empty_metric_sums() -> dict[str, float]:
+    return {key: 0.0 for key in (*LOSS_METRIC_KEYS, *SUM_METRIC_KEYS)}
+
+
+def accumulate_metrics(sums: dict[str, float], metrics: dict[str, Any]) -> int:
+    batch_size = int(metrics["batch_size"])
+    # Transfer every scalar in one tiny device->host copy. Calling .item()
+    # separately for each metric would introduce many CUDA synchronizations
+    # per batch and could make richer logging measurably slower.
+    keys = (*LOSS_METRIC_KEYS, *SUM_METRIC_KEYS)
+    values = torch.stack([
+        metrics[key].detach().float() for key in keys
+    ]).cpu().tolist()
+    for key, value in zip(LOSS_METRIC_KEYS, values[:len(LOSS_METRIC_KEYS)]):
+        sums[key] += value * batch_size
+    for key, value in zip(SUM_METRIC_KEYS, values[len(LOSS_METRIC_KEYS):]):
+        sums[key] += value
+    return batch_size
+
+
+def summarize_metrics(sums: dict[str, float], seen: int) -> dict[str, float]:
+    if seen <= 0:
+        raise RuntimeError("cannot summarize zero examples")
+    return {
+        "loss": sums["loss"] / seen,
+        "policy_loss": sums["policy_loss"] / seen,
+        "wdl_loss": sums["wdl_loss"] / seen,
+        "moves_left_loss": sums["moves_left_loss"] / seen,
+        "policy_accuracy": sums["policy_correct"] / seen,
+        "wdl_accuracy": sums["wdl_correct"] / seen,
+        "value_expected_mse": sums["value_expected_sq_error"] / seen,
+        "value_expected_mae": sums["value_expected_abs_error"] / seen,
+        "wdl_brier": sums["wdl_brier_sum"] / seen,
+        "moves_left_mae": sums["moves_left_abs_error"] / seen,
+        "moves_left_rmse": math.sqrt(sums["moves_left_sq_error"] / seen),
+        "moves_left_target_mean": sums["moves_left_target_sum"] / seen,
+        "moves_left_mu": sums["mu_sum"] / seen,
+        "moves_left_alpha": sums["alpha_sum"] / seen,
+        "moves_left_predicted_variance": (
+            sums["moves_left_predicted_variance_sum"] / seen
+        ),
+    }
+
+
+def wandb_metric_dict(prefix: str,
+                      summary: dict[str, float]) -> dict[str, float]:
+    """Namespace summaries and display accuracies in the old run's 0-100 scale."""
+    result = {}
+    for key, value in summary.items():
+        if key.endswith("accuracy"):
+            value *= 100.0
+        result[f"{prefix}/{key}"] = value
+    return result
 
 
 @torch.no_grad()
@@ -472,17 +568,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              args: argparse.Namespace, static_valid: torch.Tensor,
              autocast_enabled: bool, autocast_dtype: torch.dtype) -> dict[str, float]:
     model.eval()
-    sums = {
-        "loss": 0.0,
-        "policy_loss": 0.0,
-        "wdl_loss": 0.0,
-        "moves_left_loss": 0.0,
-        "policy_correct": 0.0,
-        "wdl_correct": 0.0,
-        "moves_left_abs_error": 0.0,
-        "mu_sum": 0.0,
-        "alpha_sum": 0.0,
-    }
+    sums = empty_metric_sums()
     seen = 0
     progress = tqdm(loader, desc="validation", leave=False)
     for batch_index, batch in enumerate(progress):
@@ -492,27 +578,11 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
             model, batch, device, args, static_valid,
             autocast_enabled, autocast_dtype,
         )
-        batch_size = metrics["batch_size"]
-        seen += batch_size
-        for key in ("loss", "policy_loss", "wdl_loss", "moves_left_loss"):
-            sums[key] += float(metrics[key].item()) * batch_size
-        for key in ("policy_correct", "wdl_correct", "moves_left_abs_error",
-                    "mu_sum", "alpha_sum"):
-            sums[key] += float(metrics[key].item())
+        seen += accumulate_metrics(sums, metrics)
 
     if seen == 0:
         raise RuntimeError("validation loader produced no batches")
-    return {
-        "loss": sums["loss"] / seen,
-        "policy_loss": sums["policy_loss"] / seen,
-        "wdl_loss": sums["wdl_loss"] / seen,
-        "moves_left_loss": sums["moves_left_loss"] / seen,
-        "policy_accuracy": sums["policy_correct"] / seen,
-        "wdl_accuracy": sums["wdl_correct"] / seen,
-        "moves_left_mae": sums["moves_left_abs_error"] / seen,
-        "moves_left_mu": sums["mu_sum"] / seen,
-        "moves_left_alpha": sums["alpha_sum"] / seen,
-    }
+    return summarize_metrics(sums, seen)
 
 
 def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
@@ -653,8 +723,13 @@ def main() -> None:
         model.train()
         progress = tqdm(train_loader, desc=f"epoch {epoch + 1}/{args.epochs}")
         n_batches = len(train_loader)
-        running_loss = 0.0
+        running_sums = empty_metric_sums()
         running_examples = 0
+        interval_examples = 0
+        interval_started = time.perf_counter()
+        epoch_started = interval_started
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         for batch_index, batch in enumerate(progress):
             window_start = (batch_index // args.grad_accum) * args.grad_accum
@@ -668,8 +743,8 @@ def main() -> None:
             loss = metrics["loss"]
             scaler.scale(loss / accumulation_divisor).backward()
             batch_size = metrics["batch_size"]
-            running_loss += float(loss.item()) * batch_size
-            running_examples += batch_size
+            running_examples += accumulate_metrics(running_sums, metrics)
+            interval_examples += batch_size
 
             update_now = batch_index + 1 == window_end
             if not update_now:
@@ -688,36 +763,59 @@ def main() -> None:
                 swa_model.update_parameters(model)
 
             if global_step % args.log_every == 0:
+                batch_sums = empty_metric_sums()
+                batch_seen = accumulate_metrics(batch_sums, metrics)
+                batch_summary = summarize_metrics(batch_sums, batch_seen)
+                interval_elapsed = max(time.perf_counter() - interval_started, 1e-9)
                 log = {
-                    "train/loss": float(loss.item()),
-                    "train/policy_loss": float(metrics["policy_loss"].item()),
-                    "train/wdl_loss": float(metrics["wdl_loss"].item()),
-                    "train/moves_left_nll": float(metrics["moves_left_loss"].item()),
-                    "train/moves_left_mu": float(metrics["mu_sum"].item()) / batch_size,
-                    "train/moves_left_alpha": float(metrics["alpha_sum"].item()) / batch_size,
+                    **wandb_metric_dict("train", batch_summary),
+                    # Compatibility aliases make direct plots against train.py
+                    # runs possible without renaming old panels.
+                    "train/policy_ce": batch_summary["policy_loss"],
+                    "train/value_mse": batch_summary["value_expected_mse"],
+                    "train/accuracy": 100.0 * batch_summary["policy_accuracy"],
+                    "train/moves_left_nll": batch_summary["moves_left_loss"],
                     "train/grad_norm": float(grad_norm),
                     "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/samples_per_second": interval_examples / interval_elapsed,
                     "optimizer_step": global_step,
                     "epoch": epoch + 1,
                 }
+                if device.type == "cuda":
+                    gib = 1024 ** 3
+                    log.update({
+                        "system/gpu_memory_allocated_gib": (
+                            torch.cuda.memory_allocated(device) / gib
+                        ),
+                        "system/gpu_memory_reserved_gib": (
+                            torch.cuda.memory_reserved(device) / gib
+                        ),
+                        "system/gpu_peak_memory_allocated_gib": (
+                            torch.cuda.max_memory_allocated(device) / gib
+                        ),
+                    })
                 progress.set_postfix(
                     loss=f"{log['train/loss']:.3f}",
                     policy=f"{log['train/policy_loss']:.3f}",
-                    mlh=f"{log['train/moves_left_nll']:.3f}",
+                    mlh=f"{log['train/moves_left_loss']:.3f}",
                     lr=f"{log['train/lr']:.2e}",
                 )
                 if wandb_run is not None:
                     wandb.log(log, step=global_step)
+                interval_examples = 0
+                interval_started = time.perf_counter()
 
         val = evaluate(
             model, val_loader, device, args, static_valid,
             autocast_enabled, autocast_dtype,
         )
-        train_epoch_loss = running_loss / max(1, running_examples)
+        train_epoch = summarize_metrics(running_sums, running_examples)
+        epoch_elapsed = max(time.perf_counter() - epoch_started, 1e-9)
         print(
-            f"epoch {epoch + 1}: train={train_epoch_loss:.4f}, "
+            f"epoch {epoch + 1}: train={train_epoch['loss']:.4f}, "
             f"val={val['loss']:.4f}, policy_acc={val['policy_accuracy']:.2%}, "
             f"wdl_acc={val['wdl_accuracy']:.2%}, "
+            f"value_mse={val['value_expected_mse']:.4f}, "
             f"moves_left_mae={val['moves_left_mae']:.3f}"
         )
 
@@ -734,11 +832,24 @@ def main() -> None:
             atomic_torch_save(payload, checkpoint_dir / "model_best.pth")
 
         if wandb_run is not None:
-            wandb.log({
-                **{f"val/{key}": value for key, value in val.items()},
-                "train/epoch_loss": train_epoch_loss,
+            epoch_log = {
+                **wandb_metric_dict("epoch_train", train_epoch),
+                **wandb_metric_dict("val", val),
+                # Exact names used by the previous train.py run.
+                "epoch/train_loss": train_epoch["loss"],
+                "epoch/train_policy_ce": train_epoch["policy_loss"],
+                "epoch/train_value_mse": train_epoch["value_expected_mse"],
+                "epoch/train_accuracy": 100.0 * train_epoch["policy_accuracy"],
+                "epoch/val_loss": val["loss"],
+                "epoch/val_policy_ce": val["policy_loss"],
+                "epoch/val_value_mse": val["value_expected_mse"],
+                "epoch/val_accuracy": 100.0 * val["policy_accuracy"],
+                "epoch/seconds": epoch_elapsed,
+                "epoch/samples_per_second": running_examples / epoch_elapsed,
                 "epoch": epoch + 1,
-            }, step=global_step)
+                "epoch/n": epoch + 1,
+            }
+            wandb.log(epoch_log, step=global_step)
 
     if int(swa_model.n_averaged.item()) == 0:
         print("SWA phase had no scheduled sample; averaging final base weights once.")
