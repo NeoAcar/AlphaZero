@@ -205,6 +205,7 @@ def load_sharded_split(args: argparse.Namespace) -> tuple[
     shards: list[dict[str, torch.Tensor]] = []
     ppg_by_shard: list[np.ndarray] = []
     all_have_masks = True
+    empty_games_skipped = 0
 
     for shard_index, path in enumerate(paths):
         raw = torch.load(path, map_location="cpu", weights_only=False)
@@ -231,11 +232,20 @@ def load_sharded_split(args: argparse.Namespace) -> tuple[
             raise RuntimeError(
                 f"{path}: expected moves ({n_positions},), got {_tensor_shape(moves)}"
             )
-        if len(ppg) == 0 or np.any(ppg <= 0) or int(ppg.sum()) != n_positions:
+        if len(ppg) == 0 or np.any(ppg < 0) or int(ppg.sum()) != n_positions:
             raise RuntimeError(
                 f"{path}: invalid positions_per_game (sum={int(ppg.sum())}, "
                 f"positions={n_positions})"
             )
+        # gen_sf_data.py records a game boundary even when a PGN has no
+        # mainline moves. Such games contribute zero samples and therefore
+        # must not enter the train/validation game split or moves-left moment
+        # calculation. Removing them does not change any position offset:
+        # their length is exactly zero.
+        shard_empty_games = int(np.count_nonzero(ppg == 0))
+        if shard_empty_games:
+            empty_games_skipped += shard_empty_games
+            ppg = ppg[ppg > 0]
         if masks is None:
             all_have_masks = False
         elif _tensor_shape(masks) != (n_positions, PACKED_ACTION_SPACE):
@@ -253,8 +263,11 @@ def load_sharded_split(args: argparse.Namespace) -> tuple[
             shard["legal_masks_packed"] = masks
         shards.append(shard)
         ppg_by_shard.append(ppg)
+        empty_note = (
+            f", {shard_empty_games:,} empty skipped" if shard_empty_games else ""
+        )
         print(f"  [{shard_index + 1:02d}/{len(paths):02d}] {path.name}: "
-              f"{n_positions:,} positions, {len(ppg):,} games")
+              f"{n_positions:,} positions, {len(ppg):,} usable games{empty_note}")
 
     game_shard = np.concatenate([
         np.full(len(ppg), i, dtype=np.int64) for i, ppg in enumerate(ppg_by_shard)
@@ -286,11 +299,14 @@ def load_sharded_split(args: argparse.Namespace) -> tuple[
         "train_positions": len(train),
         "val_positions": len(val),
         "legal_masks": all_have_masks,
+        "empty_games_skipped": empty_games_skipped,
     }
     print(
         f"Split: {stats['train_games']:,} train / {stats['val_games']:,} val games; "
         f"{len(train):,} train / {len(val):,} val positions"
     )
+    if empty_games_skipped:
+        print(f"Ignored {empty_games_skipped:,} empty PGN games (0 positions).")
     if not all_have_masks:
         print("WARNING: at least one shard has no legal_masks_packed; label "
               "smoothing will use the model's static geometric move mask.")
