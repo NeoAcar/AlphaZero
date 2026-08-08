@@ -8,7 +8,8 @@ wrapper let the bot play in any chess GUI or on Lichess via lichess-bot.
 See **`CLAUDE.md`** for the conventions that are easy to get wrong
 (mirror-canonical state, the 4672 action space, value perspective,
 proven-value semantics) and **`RECIPE.md`** for how this pipeline compares to
-the AlphaGo Zero / AlphaZero papers.
+the AlphaGo Zero / AlphaZero papers. Open research and engineering directions
+are tracked in **`FUTURE_IDEAS.md`**.
 
 ## File structure
 

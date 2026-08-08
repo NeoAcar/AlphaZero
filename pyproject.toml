@@ -11,6 +11,7 @@ dependencies = [
     "tqdm>=4.66",
     "wandb>=0.18",
     "flask>=3.0",
+    "matplotlib>=3.11.0",
 ]
 
 [tool.uv.sources]

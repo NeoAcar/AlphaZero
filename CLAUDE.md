@@ -385,15 +385,5 @@ UCI_MONITOR_URL= ./alphazero_uci.sh
 
 ## Deferred work
 
-Tracked as memory items for future Claude sessions; surface when relevant:
-
-- 19 → 119 input planes (add 8-frame history)
-- Puzzle fine-tuning (Lichess puzzle CSV → tactical fine-tune)
-- Resign threshold in self-play with calibration loop
-- 1858-action policy head (LC0-compact, ~5-10% model size win)
-- UCI pondering (background search on opp's clock; monitor.py already has
-  the infra to display it)
-- Retune PUCT `c_init` for the sharper WDL Q distribution (current 1.25
-  likely under-explores; try LC0-style ~1.7 + log scaling)
-- Variance band on the win-prob plot from WDL: `Var = P(W) + P(L) − (P(W)
-  − P(L))²` is free given the WDL head; would visualize search uncertainty
+Use `FUTURE_IDEAS.md` as the authoritative roadmap. It separates capabilities
+already present in the codebase from open research and engineering ideas.

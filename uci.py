@@ -122,13 +122,13 @@ class UciEngine:
         "Checkpoint": "models/model_best_combined_wdl.pth",
         "Architecture": "seresnetwdl",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
-        "Sims": 3800,
+        "Sims": 1200,
         "Temperature": 0.6,
         "TempMoves": 6,
         "DirichletEps": 0.0,
         "DirichletAlpha": 0.3,
-        "CInit": 1.745,     # LC0 log-scaling defaults (with CFactor + c_base 38739)
-        "CFactor": 3.894,   # coefficient on the log term; 1.0 = pre-LC0 behaviour
+        "CInit": 1.33,     # LC0 log-scaling defaults (with CFactor + c_base 38739)
+        "CFactor": 1,   # coefficient on the log term; 1.0 = pre-LC0 behaviour #3.894
         "CFPU": 0.2,
         # Engine-driven background pondering. NOT the same as the standard UCI
         # `Ponder` option (which controls GUI-driven `go ponder` and lichess-bot
