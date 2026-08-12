@@ -95,11 +95,16 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
     # WDL probs ride along in the same single GPU→CPU sync. .float() guards
     # fp16 autocast outputs from leaking into numpy storage.
     aux_parts = []
+    aux_width = 0
     if aux_t is not None:
-        aux_parts = [
-            aux_t["moves_left_mu"].reshape(-1, 1).float(),
-            aux_t["moves_left_alpha"].reshape(-1, 1).float(),
-        ]
+        if "moves_left_scaled" in aux_t:
+            aux_parts = [aux_t["moves_left_scaled"].reshape(-1, 1).float() * 20.0]
+        else:
+            aux_parts = [
+                aux_t["moves_left_mu"].reshape(-1, 1).float(),
+                aux_t["moves_left_alpha"].reshape(-1, 1).float(),
+            ]
+        aux_width = len(aux_parts)
     if wdl_t is not None:
         combined = torch.cat(
             [values_t, wdl_t.float(), *aux_parts, policies_t], dim=1
@@ -108,8 +113,8 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
         wdl_probs = combined[:, 1:4]
         if aux_t is not None:
             moves_left_mu = combined[:, 4]
-            moves_left_alpha = combined[:, 5]
-            policies = combined[:, 6:]
+            moves_left_alpha = combined[:, 5] if aux_width == 2 else None
+            policies = combined[:, 4 + aux_width:]
         else:
             moves_left_mu = moves_left_alpha = None
             policies = combined[:, 4:]
@@ -119,8 +124,8 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
         wdl_probs = None
         if aux_t is not None:
             moves_left_mu = combined[:, 1]
-            moves_left_alpha = combined[:, 2]
-            policies = combined[:, 3:]
+            moves_left_alpha = combined[:, 2] if aux_width == 2 else None
+            policies = combined[:, 1 + aux_width:]
         else:
             moves_left_mu = moves_left_alpha = None
             policies = combined[:, 1:]
@@ -140,7 +145,9 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
                 )
             if moves_left_mu is not None:
                 leaf.raw_nn_moves_left = float(moves_left_mu[i])
-                leaf.raw_nn_moves_left_alpha = float(moves_left_alpha[i])
+                leaf.raw_nn_moves_left_alpha = (
+                    float(moves_left_alpha[i]) if moves_left_alpha is not None else None
+                )
         leaf_value[id(leaf)] = val
     return leaf_value
 

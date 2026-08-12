@@ -596,6 +596,34 @@ class NegativeBinomialMovesLeftHead(nn.Module):
         alpha = F.softplus(self.alpha_head(features)) + self.min_alpha
         return mu, alpha
 
+
+class ScaledHuberMovesLeftHead(nn.Module):
+    """Predict remaining plies on Leela's ``plies / 20`` regression scale."""
+
+    def __init__(self, embed_dim: int, hidden_dim: int | None = None):
+        super().__init__()
+        hidden_dim = hidden_dim or embed_dim // 2
+        self.pool = LearnedAttentionPool(embed_dim)
+        self.shared = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.Mish(),
+        )
+        # Intentionally unconstrained: SmoothL1 regression needs no
+        # distributional parameter or artificial positive-output transform.
+        self.output = nn.Linear(hidden_dim, 1)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.output(self.shared(self.pool(tokens)))
+
+
+def make_moves_left_head(loss: str, embed_dim: int) -> nn.Module:
+    if loss == "negbinom":
+        return NegativeBinomialMovesLeftHead(embed_dim)
+    if loss == "huber":
+        return ScaledHuberMovesLeftHead(embed_dim)
+    raise ValueError(f"unsupported moves-left loss: {loss!r}")
+
+
 def negative_binomial_nll_loss(target: torch.Tensor, mu: torch.Tensor,
                                alpha: torch.Tensor,
                                reduction: str = "mean") -> torch.Tensor:
@@ -655,23 +683,26 @@ class ChessFormerWDL(nn.Module):
     returns ``(wdl_logits, policy_logits)``. Training can request the auxiliary
     predictions with ``return_aux=True`` and receives a third dictionary:
 
-        {"moves_left_mu": (B, 1), "moves_left_alpha": (B, 1)}
+        NB: {"moves_left_mu": (B, 1), "moves_left_alpha": (B, 1)}
+        Huber: {"moves_left_scaled": (B, 1)}
 
-    Moves-left is a negative-binomial count model trained on raw remaining
-    plies derived from the existing ``positions_per_game`` boundaries. No new
-    labelled data is required for the auxiliary target.
+    The NB target is raw remaining plies. Huber uses the Leela-style target
+    ``remaining_plies / 20``. Both use the existing ``positions_per_game``
+    boundaries; no new labelled data is required.
     """
 
     def __init__(self, in_channels: int = INPUT_PLANES_LEGACY,
                  embed_dim: int = 384, n_blocks: int = 10,
                  num_heads: int = 12, hidden_dim: int = 768,
-                 policy_dim: int = 192, dropout: float = 0.0):
+                 policy_dim: int = 192, dropout: float = 0.0,
+                 moves_left_loss: str = "negbinom"):
         super().__init__()
         if in_channels < 7:
             raise ValueError("ChessFormerWDL expects piece/history planes plus 7 metadata planes")
 
         self.in_channels = in_channels
         self.embed_dim = embed_dim
+        self.moves_left_loss = moves_left_loss
 
         # Sequential naming preserves the current checkpoint input-plane
         # detection convention: startBlock.0.weight.shape[1] == in_channels.
@@ -705,7 +736,7 @@ class ChessFormerWDL(nn.Module):
             nn.SiLU(),
             nn.Linear(embed_dim, 3),
         )
-        self.movesLeftHead = NegativeBinomialMovesLeftHead(embed_dim)
+        self.movesLeftHead = make_moves_left_head(moves_left_loss, embed_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4 or x.shape[1] != self.in_channels or x.shape[-2:] != (8, 8):
@@ -733,11 +764,14 @@ class ChessFormerWDL(nn.Module):
         if not return_aux:
             return value, policy
 
-        moves_left_mu, moves_left_alpha = self.movesLeftHead(tokens)
-        aux = {
-            "moves_left_mu": moves_left_mu,
-            "moves_left_alpha": moves_left_alpha,
-        }
+        if self.moves_left_loss == "negbinom":
+            moves_left_mu, moves_left_alpha = self.movesLeftHead(tokens)
+            aux = {
+                "moves_left_mu": moves_left_mu,
+                "moves_left_alpha": moves_left_alpha,
+            }
+        else:
+            aux = {"moves_left_scaled": self.movesLeftHead(tokens)}
         return value, policy, aux
 
     def parameter_count(self, exclude_input_projection: bool = False) -> int:
@@ -890,13 +924,13 @@ class Chessformer5MFiLMWDL(nn.Module):
     planes become the paper's square-token features; the final seven rule/game
     planes are encoded once and supplied to each block through FiLM. The model
     retains the paper WDL and source-destination policy heads, plus our
-    negative-binomial remaining-plies auxiliary head.
+    selectable remaining-plies auxiliary head.
     """
 
     def __init__(self, in_channels: int = INPUT_PLANES_LEGACY,
                  embed_dim: int = 256, n_blocks: int = 8,
                  num_heads: int = 8, mlp_ratio: float = 2.0,
-                 policy_dim: int = 256):
+                 policy_dim: int = 256, moves_left_loss: str = "negbinom"):
         super().__init__()
         if in_channels != INPUT_PLANES_LEGACY:
             raise ValueError(
@@ -911,6 +945,7 @@ class Chessformer5MFiLMWDL(nn.Module):
             )
         self.in_channels = in_channels
         self.embed_dim = embed_dim
+        self.moves_left_loss = moves_left_loss
         self.token_projection = nn.Linear(12, embed_dim)
         self.metadata_projection = nn.Sequential(
             nn.Linear(7, embed_dim),
@@ -932,7 +967,7 @@ class Chessformer5MFiLMWDL(nn.Module):
         self.value_hidden = nn.Linear(embed_dim, embed_dim)
         self.value_out = nn.Linear(embed_dim, 3)
         self.policyHead = PaperChessformerPolicyHead(embed_dim, policy_dim)
-        self.movesLeftHead = NegativeBinomialMovesLeftHead(embed_dim)
+        self.movesLeftHead = make_moves_left_head(moves_left_loss, embed_dim)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4 or x.shape[1:] != (self.in_channels, 8, 8):
@@ -955,11 +990,13 @@ class Chessformer5MFiLMWDL(nn.Module):
         value = self.value_out(F.relu(self.value_hidden(pooled)))
         if not return_aux:
             return value, policy
-        moves_left_mu, moves_left_alpha = self.movesLeftHead(tokens)
-        return value, policy, {
-            "moves_left_mu": moves_left_mu,
-            "moves_left_alpha": moves_left_alpha,
-        }
+        if self.moves_left_loss == "negbinom":
+            moves_left_mu, moves_left_alpha = self.movesLeftHead(tokens)
+            return value, policy, {
+                "moves_left_mu": moves_left_mu,
+                "moves_left_alpha": moves_left_alpha,
+            }
+        return value, policy, {"moves_left_scaled": self.movesLeftHead(tokens)}
 
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())

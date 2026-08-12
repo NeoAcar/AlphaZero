@@ -227,11 +227,17 @@ class Node:
         # the policy probs and pull across the PCIe boundary once. .float()
         # guards against fp16 autocast outputs leaking into numpy storage.
         aux_parts = []
+        aux_width = 0
         if aux_t is not None:
-            aux_parts = [
-                aux_t["moves_left_mu"].flatten().float(),
-                aux_t["moves_left_alpha"].flatten().float(),
-            ]
+            if "moves_left_scaled" in aux_t:
+                # Huber head predicts Leela's scaled target (plies / 20).
+                aux_parts = [aux_t["moves_left_scaled"].flatten().float() * 20.0]
+            else:
+                aux_parts = [
+                    aux_t["moves_left_mu"].flatten().float(),
+                    aux_t["moves_left_alpha"].flatten().float(),
+                ]
+            aux_width = len(aux_parts)
         if wdl is not None:
             combined = torch.cat(
                 [value_scalar, wdl.flatten().float(), *aux_parts, policy_probs]
@@ -243,8 +249,10 @@ class Node:
             policy_offset = 4
             if aux_t is not None:
                 self.raw_nn_moves_left = float(combined[4])
-                self.raw_nn_moves_left_alpha = float(combined[5])
-                policy_offset = 6
+                self.raw_nn_moves_left_alpha = (
+                    float(combined[5]) if aux_width == 2 else None
+                )
+                policy_offset += aux_width
             self.raw_policy = combined[policy_offset:]
         else:
             combined = torch.cat([value_scalar, *aux_parts, policy_probs]).cpu().numpy()
@@ -252,8 +260,10 @@ class Node:
             policy_offset = 1
             if aux_t is not None:
                 self.raw_nn_moves_left = float(combined[1])
-                self.raw_nn_moves_left_alpha = float(combined[2])
-                policy_offset = 3
+                self.raw_nn_moves_left_alpha = (
+                    float(combined[2]) if aux_width == 2 else None
+                )
+                policy_offset += aux_width
             self.raw_policy = combined[policy_offset:]
         self.policy = self.raw_policy.copy()
         self.raw_nn_value = value

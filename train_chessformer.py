@@ -83,10 +83,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--beta2", type=float, default=0.98)
-    parser.add_argument("--warmup-fraction", type=float, default=0.03)
+    parser.add_argument("--lr-schedule", choices=("constant", "cosine"),
+                        default="constant",
+                        help="constant keeps LR fixed; cosine retains the old warmup/decay recipe")
+    parser.add_argument("--warmup-fraction", type=float, default=0.03,
+                        help="only used with --lr-schedule cosine")
     parser.add_argument("--swa-start-fraction", type=float, default=0.85)
     parser.add_argument("--swa-lr-ratio", type=float, default=0.05,
-                        help="final/SWA learning rate divided by peak LR")
+                        help="final/SWA learning rate divided by peak LR; cosine only")
     parser.add_argument("--swa-update-every", type=int, default=100,
                         help="average weights every N optimizer updates in SWA phase")
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -96,6 +100,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-weight", type=float, default=1.0)
     parser.add_argument("--wdl-weight", type=float, default=1.0)
     parser.add_argument("--moves-left-weight", type=float, default=0.05)
+    parser.add_argument("--moves-left-loss", choices=("huber", "negbinom"),
+                        default="huber",
+                        help="huber regresses remaining plies / 20; negbinom uses mu/alpha NLL")
     parser.add_argument("--label-smoothing", type=float, default=0.05)
 
     # Defaults target roughly the old 22.7M-parameter model without merely
@@ -120,8 +127,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("val-fraction must be between 0 and 1")
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error("label-smoothing must be in [0, 1)")
-    if not 0.0 <= args.warmup_fraction < args.swa_start_fraction < 1.0:
-        parser.error("need 0 <= warmup-fraction < swa-start-fraction < 1")
+    if not 0.0 < args.swa_start_fraction < 1.0:
+        parser.error("swa-start-fraction must be in (0, 1)")
+    if args.lr_schedule == "cosine" \
+            and not 0.0 <= args.warmup_fraction < args.swa_start_fraction:
+        parser.error("cosine needs 0 <= warmup-fraction < swa-start-fraction")
     if not 0.0 < args.swa_lr_ratio <= 1.0:
         parser.error("swa-lr-ratio must be in (0, 1]")
     if args.swa_update_every <= 0:
@@ -378,7 +388,10 @@ def model_configuration(args: argparse.Namespace,
     if args.architecture == "paper_gab_5m":
         # Constructor deliberately fixes every body hyperparameter to the
         # released Maia-3 5M recipe. No accidental width/depth deviations.
-        return {"in_channels": INPUT_PLANES_LEGACY}
+        return {
+            "in_channels": INPUT_PLANES_LEGACY,
+            "moves_left_loss": args.moves_left_loss,
+        }
     return {
         "in_channels": INPUT_PLANES_LEGACY,
         "embed_dim": args.embed_dim,
@@ -387,6 +400,7 @@ def model_configuration(args: argparse.Namespace,
         "hidden_dim": args.hidden_dim,
         "policy_dim": args.policy_dim,
         "dropout": args.dropout,
+        "moves_left_loss": args.moves_left_loss,
     }
 
 
@@ -410,12 +424,15 @@ def adamw_parameter_groups(model: torch.nn.Module, weight_decay: float):
 
 
 def make_lr_scheduler(optimizer: torch.optim.Optimizer, total_steps: int,
-                      warmup_fraction: float, swa_start_fraction: float,
-                      swa_lr_ratio: float):
+                      lr_schedule: str, warmup_fraction: float,
+                      swa_start_fraction: float, swa_lr_ratio: float):
     warmup_steps = round(total_steps * warmup_fraction)
-    swa_start_step = max(warmup_steps + 1, round(total_steps * swa_start_fraction))
+    minimum_swa_step = warmup_steps + 1 if lr_schedule == "cosine" else 1
+    swa_start_step = max(minimum_swa_step, round(total_steps * swa_start_fraction))
 
     def multiplier(step: int) -> float:
+        if lr_schedule == "constant":
+            return 1.0
         if warmup_steps > 0 and step < warmup_steps:
             return max(1e-8, (step + 1) / warmup_steps)
         if step < swa_start_step:
@@ -459,9 +476,14 @@ def batch_losses(model: torch.nn.Module, batch, device: torch.device,
             policy_logits, moves, masks, args.label_smoothing, static_valid
         )
         wdl = soft_wdl_cross_entropy(wdl_logits, wdls)
-        moves_left = negative_binomial_nll_loss(
-            remaining, aux["moves_left_mu"], aux["moves_left_alpha"]
-        )
+        if args.moves_left_loss == "negbinom":
+            moves_left = negative_binomial_nll_loss(
+                remaining, aux["moves_left_mu"], aux["moves_left_alpha"]
+            )
+        else:
+            moves_left = F.smooth_l1_loss(
+                aux["moves_left_scaled"].float().squeeze(1), remaining / 20.0
+            )
         total = (
             args.policy_weight * policy
             + args.wdl_weight * wdl
@@ -480,10 +502,15 @@ def batch_losses(model: torch.nn.Module, batch, device: torch.device,
         target_score = wdl_targets[:, 0] - wdl_targets[:, 2]
         value_error = predicted_score - target_score
 
-        mu = aux["moves_left_mu"].detach().squeeze(1).float()
-        alpha = aux["moves_left_alpha"].detach().squeeze(1).float()
-        moves_left_error = mu - remaining
-        predicted_variance = mu + alpha * mu.square()
+        if args.moves_left_loss == "negbinom":
+            prediction = aux["moves_left_mu"].detach().squeeze(1).float()
+            alpha = aux["moves_left_alpha"].detach().squeeze(1).float()
+            predicted_variance = prediction + alpha * prediction.square()
+        else:
+            prediction = aux["moves_left_scaled"].detach().squeeze(1).float() * 20.0
+            alpha = torch.zeros_like(prediction)
+            predicted_variance = torch.zeros_like(prediction)
+        moves_left_error = prediction - remaining
 
     metrics = {
         "loss": total,
@@ -502,7 +529,7 @@ def batch_losses(model: torch.nn.Module, batch, device: torch.device,
         "moves_left_target_sum": remaining.sum(),
         "moves_left_predicted_variance_sum": predicted_variance.sum(),
         "batch_size": boards.size(0),
-        "mu_sum": mu.sum(),
+        "mu_sum": prediction.sum(),
         "alpha_sum": alpha.sum(),
     }
     return metrics
@@ -664,6 +691,13 @@ def main() -> None:
                 f"resume architecture mismatch: checkpoint={saved_arch!r}, "
                 f"requested={args.architecture!r}"
             )
+        saved_moves_left_loss = model_config.get("moves_left_loss", "negbinom")
+        if saved_moves_left_loss != args.moves_left_loss:
+            raise RuntimeError(
+                "resume moves-left-loss mismatch: "
+                f"checkpoint={saved_moves_left_loss!r}, requested={args.moves_left_loss!r}. "
+                "A different auxiliary head requires a fresh run."
+            )
     model = build_model(args, model_config)
     parameter_count = model.parameter_count()
     print(f"Model parameters: {parameter_count:,} ({parameter_count / 1e6:.3f}M)")
@@ -678,7 +712,7 @@ def main() -> None:
     updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     total_steps = updates_per_epoch * args.epochs
     scheduler, swa_start_step = make_lr_scheduler(
-        optimizer, total_steps, args.warmup_fraction,
+        optimizer, total_steps, args.lr_schedule, args.warmup_fraction,
         args.swa_start_fraction, args.swa_lr_ratio,
     )
     # The default buffer behaviour copies (rather than averages) integer/bool
@@ -721,8 +755,14 @@ def main() -> None:
             config={**vars(args), **model_config, "parameters": parameter_count},
         )
 
+    schedule_description = (
+        f"constant lr={args.learning_rate:g}"
+        if args.lr_schedule == "constant"
+        else f"cosine peak_lr={args.learning_rate:g}, final_lr="
+             f"{args.learning_rate * args.swa_lr_ratio:g}"
+    )
     print(
-        f"AdamW peak_lr={args.learning_rate:g}, decay={args.weight_decay:g}; "
+        f"AdamW {schedule_description}, decay={args.weight_decay:g}; "
         f"{total_steps:,} optimizer updates; SWA begins at update "
         f"{swa_start_step:,} ({args.swa_start_fraction:.0%})"
     )
@@ -783,7 +823,7 @@ def main() -> None:
                     "train/policy_ce": batch_summary["policy_loss"],
                     "train/value_mse": batch_summary["value_expected_mse"],
                     "train/accuracy": 100.0 * batch_summary["policy_accuracy"],
-                    "train/moves_left_nll": batch_summary["moves_left_loss"],
+                    f"train/moves_left_{args.moves_left_loss}": batch_summary["moves_left_loss"],
                     "train/grad_norm": float(grad_norm),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/samples_per_second": interval_examples / interval_elapsed,
