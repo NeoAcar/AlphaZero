@@ -36,7 +36,15 @@ if torch.cuda.is_available():
 
 from . import utils as f
 from .mcts import MCTS, _amp_ctx
-from .nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
+from .nn import (
+    ChessFormerWDL,
+    Chessformer5MFiLMWDL,
+    ResNet,
+    SEResNet,
+    SEResNetWDL,
+    detect_in_channels,
+    value_to_scalar,
+)
 
 
 def _channels_last_model(model, device):
@@ -64,9 +72,11 @@ def _load_model(cfg: dict, device):
 
 
 _ARCH_CLASSES = {
-    "resnet":      ResNet,
-    "seresnet":    SEResNet,
-    "seresnetwdl": SEResNetWDL,
+    "resnet":         ResNet,
+    "seresnet":       SEResNet,
+    "seresnetwdl":    SEResNetWDL,
+    "chessformerwdl": ChessFormerWDL,
+    "chessformer5mfilmwdl": Chessformer5MFiLMWDL,
 }
 
 
@@ -77,10 +87,12 @@ def build_model(cfg: dict):
     name = cfg.get("architecture", "resnet").lower()
     if name not in _ARCH_CLASSES:
         raise ValueError(
-            f"unknown architecture: {name!r}; expected 'resnet', 'seresnet', or 'seresnetwdl'"
+            f"unknown architecture: {name!r}; expected one of "
+            f"{sorted(_ARCH_CLASSES)}"
         )
     in_ch = 19   # legacy default; overridden if a checkpoint is given
     ckpt_path = cfg.get("checkpoint")
+    state = None
     if ckpt_path:
         try:
             state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -88,6 +100,10 @@ def build_model(cfg: dict):
         except Exception:
             pass
     cfg["_in_channels"] = in_ch                  # stash so MctsPlayer can read
+    if name in {"chessformerwdl", "chessformer5mfilmwdl"} and state is not None:
+        model_config = state.get("model_config")
+        if model_config is not None:
+            return _ARCH_CLASSES[name](**model_config)
     return _ARCH_CLASSES[name](in_channels=in_ch)
 
 

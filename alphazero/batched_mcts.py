@@ -71,7 +71,11 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
     if inputs.device.type == "cuda" and args.get("channels_last", True):
         inputs = inputs.contiguous(memory_format=torch.channels_last)
     with torch.inference_mode(), _amp_ctx(inputs.device):
-        value_t, policy_t = model(inputs)
+        if args.get("moves_left_aux", False):
+            value_t, policy_t, aux_t = model(inputs, return_aux=True)
+        else:
+            value_t, policy_t = model(inputs)
+            aux_t = None
 
     masks_np = np.stack([
         (leaf.legal_mask_np if leaf.legal_mask_np is not None
@@ -90,16 +94,36 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
 
     # WDL probs ride along in the same single GPU→CPU sync. .float() guards
     # fp16 autocast outputs from leaking into numpy storage.
+    aux_parts = []
+    if aux_t is not None:
+        aux_parts = [
+            aux_t["moves_left_mu"].reshape(-1, 1).float(),
+            aux_t["moves_left_alpha"].reshape(-1, 1).float(),
+        ]
     if wdl_t is not None:
-        combined = torch.cat([values_t, wdl_t.float(), policies_t], dim=1).cpu().numpy()
+        combined = torch.cat(
+            [values_t, wdl_t.float(), *aux_parts, policies_t], dim=1
+        ).cpu().numpy()
         values = combined[:, 0]
         wdl_probs = combined[:, 1:4]
-        policies = combined[:, 4:]
+        if aux_t is not None:
+            moves_left_mu = combined[:, 4]
+            moves_left_alpha = combined[:, 5]
+            policies = combined[:, 6:]
+        else:
+            moves_left_mu = moves_left_alpha = None
+            policies = combined[:, 4:]
     else:
-        combined = torch.cat([values_t, policies_t], dim=1).cpu().numpy()
+        combined = torch.cat([values_t, *aux_parts, policies_t], dim=1).cpu().numpy()
         values = combined[:, 0]
         wdl_probs = None
-        policies = combined[:, 1:]
+        if aux_t is not None:
+            moves_left_mu = combined[:, 1]
+            moves_left_alpha = combined[:, 2]
+            policies = combined[:, 3:]
+        else:
+            moves_left_mu = moves_left_alpha = None
+            policies = combined[:, 1:]
 
     leaf_value: dict[int, float] = {}
     for i, leaf in enumerate(leaves):
@@ -114,6 +138,9 @@ def evaluate_leaves(model, leaves: list[Node], args: dict) -> dict[int, float]:
                 leaf.raw_nn_wdl = (
                     float(wdl_probs[i, 0]), float(wdl_probs[i, 1]), float(wdl_probs[i, 2])
                 )
+            if moves_left_mu is not None:
+                leaf.raw_nn_moves_left = float(moves_left_mu[i])
+                leaf.raw_nn_moves_left_alpha = float(moves_left_alpha[i])
         leaf_value[id(leaf)] = val
     return leaf_value
 

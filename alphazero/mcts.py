@@ -77,6 +77,11 @@ class Node:
         # Lets the dashboard compute variance for the win-prob band without
         # a second forward pass.
         self.raw_nn_wdl: tuple[float, float, float] | None = None
+        # Optional auxiliary prediction from ChessFormerWDL. The training
+        # target is raw remaining plies; this is telemetry only and is never
+        # consulted by selection, backup, early-stop, or time management.
+        self.raw_nn_moves_left: float | None = None
+        self.raw_nn_moves_left_alpha: float | None = None
         # Cached legal-move mask (bool (4672,)) computed once in expand_lazy.
         # The board state is immutable, so the mask never needs invalidation;
         # lets batched dedup / repeat visits reuse it without recomputing.
@@ -199,7 +204,11 @@ class Node:
         if inputs.device.type == "cuda" and self.args.get("channels_last", True):
             inputs = inputs.contiguous(memory_format=torch.channels_last)
         with _amp_ctx(inputs.device):
-            value_t, policy_t = model(inputs)
+            if self.args.get("moves_left_aux", False):
+                value_t, policy_t, aux_t = model(inputs, return_aux=True)
+            else:
+                value_t, policy_t = model(inputs)
+                aux_t = None
 
         legal_mask_np = f.legal_mask(self.state)
         self.n_legal = int(legal_mask_np.sum())
@@ -217,17 +226,35 @@ class Node:
         # Single GPU→CPU sync: concat value scalar (+ optional WDL probs) with
         # the policy probs and pull across the PCIe boundary once. .float()
         # guards against fp16 autocast outputs leaking into numpy storage.
+        aux_parts = []
+        if aux_t is not None:
+            aux_parts = [
+                aux_t["moves_left_mu"].flatten().float(),
+                aux_t["moves_left_alpha"].flatten().float(),
+            ]
         if wdl is not None:
-            combined = torch.cat([value_scalar, wdl.flatten().float(), policy_probs]).cpu().numpy()
+            combined = torch.cat(
+                [value_scalar, wdl.flatten().float(), *aux_parts, policy_probs]
+            ).cpu().numpy()
             value = float(combined[0])
             self.raw_nn_wdl = (
                 float(combined[1]), float(combined[2]), float(combined[3])
             )
-            self.raw_policy = combined[4:]
+            policy_offset = 4
+            if aux_t is not None:
+                self.raw_nn_moves_left = float(combined[4])
+                self.raw_nn_moves_left_alpha = float(combined[5])
+                policy_offset = 6
+            self.raw_policy = combined[policy_offset:]
         else:
-            combined = torch.cat([value_scalar, policy_probs]).cpu().numpy()
+            combined = torch.cat([value_scalar, *aux_parts, policy_probs]).cpu().numpy()
             value = float(combined[0])
-            self.raw_policy = combined[1:]
+            policy_offset = 1
+            if aux_t is not None:
+                self.raw_nn_moves_left = float(combined[1])
+                self.raw_nn_moves_left_alpha = float(combined[2])
+                policy_offset = 3
+            self.raw_policy = combined[policy_offset:]
         self.policy = self.raw_policy.copy()
         self.raw_nn_value = value
         return value

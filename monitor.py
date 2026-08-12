@@ -50,6 +50,8 @@ _state = {
     "win_prob_series": [],      # list of [ply, win_prob_bot_pov]  (MCTS Q)
     "nn_win_prob_series": [],   # list of [ply, win_prob_bot_pov]  (raw NN)
     "nn_std_series": [],        # list of [ply, std_dev_of_nn_win_prob]  (WDL only)
+    "moves_left_plies": None,   # ChessFormer auxiliary; display only
+    "moves_left_alpha": None,
     "last_tick": None,
     "last_ponder_tick": None,   # latest ponder_tick (status=running); cleared on bot move / new game
     "clock": None,
@@ -106,6 +108,8 @@ def event_in():
                 _state["win_prob_series"] = []
                 _state["nn_win_prob_series"] = []
                 _state["nn_std_series"] = []
+                _state["moves_left_plies"] = None
+                _state["moves_left_alpha"] = None
                 _state["last_tick"] = None
                 _state["last_ponder_tick"] = None
             _state["board_svg"] = _render_board_svg(
@@ -132,11 +136,17 @@ def event_in():
             nn_std = payload.get("nn_std")
             if nn_std is not None and ply is not None:
                 _state["nn_std_series"].append([ply, nn_std])
+            if payload.get("moves_left_plies") is not None:
+                _state["moves_left_plies"] = payload["moves_left_plies"]
+                _state["moves_left_alpha"] = payload.get("moves_left_alpha")
             # Bot just moved -- any prior ponder state is stale.
             if payload.get("mover") == "bot":
                 _state["last_ponder_tick"] = None
         elif kind == "tick":
             _state["last_tick"] = payload
+            if payload.get("moves_left_plies") is not None:
+                _state["moves_left_plies"] = payload["moves_left_plies"]
+                _state["moves_left_alpha"] = payload.get("moves_left_alpha")
         elif kind == "ponder_tick":
             # Keep the latest running tick. Ignore 'stopped' events: we want
             # the final count to remain visible across opp's think time and
@@ -277,8 +287,13 @@ DASHBOARD_HTML = r"""<!doctype html>
   /* Big eval header */
   .eval-head { display: flex; align-items: baseline; justify-content: space-between;
                margin-bottom: 12px; }
+  .eval-side { display: flex; align-items: center; gap: 9px; }
   .eval-head .cp { font: 600 30px/1 ui-monospace, monospace; }
   .eval-head .wp { font: 600 18px/1 ui-monospace, monospace; color: var(--muted); }
+  .mlh-badge { padding: 2px 7px; border-radius: 999px;
+               border: 1px solid var(--line); background: var(--panel-2);
+               color: #b8bdc8; font: 600 11px/1.4 ui-monospace, monospace;
+               white-space: nowrap; }
   .eval-pos { color: var(--pos); } .eval-neg { color: var(--neg); }
   .cp.mate { color: var(--gold); }   /* proven forced mate (M7) */
   /* Stat tiles */
@@ -344,7 +359,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="card">
       <div class="eval-head">
         <span id="evalText" class="cp">+0.00</span>
-        <span id="winProb" class="wp">50.0%</span>
+        <span class="eval-side">
+          <span id="movesLeft" class="mlh-badge" hidden></span>
+          <span id="winProb" class="wp">50.0%</span>
+        </span>
       </div>
       <div class="tiles">
         <div class="tile"><div class="k">Depth</div><div class="v" id="depth">0</div></div>
@@ -517,6 +535,23 @@ function setEval(cp, winProb, mate) {
   }
 }
 
+function setMovesLeft(plies, alpha) {
+  const el = $('movesLeft');
+  if (plies == null || !Number.isFinite(Number(plies))) {
+    el.hidden = true;
+    el.textContent = '';
+    el.title = '';
+    return;
+  }
+  const moves = Math.max(0, Number(plies)) / 2;
+  el.textContent = `≈${moves.toFixed(1)} hamle`;
+  el.hidden = false;
+  el.title = 'Modelin tahmini kalan tam hamle sayısı (moves-left μ)';
+  if (alpha != null && Number.isFinite(Number(alpha))) {
+    el.title += ` · dağılım α=${Number(alpha).toFixed(3)}`;
+  }
+}
+
 // Map Q in [-1,1] to a red -> yellow -> green hue for the candidate bars.
 function qColor(q) {
   const h = clamp01((q + 1) / 2) * 130;   // 0 = red, 130 = green
@@ -608,6 +643,9 @@ function renderPV(pv) {
 
 function applyTick(t) {
   setEval(t.cp, t.win_prob, t.mate);
+  if (t.moves_left_plies !== undefined) {
+    setMovesLeft(t.moves_left_plies, t.moves_left_alpha);
+  }
   if (t.depth !== undefined) $('depth').textContent = t.depth;
   if (t.sims !== undefined) $('sims').textContent = t.sims.toLocaleString();
   if (t.nps !== undefined) $('nps').textContent = t.nps.toLocaleString();
@@ -644,6 +682,9 @@ function applyMove(m) {
       y: [[lo], [hi], [m.nn_win_prob]],
     }, [1, 2, 3]);
   }
+  if (m.moves_left_plies !== undefined) {
+    setMovesLeft(m.moves_left_plies, m.moves_left_alpha);
+  }
   if (m.mover === 'bot') {
     goStartMs = null;
     $('goTime').textContent = '—';
@@ -670,6 +711,7 @@ function applyState(s) {
     $('ponderSims').textContent = '—';
     $('ponderNps').textContent = '—';
     $('lastMoveTime').textContent = '—';
+    setMovesLeft(null);
     renderCandidates([]);
     renderPV([]);
     lastTop = []; lastOpp = false; drawArrows([]);
@@ -690,6 +732,7 @@ function applySnapshot(s) {
   if (s.ply !== undefined) $('ply').textContent = 'ply ' + s.ply;
   if (s.bot_color) $('botColor').textContent = s.bot_color;
   if (s.clock) applyClock(s.clock);
+  setMovesLeft(s.moves_left_plies, s.moves_left_alpha);
   const hasMcts = s.win_prob_series && s.win_prob_series.length > 0;
   const hasNn = s.nn_win_prob_series && s.nn_win_prob_series.length > 0;
   if (hasMcts || hasNn) {

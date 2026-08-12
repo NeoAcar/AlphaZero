@@ -1,4 +1,4 @@
-"""Train ChessFormerWDL from scratch on the 19-plane Stockfish shards.
+"""Train a 19-plane ChessFormer from scratch on the Stockfish shards.
 
 This is deliberately independent from train.py. It trains only on supervised
 ``gen_sf_data.py`` shards and never constructs 119-plane history inputs.
@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -41,9 +42,9 @@ except ImportError:
 
 from alphazero.nn import (
     INPUT_PLANES_LEGACY,
+    Chessformer5MFiLMWDL,
     ChessFormerWDL,
     negative_binomial_nll_loss,
-    remaining_plies_moments,
 )
 
 
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", default="./checkpoints/chessformer_19")
     parser.add_argument("--resume", default=None,
                         help="resume a full checkpoint produced by this script")
+    parser.add_argument(
+        "--architecture", choices=("hybrid", "paper_gab_5m"), default="hybrid",
+        help="hybrid = existing 22M local-CNN ChessFormer; paper_gab_5m = "
+             "paper 5M GAB Chessformer with our FiLM/moves-left additions",
+    )
 
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -369,6 +375,10 @@ def model_configuration(args: argparse.Namespace,
         if int(config.get("in_channels", -1)) != INPUT_PLANES_LEGACY:
             raise RuntimeError("resume checkpoint is not a 19-plane ChessFormer")
         return config
+    if args.architecture == "paper_gab_5m":
+        # Constructor deliberately fixes every body hyperparameter to the
+        # released Maia-3 5M recipe. No accidental width/depth deviations.
+        return {"in_channels": INPUT_PLANES_LEGACY}
     return {
         "in_channels": INPUT_PLANES_LEGACY,
         "embed_dim": args.embed_dim,
@@ -378,6 +388,12 @@ def model_configuration(args: argparse.Namespace,
         "policy_dim": args.policy_dim,
         "dropout": args.dropout,
     }
+
+
+def build_model(args: argparse.Namespace, model_config: dict[str, Any]) -> nn.Module:
+    if args.architecture == "paper_gab_5m":
+        return Chessformer5MFiLMWDL(**model_config)
+    return ChessFormerWDL(**model_config)
 
 
 def adamw_parameter_groups(model: torch.nn.Module, weight_decay: float):
@@ -592,13 +608,12 @@ def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
-def checkpoint_payload(model: ChessFormerWDL, optimizer, scheduler, scaler,
+def checkpoint_payload(model: nn.Module, optimizer, scheduler, scaler,
                        swa_model: AveragedModel, epoch: int, global_step: int,
                        best_val: float, args: argparse.Namespace,
-                       model_config: dict[str, Any], data_stats: dict[str, Any],
-                       moves_left_init: dict[str, float] | None) -> dict[str, Any]:
+                       model_config: dict[str, Any], data_stats: dict[str, Any]) -> dict[str, Any]:
     return {
-        "model_type": "ChessFormerWDL",
+        "model_type": type(model).__name__,
         "input_planes": INPUT_PLANES_LEGACY,
         "model_config": model_config,
         "model_state_dict": model.state_dict(),
@@ -611,7 +626,6 @@ def checkpoint_payload(model: ChessFormerWDL, optimizer, scheduler, scaler,
         "best_val_loss": best_val,
         "args": vars(args),
         "data_stats": data_stats,
-        "moves_left_initialization": moves_left_init,
     }
 
 
@@ -643,19 +657,16 @@ def main() -> None:
     val_loader = make_loader(val_dataset, args, shuffle=False)
 
     model_config = model_configuration(args, resume_checkpoint)
-    model = ChessFormerWDL(**model_config)
+    if resume_checkpoint is not None:
+        saved_arch = resume_checkpoint.get("args", {}).get("architecture", "hybrid")
+        if saved_arch != args.architecture:
+            raise RuntimeError(
+                f"resume architecture mismatch: checkpoint={saved_arch!r}, "
+                f"requested={args.architecture!r}"
+            )
+    model = build_model(args, model_config)
     parameter_count = model.parameter_count()
     print(f"Model parameters: {parameter_count:,} ({parameter_count / 1e6:.3f}M)")
-
-    moves_left_init = None
-    if resume_checkpoint is None:
-        mean, variance = remaining_plies_moments(train_dataset.game_lengths)
-        moves_left_init = model.movesLeftHead.initialize_from_moments(mean, variance)
-        print(
-            "Moves-left prior from TRAIN games only: "
-            f"mean={mean:.4f}, variance={variance:.4f}, "
-            f"mu={moves_left_init['mu']:.4f}, alpha={moves_left_init['alpha']:.6f}"
-        )
 
     model.to(device)
     static_valid = model.policyHead.static_valid.to(device)
@@ -688,7 +699,6 @@ def main() -> None:
         start_epoch = int(resume_checkpoint.get("epoch", -1)) + 1
         global_step = int(resume_checkpoint.get("global_step", 0))
         best_val = float(resume_checkpoint.get("best_val_loss", math.inf))
-        moves_left_init = resume_checkpoint.get("moves_left_initialization")
         print(f"Resumed epoch={start_epoch}, optimizer_step={global_step:,}")
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -699,7 +709,6 @@ def main() -> None:
             "model_config": model_config,
             "parameters": parameter_count,
             "data_stats": data_stats,
-            "moves_left_initialization": moves_left_init,
         }, handle, indent=2)
 
     wandb_run = None
@@ -825,7 +834,7 @@ def main() -> None:
         payload = checkpoint_payload(
             model, optimizer, scheduler, scaler, swa_model,
             epoch, global_step, best_val, args, model_config,
-            data_stats, moves_left_init,
+            data_stats,
         )
         atomic_torch_save(payload, checkpoint_dir / "model_last.pth")
         if improved:
@@ -859,7 +868,7 @@ def main() -> None:
         autocast_enabled, autocast_dtype,
     )
     swa_payload = {
-        "model_type": "ChessFormerWDL",
+        "model_type": type(model).__name__,
         "input_planes": INPUT_PLANES_LEGACY,
         "model_config": model_config,
         "model_state_dict": swa_model.module.state_dict(),
@@ -867,7 +876,6 @@ def main() -> None:
         "validation": swa_val,
         "args": vars(args),
         "data_stats": data_stats,
-        "moves_left_initialization": moves_left_init,
     }
     atomic_torch_save(swa_payload, checkpoint_dir / "model_swa.pth")
     print(

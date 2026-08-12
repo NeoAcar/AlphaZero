@@ -1,0 +1,9 @@
+{
+    "type": "value_only",
+    "architecture": "chessformerwdl",
+    "checkpoint": "models/chessformer0_swa.pth",
+    "value_scalar": "expected",
+    "temperature": 1.0,
+    "temperature_moves": 10,
+    "sampling_seed": 2026
+}

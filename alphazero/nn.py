@@ -20,6 +20,12 @@ def detect_in_channels(state_dict) -> int:
     can load 19- or 119-plane checkpoints without knowing in advance."""
     if "model_state_dict" in state_dict:
         state_dict = state_dict["model_state_dict"]
+    # The paper-faithful Chessformer-GAB uses a token projection over the 12
+    # piece planes and receives the seven rule planes separately through FiLM.
+    # Its checkpoint therefore has no convolutional ``startBlock`` stem.
+    gab_key = "token_projection.weight"
+    if gab_key in state_dict:
+        return int(state_dict[gab_key].shape[1]) + 7
     key = "startBlock.0.weight"  # shared name across ResNet/SEResNet/SEResNetWDL
     if key not in state_dict:
         raise KeyError(
@@ -525,14 +531,16 @@ class AttentionPolicyHead(nn.Module):
         # Underpromotion types share a from/to traversal, so predict the choice
         # of knight/bishop/rook from the source-square representation.
         promotion_mask = self.promotion_piece >= 0
-        if promotion_mask.any():
-            promotion_logits = self.promotion_projection(x)
-            promo_from = self.action_from[promotion_mask]
-            promo_piece = self.promotion_piece[promotion_mask]
-            logits[:, promotion_mask] = (
-                logits[:, promotion_mask]
-                + promotion_logits[:, promo_from, promo_piece]
-            )
+        promotion_logits = self.promotion_projection(x)
+        # Gather one promotion score for every action and zero the ordinary
+        # moves. This is equivalent to assigning only the underpromotion slice,
+        # but avoids index_put_: in-place advanced indexing cannot be captured
+        # safely by torch.compile's CUDA Graph path during inference.
+        promotion_piece = self.promotion_piece.clamp_min(0)
+        promotion_bonus = promotion_logits[
+            :, self.action_from, promotion_piece
+        ] * promotion_mask.to(dtype=logits.dtype).unsqueeze(0)
+        logits = logits + promotion_bonus
 
         # Keep this finite: soft-target CE evaluates target * log_probability,
         # and zero * -inf would otherwise produce NaNs for invalid actions.
@@ -555,41 +563,6 @@ class LearnedAttentionPool(nn.Module):
         return torch.einsum("bn,bnd->bd", weights, x)
 
 
-def remaining_plies_moments(positions_per_game) -> tuple[float, float]:
-    """Exact position-weighted mean/variance of moves-left targets.
-
-    Supervised shards store one position immediately before every played move
-    and do not store the terminal board. A game with ``L`` stored positions
-    therefore contributes the raw remaining-ply targets ``L, L-1, ..., 1``.
-
-    Only the small ``positions_per_game`` vector is needed; no board tensor is
-    scanned and no per-position target vector is materialised.
-    """
-
-    lengths = torch.as_tensor(positions_per_game, dtype=torch.float64).flatten()
-    if lengths.numel() == 0:
-        raise ValueError("positions_per_game is empty")
-    if torch.any(lengths <= 0):
-        raise ValueError("every game must contain at least one stored position")
-
-    n_positions = lengths.sum()
-    target_sum = (lengths * (lengths + 1.0) / 2.0).sum()
-    target_sq_sum = (
-        lengths * (lengths + 1.0) * (2.0 * lengths + 1.0) / 6.0
-    ).sum()
-    mean = target_sum / n_positions
-    variance = (target_sq_sum / n_positions - mean.square()).clamp_min(0.0)
-    return float(mean), float(variance)
-
-
-def _inverse_softplus_scalar(value: float) -> float:
-    """Numerically stable inverse of softplus for a positive scalar."""
-
-    if value <= 0:
-        raise ValueError(f"inverse softplus expects a positive value, got {value}")
-    return value + math.log(-math.expm1(-value))
-
-
 class NegativeBinomialMovesLeftHead(nn.Module):
     """Predict a negative-binomial distribution over remaining plies.
 
@@ -604,8 +577,7 @@ class NegativeBinomialMovesLeftHead(nn.Module):
     """
 
     def __init__(self, embed_dim: int, hidden_dim: int | None = None,
-                 min_mu: float = 1e-3, min_alpha: float = 1e-3,
-                 initial_mu: float = 40.0, initial_alpha: float = 0.25):
+                 min_mu: float = 1e-3, min_alpha: float = 1e-3):
         super().__init__()
         hidden_dim = hidden_dim or embed_dim // 2
         self.min_mu = min_mu
@@ -618,68 +590,11 @@ class NegativeBinomialMovesLeftHead(nn.Module):
         self.mu_head = nn.Linear(hidden_dim, 1)
         self.alpha_head = nn.Linear(hidden_dim, 1)
 
-        # A zero raw output would imply softplus(0) ~= 0.69 remaining plies,
-        # which is an unnecessarily poor starting point for ordinary games.
-        # These are priors only; both biases remain fully trainable.
-        nn.init.zeros_(self.mu_head.weight)
-        nn.init.zeros_(self.alpha_head.weight)
-        nn.init.constant_(
-            self.mu_head.bias,
-            _inverse_softplus_scalar(max(initial_mu - min_mu, 1e-6)),
-        )
-        nn.init.constant_(
-            self.alpha_head.bias,
-            _inverse_softplus_scalar(max(initial_alpha - min_alpha, 1e-6)),
-        )
-
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.shared(self.pool(tokens))
         mu = F.softplus(self.mu_head(features)) + self.min_mu
         alpha = F.softplus(self.alpha_head(features)) + self.min_alpha
         return mu, alpha
-
-    @torch.no_grad()
-    def initialize_from_moments(self, mean: float, variance: float) -> dict[str, float]:
-        """Moment-match the constant initial NB2 prediction to training data.
-
-        For ``Var[Y] = mu + alpha * mu**2``, method of moments gives
-        ``alpha = (variance - mean) / mean**2``. Negative binomial cannot model
-        under-dispersion, so alpha falls back to ``min_alpha`` when variance is
-        no larger than the mean. This method is intended for a fresh model, not
-        a resumed checkpoint, because it deliberately resets the two output
-        projections to constant predictions.
-        """
-
-        mean = float(mean)
-        variance = float(variance)
-        if not math.isfinite(mean) or mean <= 0:
-            raise ValueError(f"moves-left mean must be positive and finite, got {mean}")
-        if not math.isfinite(variance) or variance < 0:
-            raise ValueError(
-                f"moves-left variance must be non-negative and finite, got {variance}"
-            )
-
-        mu = max(mean, self.min_mu + 1e-6)
-        alpha_mom = (variance - mean) / (mean * mean)
-        alpha = max(alpha_mom, self.min_alpha + 1e-6)
-
-        self.mu_head.weight.zero_()
-        self.alpha_head.weight.zero_()
-        self.mu_head.bias.fill_(
-            _inverse_softplus_scalar(mu - self.min_mu)
-        )
-        self.alpha_head.bias.fill_(
-            _inverse_softplus_scalar(alpha - self.min_alpha)
-        )
-        return {"mean": mean, "variance": variance, "mu": mu, "alpha": alpha}
-
-    @torch.no_grad()
-    def initialize_from_game_lengths(self, positions_per_game) -> dict[str, float]:
-        """Convenience wrapper for exact moment initialisation from shard metadata."""
-
-        mean, variance = remaining_plies_moments(positions_per_game)
-        return self.initialize_from_moments(mean, variance)
-
 
 def negative_binomial_nll_loss(target: torch.Tensor, mu: torch.Tensor,
                                alpha: torch.Tensor,
@@ -831,3 +746,220 @@ class ChessFormerWDL(nn.Module):
         if exclude_input_projection:
             total -= sum(parameter.numel() for parameter in self.startBlock.parameters())
         return total
+
+
+# ---------------------------------------------------------------------------
+# Paper-faithful 5M Chessformer with our state FiLM + moves-left auxiliary.
+#
+# The body below tracks CSSLab's released Maia-3 5M implementation: eight
+# post-norm encoder blocks, RMSNorm, 8 heads of dimension 32, GELU 2x MLP,
+# no QKV biases, zero dropout, and the shared-template pooled GAB generator.
+# Deliberate, documented deviations are only (1) rule-plane FiLM in place of
+# Maia's two Elo embeddings and (2) our negative-binomial moves-left head.
+# ---------------------------------------------------------------------------
+
+
+class PaperGABSelfAttention(nn.Module):
+    """Maia-3 5M Geometric Attention Bias (GAB) attention layer.
+
+    The GAB generator is per block, while ``gab_weight`` is shared by every
+    block exactly as in the released Chessformer code. With ``per_square=0``
+    the paper's efficient 5M variant mean-pools the square tokens before
+    generating its dynamic 64x64 attention biases.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int,
+                 gab_weight: nn.Parameter, gab_gen_size: int = 64,
+                 gab_intermediate_dim: int = 64):
+        super().__init__()
+        if embed_dim % num_heads:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.gab_gen_size = gab_gen_size
+        # Paper 5M: PyTorch MHA with all Q/K/V/output biases disabled.
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=0.0,
+            batch_first=True,
+            bias=False,
+        )
+        self.sm2 = nn.Linear(embed_dim, gab_intermediate_dim)
+        self.ln1 = nn.LayerNorm(gab_intermediate_dim)
+        self.sm3 = nn.Linear(gab_intermediate_dim, num_heads * gab_gen_size)
+        self.ln2 = nn.LayerNorm(num_heads * gab_gen_size)
+        self.gab_weight = gab_weight
+
+    def _gab_bias(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] != 64:
+            raise ValueError(f"GAB expects exactly 64 square tokens, got {x.shape[1]}")
+        batch = x.shape[0]
+        # This is the paper's 5M pooled-GAB branch (gab_per_square_dim=0).
+        y = x.mean(dim=1)
+        y = F.gelu(self.sm2(y))
+        y = self.ln1(y)
+        y = F.gelu(self.sm3(y))
+        y = self.ln2(y).view(batch, self.num_heads, self.gab_gen_size)
+        bias = torch.einsum("bhi,oi->bho", y, self.gab_weight)
+        return bias.view(batch * self.num_heads, 64, 64)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self._gab_bias(x)
+        output, _ = self.attention(x, x, x, need_weights=False, attn_mask=bias)
+        return output
+
+
+class PaperChessformerFiLMBlock(nn.Module):
+    """Released 5M encoder block plus identity-initialised metadata FiLM."""
+
+    def __init__(self, embed_dim: int, num_heads: int,
+                 gab_weight: nn.Parameter, mlp_dim: int = 512):
+        super().__init__()
+        self.metadata_film = MetadataFiLM(embed_dim)
+        self.self_attn = PaperGABSelfAttention(
+            embed_dim, num_heads, gab_weight,
+            gab_gen_size=64, gab_intermediate_dim=64,
+        )
+        self.linear1 = nn.Linear(embed_dim, mlp_dim)
+        self.linear2 = nn.Linear(mlp_dim, embed_dim)
+        # Paper code selects RMSNorm for every released 5M/23M/79M model.
+        self.norm1 = nn.RMSNorm(embed_dim)
+        self.norm2 = nn.RMSNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor, metadata: torch.Tensor) -> torch.Tensor:
+        # FiLM is the sole body-level departure. It starts as identity, so the
+        # unconditioned initial model is exactly the paper block.
+        attended = self.self_attn(self.metadata_film(x, metadata))
+        x = self.norm1(x + attended)                 # paper: post-norm
+        feedforward = self.linear2(F.gelu(self.linear1(x)))
+        return self.norm2(x + feedforward)            # paper: post-norm
+
+
+class PaperChessformerPolicyHead(nn.Module):
+    """Paper source-destination policy, remapped to this repo's 4672 actions.
+
+    Chessformer natively emits 4096 from/to logits plus 256 promotion logits
+    (4352 UCI-style actions). Our stored targets and legal masks use the
+    AlphaZero 73x64 layout. Ordinary moves are therefore gathered from the
+    identical 64x64 source-destination matrix; the three underpromotion
+    channels receive the paper's destination-conditioned N/B/R logits. This
+    is only an output-index adaptation, not a different policy computation.
+    """
+
+    def __init__(self, embed_dim: int = 256, policy_dim: int = 256):
+        super().__init__()
+        self.from_projection = nn.Linear(embed_dim, policy_dim, bias=False)
+        self.to_projection = nn.Linear(embed_dim, policy_dim, bias=False)
+        # Paper order is Q, R, B, N. Q promotions use the base traversal in
+        # our 73-plane action encoding; N/B/R occupy its dedicated planes.
+        self.promotion_projection = nn.Linear(policy_dim, 4, bias=False)
+        self.scale = policy_dim ** -0.5
+
+        mapping = _build_attention_policy_action_map()
+        self.register_buffer("action_from", mapping[0])
+        self.register_buffer("action_to", mapping[1])
+        self.register_buffer("promotion_piece", mapping[3])
+        self.register_buffer("static_valid", mapping[4])
+        paper_promotion = torch.tensor([3, 2, 1], dtype=torch.long)  # N,B,R -> paper Q,R,B,N
+        underpromotion_index = torch.zeros(4672, dtype=torch.long)
+        underpromotion_mask = mapping[3] >= 0
+        underpromotion_index[underpromotion_mask] = paper_promotion[
+            mapping[3][underpromotion_mask]
+        ]
+        self.register_buffer("underpromotion_index", underpromotion_index)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        source = self.from_projection(x)
+        destination = self.to_projection(x)
+        pair_logits = torch.einsum("bid,bjd->bij", source, destination) * self.scale
+        logits = pair_logits[:, self.action_from, self.action_to]
+
+        underpromotion_mask = self.promotion_piece >= 0
+        # The reference code obtains promotion biases from destination features
+        # and rescales them by sqrt(head_dim) before adding to the base score.
+        promo = self.promotion_projection(destination) * math.sqrt(source.shape[-1])
+        promo_bonus = promo[:, self.action_to, self.underpromotion_index]
+        logits = logits + promo_bonus * underpromotion_mask.to(logits.dtype).unsqueeze(0)
+        return logits.masked_fill(~self.static_valid.unsqueeze(0), -1e4)
+
+
+class Chessformer5MFiLMWDL(nn.Module):
+    """Maia-3/Chessformer 5M body for our 19-plane supervised pipeline.
+
+    Input is fixed to the existing 19-plane representation. The first twelve
+    planes become the paper's square-token features; the final seven rule/game
+    planes are encoded once and supplied to each block through FiLM. The model
+    retains the paper WDL and source-destination policy heads, plus our
+    negative-binomial remaining-plies auxiliary head.
+    """
+
+    def __init__(self, in_channels: int = INPUT_PLANES_LEGACY,
+                 embed_dim: int = 256, n_blocks: int = 8,
+                 num_heads: int = 8, mlp_ratio: float = 2.0,
+                 policy_dim: int = 256):
+        super().__init__()
+        if in_channels != INPUT_PLANES_LEGACY:
+            raise ValueError(
+                "Chessformer5MFiLMWDL is the paper 5M current-board variant "
+                f"and requires {INPUT_PLANES_LEGACY} planes, got {in_channels}"
+            )
+        if embed_dim != 256 or n_blocks != 8 or num_heads != 8 or mlp_ratio != 2.0 \
+                or policy_dim != 256:
+            raise ValueError(
+                "this class intentionally fixes the published 5M body: "
+                "embed_dim=256, n_blocks=8, num_heads=8, mlp_ratio=2, policy_dim=256"
+            )
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.token_projection = nn.Linear(12, embed_dim)
+        self.metadata_projection = nn.Sequential(
+            nn.Linear(7, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        # Shared GAB template matrix: 64*64 square-pairs x 64 generated bases.
+        self.gab_shared_weight = nn.Parameter(torch.empty(64 * 64, 64))
+        nn.init.xavier_normal_(self.gab_shared_weight)
+        self.backBone = nn.ModuleList([
+            PaperChessformerFiLMBlock(
+                embed_dim, num_heads, self.gab_shared_weight,
+                mlp_dim=int(embed_dim * mlp_ratio),
+            )
+            for _ in range(n_blocks)
+        ])
+        self.final_norm = nn.LayerNorm(embed_dim)       # paper encoder final norm
+        self.value_norm = nn.LayerNorm(embed_dim)       # paper's last_ln after mean pool
+        self.value_hidden = nn.Linear(embed_dim, embed_dim)
+        self.value_out = nn.Linear(embed_dim, 3)
+        self.policyHead = PaperChessformerPolicyHead(embed_dim, policy_dim)
+        self.movesLeftHead = NegativeBinomialMovesLeftHead(embed_dim)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1:] != (self.in_channels, 8, 8):
+            raise ValueError(
+                f"expected (B,{self.in_channels},8,8), got {tuple(x.shape)}"
+            )
+        # 12 piece planes are square features (paper tokenization). The seven
+        # constant rule planes are global state used only by our FiLM addition.
+        square_features = x[:, :12].flatten(2).transpose(1, 2)
+        metadata = self.metadata_projection(x[:, 12:, 0, 0])
+        tokens = self.token_projection(square_features)
+        for block in self.backBone:
+            tokens = block(tokens, metadata)
+        return self.final_norm(tokens)
+
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
+        tokens = self.encode(x)
+        policy = self.policyHead(tokens)
+        pooled = self.value_norm(tokens.mean(dim=1))
+        value = self.value_out(F.relu(self.value_hidden(pooled)))
+        if not return_aux:
+            return value, policy
+        moves_left_mu, moves_left_alpha = self.movesLeftHead(tokens)
+        return value, policy, {
+            "moves_left_mu": moves_left_mu,
+            "moves_left_alpha": moves_left_alpha,
+        }
+
+    def parameter_count(self) -> int:
+        return sum(parameter.numel() for parameter in self.parameters())

@@ -43,13 +43,23 @@ import torch
 from alphazero import utils as f
 from alphazero.batched_mcts import BatchedMCTS as MCTS
 from alphazero.mcts import _amp_ctx
-from alphazero.nn import ResNet, SEResNet, SEResNetWDL, detect_in_channels, value_to_scalar
+from alphazero.nn import (
+    ChessFormerWDL,
+    Chessformer5MFiLMWDL,
+    ResNet,
+    SEResNet,
+    SEResNetWDL,
+    detect_in_channels,
+    value_to_scalar,
+)
 
 
 ARCHITECTURES = {
     "resnet": ResNet,
     "seresnet": SEResNet,
     "seresnetwdl": SEResNetWDL,
+    "chessformerwdl": ChessFormerWDL,
+    "chessformer5mfilmwdl": Chessformer5MFiLMWDL,
 }
 
 PLAYER_TYPES = {"mcts", "policy_only", "value_only"}
@@ -119,8 +129,8 @@ def post_event(payload: dict) -> None:
 class UciEngine:
     DEFAULT_OPTS = {
         "Type": "mcts",              # one of: mcts | policy_only | value_only
-        "Checkpoint": "models/model_best_combined_wdl.pth",
-        "Architecture": "seresnetwdl",
+        "Checkpoint": "models/chessformer0_swa.pth",
+        "Architecture": "chessformerwdl",
         "ValueScalar": "expected",   # WDL collapse mode: "expected" (P(W)-P(L)) or "win_only" (P(W))
         "Sims": 1200,
         "Temperature": 0.6,
@@ -264,7 +274,13 @@ class UciEngine:
         state = torch.load(ckpt, map_location=self.device, weights_only=False)
         in_ch = detect_in_channels(state)
         log(f"  input_planes = {in_ch}")
-        model = ARCHITECTURES[arch](in_channels=in_ch).to(self.device)
+        if arch in {"chessformerwdl", "chessformer5mfilmwdl"}:
+            model_config = state.get("model_config")
+            if not model_config:
+                raise ValueError("ChessFormer checkpoint is missing model_config")
+            model = ARCHITECTURES[arch](**model_config).to(self.device)
+        else:
+            model = ARCHITECTURES[arch](in_channels=in_ch).to(self.device)
         model.load_state_dict(state["model_state_dict"])
         if self.device.type == "cuda":
             model = model.to(memory_format=torch.channels_last)
@@ -285,7 +301,10 @@ class UciEngine:
             if self.device.type == "cuda":
                 real_one = real_one.contiguous(memory_format=torch.channels_last)
             with torch.inference_mode(), _amp_ctx(self.device):
-                _ = model(real_one)
+                if arch in {"chessformerwdl", "chessformer5mfilmwdl"}:
+                    _ = model(real_one, return_aux=True)
+                else:
+                    _ = model(real_one)
             log("torch.compile + warm-up done")
         except Exception as e:
             log(f"torch.compile skipped: {e}")
@@ -313,6 +332,11 @@ class UciEngine:
             # 19 (legacy) or 119 (8-frame history) -- decided when the
             # checkpoint was loaded. MCTS routes board_to_matrix accordingly.
             "input_planes": getattr(self, "loaded_in_channels", 19),
+            # Cache ChessFormer's moves-left auxiliary alongside value/policy.
+            # It is telemetry-only and never affects MCTS decisions.
+            "moves_left_aux": self.loaded_arch in {
+                "chessformerwdl", "chessformer5mfilmwdl"
+            },
             # Early-stop + sim-bank (play only; never set by self-play).
             "early_stop": str(self.options["EarlyStop"]).lower() == "true",
             "max_borrow": int(self.options["MaxBorrow"]),
@@ -803,6 +827,12 @@ class UciEngine:
             nn_std = self._pending_bot_eval.get("nn_std")
             if nn_std is not None:
                 evt["nn_std"] = nn_std
+            moves_left = self._pending_bot_eval.get("moves_left_plies")
+            if moves_left is not None:
+                evt["moves_left_plies"] = moves_left
+            moves_left_alpha = self._pending_bot_eval.get("moves_left_alpha")
+            if moves_left_alpha is not None:
+                evt["moves_left_alpha"] = moves_left_alpha
             mate = self._pending_bot_eval.get("mate")
             if mate is not None:
                 evt["mate"] = mate
@@ -869,6 +899,8 @@ class UciEngine:
             "q": q, "win_prob": win_prob, "cp": cp, "duration": duration,
             "nn_win_prob": nn_win_prob,
             "nn_std": nn_std,
+            "moves_left_plies": self.mcts.root.raw_nn_moves_left,
+            "moves_left_alpha": self.mcts.root.raw_nn_moves_left_alpha,
             "mate": self._mate_in(),          # signed mate-in-N, or None
         }
 
@@ -981,6 +1013,8 @@ class UciEngine:
             "elapsed_s": round(elapsed_s, 3),
             "pv": pv,
             "top": [{"uci": u, "N": n, "q": qv} for u, n, qv in top],
+            "moves_left_plies": mcts.root.raw_nn_moves_left,
+            "moves_left_alpha": mcts.root.raw_nn_moves_left_alpha,
             "mate": self._mate_in(),    # show 'M7' live if a mate is already proven
         })
 
