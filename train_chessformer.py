@@ -44,6 +44,7 @@ from alphazero.nn import (
     INPUT_PLANES_LEGACY,
     Chessformer5MFiLMWDL,
     ChessFormerWDL,
+    ConditionalSEResNetWDL,
     negative_binomial_nll_loss,
 )
 
@@ -64,9 +65,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", default=None,
                         help="resume a full checkpoint produced by this script")
     parser.add_argument(
-        "--architecture", choices=("hybrid", "paper_gab_5m"), default="hybrid",
+        "--architecture", choices=("hybrid", "paper_gab_5m", "conditional_se"), default="hybrid",
         help="hybrid = existing 22M local-CNN ChessFormer; paper_gab_5m = "
-             "paper 5M GAB Chessformer with our FiLM/moves-left additions",
+             "paper 5M GAB Chessformer with our FiLM/moves-left additions; "
+             "conditional_se = metadata-conditioned Leela-style CNN student",
     )
 
     parser.add_argument("--epochs", type=int, default=10)
@@ -113,6 +115,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=768)
     parser.add_argument("--policy-dim", type=int, default=192)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--se-channels", type=int, default=120,
+                        help="conditional_se only: convolution width")
+    parser.add_argument("--se-blocks", type=int, default=11,
+                        help="conditional_se only: residual block count")
+    parser.add_argument("--se-reduction", type=int, default=4,
+                        help="conditional_se only: Leela SE bottleneck ratio")
+    parser.add_argument("--metadata-dim", type=int, default=32,
+                        help="conditional_se only: shared rule-metadata embedding size")
 
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--wandb-project", default=None)
@@ -136,6 +146,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("swa-lr-ratio must be in (0, 1]")
     if args.swa_update_every <= 0:
         parser.error("swa-update-every must be positive")
+    if args.architecture == "conditional_se":
+        if args.se_channels <= 0 or args.se_blocks <= 0 or args.metadata_dim <= 0:
+            parser.error("conditional_se width, blocks and metadata-dim must be positive")
+        if args.se_reduction <= 0 or args.se_channels % args.se_reduction:
+            parser.error("se-channels must be divisible by se-reduction")
     return args
 
 
@@ -392,6 +407,15 @@ def model_configuration(args: argparse.Namespace,
             "in_channels": INPUT_PLANES_LEGACY,
             "moves_left_loss": args.moves_left_loss,
         }
+    if args.architecture == "conditional_se":
+        return {
+            "in_channels": INPUT_PLANES_LEGACY,
+            "channels": args.se_channels,
+            "n_blocks": args.se_blocks,
+            "se_reduction": args.se_reduction,
+            "metadata_dim": args.metadata_dim,
+            "moves_left_loss": args.moves_left_loss,
+        }
     return {
         "in_channels": INPUT_PLANES_LEGACY,
         "embed_dim": args.embed_dim,
@@ -407,6 +431,8 @@ def model_configuration(args: argparse.Namespace,
 def build_model(args: argparse.Namespace, model_config: dict[str, Any]) -> nn.Module:
     if args.architecture == "paper_gab_5m":
         return Chessformer5MFiLMWDL(**model_config)
+    if args.architecture == "conditional_se":
+        return ConditionalSEResNetWDL(**model_config)
     return ChessFormerWDL(**model_config)
 
 
@@ -703,7 +729,10 @@ def main() -> None:
     print(f"Model parameters: {parameter_count:,} ({parameter_count / 1e6:.3f}M)")
 
     model.to(device)
-    static_valid = model.policyHead.static_valid.to(device)
+    static_valid = getattr(model.policyHead, "static_valid", None)
+    if static_valid is None:
+        static_valid = model.static_valid
+    static_valid = static_valid.to(device)
     optimizer = torch.optim.AdamW(
         adamw_parameter_groups(model, args.weight_decay),
         lr=args.learning_rate,

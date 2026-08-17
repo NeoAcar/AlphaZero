@@ -39,6 +39,7 @@ from .mcts import MCTS, _amp_ctx
 from .nn import (
     ChessFormerWDL,
     Chessformer5MFiLMWDL,
+    ConditionalSEResNetWDL,
     ResNet,
     SEResNet,
     SEResNetWDL,
@@ -77,6 +78,7 @@ _ARCH_CLASSES = {
     "seresnetwdl":    SEResNetWDL,
     "chessformerwdl": ChessFormerWDL,
     "chessformer5mfilmwdl": Chessformer5MFiLMWDL,
+    "conditionalseresnetwdl": ConditionalSEResNetWDL,
 }
 
 
@@ -100,7 +102,8 @@ def build_model(cfg: dict):
         except Exception:
             pass
     cfg["_in_channels"] = in_ch                  # stash so MctsPlayer can read
-    if name in {"chessformerwdl", "chessformer5mfilmwdl"} and state is not None:
+    if name in {"chessformerwdl", "chessformer5mfilmwdl", "conditionalseresnetwdl"} \
+            and state is not None:
         model_config = state.get("model_config")
         if model_config is not None:
             return _ARCH_CLASSES[name](**model_config)

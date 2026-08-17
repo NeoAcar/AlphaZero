@@ -46,6 +46,7 @@ from alphazero.mcts import _amp_ctx
 from alphazero.nn import (
     ChessFormerWDL,
     Chessformer5MFiLMWDL,
+    ConditionalSEResNetWDL,
     ResNet,
     SEResNet,
     SEResNetWDL,
@@ -60,6 +61,7 @@ ARCHITECTURES = {
     "seresnetwdl": SEResNetWDL,
     "chessformerwdl": ChessFormerWDL,
     "chessformer5mfilmwdl": Chessformer5MFiLMWDL,
+    "conditionalseresnetwdl": ConditionalSEResNetWDL,
 }
 
 PLAYER_TYPES = {"mcts", "policy_only", "value_only"}
@@ -274,7 +276,7 @@ class UciEngine:
         state = torch.load(ckpt, map_location=self.device, weights_only=False)
         in_ch = detect_in_channels(state)
         log(f"  input_planes = {in_ch}")
-        if arch in {"chessformerwdl", "chessformer5mfilmwdl"}:
+        if arch in {"chessformerwdl", "chessformer5mfilmwdl", "conditionalseresnetwdl"}:
             model_config = state.get("model_config")
             if not model_config:
                 raise ValueError("ChessFormer checkpoint is missing model_config")
@@ -335,7 +337,7 @@ class UciEngine:
             # Cache ChessFormer's moves-left auxiliary alongside value/policy.
             # It is telemetry-only and never affects MCTS decisions.
             "moves_left_aux": self.loaded_arch in {
-                "chessformerwdl", "chessformer5mfilmwdl"
+                "chessformerwdl", "chessformer5mfilmwdl", "conditionalseresnetwdl"
             },
             # Early-stop + sim-bank (play only; never set by self-play).
             "early_stop": str(self.options["EarlyStop"]).lower() == "true",

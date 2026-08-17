@@ -26,6 +26,10 @@ def detect_in_channels(state_dict) -> int:
     gab_key = "token_projection.weight"
     if gab_key in state_dict:
         return int(state_dict[gab_key].shape[1]) + 7
+    # Conditional SEResNet consumes only the twelve spatial piece planes in
+    # its convolutional stem and reads the seven constant planes as a vector.
+    if "metadata_encoder.0.weight" in state_dict:
+        return INPUT_PLANES_LEGACY
     key = "startBlock.0.weight"  # shared name across ResNet/SEResNet/SEResNetWDL
     if key not in state_dict:
         raise KeyError(
@@ -257,6 +261,123 @@ class SEResNetWDL(nn.Module):
         policy = self.policyHead(x)
         value = self.valueHead(x)
         return value, policy
+
+
+class ConditionalLeelaSE(nn.Module):
+    """Leela-style gamma/beta SE conditioned on global rule metadata."""
+
+    def __init__(self, channels: int, metadata_dim: int, reduction: int = 4):
+        super().__init__()
+        if channels % reduction:
+            raise ValueError("channels must be divisible by se reduction")
+        hidden = channels // reduction
+        self.fc1 = nn.Linear(channels + metadata_dim, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, 2 * channels, bias=False)
+
+    def forward(self, x: torch.Tensor, metadata: torch.Tensor) -> torch.Tensor:
+        summary = x.mean(dim=(2, 3))
+        hidden = F.silu(self.fc1(torch.cat((summary, metadata), dim=1)))
+        gamma, beta = self.fc2(hidden).chunk(2, dim=1)
+        gamma = torch.sigmoid(gamma).unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        return gamma * x + beta
+
+
+class ConditionalSEResBlock(nn.Module):
+    """Residual CNN block with metadata-conditioned Leela gamma/beta SE."""
+
+    def __init__(self, channels: int, metadata_dim: int, se_reduction: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.se = ConditionalLeelaSE(channels, metadata_dim, se_reduction)
+
+    def forward(self, x: torch.Tensor, metadata: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = F.silu(self.bn1(self.conv1(x)))
+        x = self.se(self.bn2(self.conv2(x)), metadata)
+        return F.silu(x + residual)
+
+
+class ConditionalSEResNetWDL(nn.Module):
+    """CNN student that separates board geometry from global chess metadata.
+
+    The existing shards remain ``(B,19,8,8)``. Piece planes 0:12 feed the
+    spatial convolutional tower; the seven constant planes are read once at
+    ``[0, 0]`` and injected into every Leela-style gamma/beta SE unit.
+    """
+
+    def __init__(self, channels: int = 120, n_blocks: int = 11,
+                 se_reduction: int = 4, metadata_dim: int = 32,
+                 in_channels: int = INPUT_PLANES_LEGACY,
+                 moves_left_loss: str = "huber"):
+        super().__init__()
+        if in_channels != INPUT_PLANES_LEGACY:
+            raise ValueError("ConditionalSEResNetWDL requires the 19-plane input")
+        if channels <= 0 or n_blocks <= 0 or metadata_dim <= 0:
+            raise ValueError("channels, n_blocks and metadata_dim must be positive")
+        if channels % se_reduction:
+            raise ValueError("channels must be divisible by se_reduction")
+        self.in_channels = in_channels
+        self.channels = channels
+        self.moves_left_loss = moves_left_loss
+        self.startBlock = nn.Sequential(
+            nn.Conv2d(12, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(),
+        )
+        self.metadata_encoder = nn.Sequential(
+            nn.Linear(7, metadata_dim),
+            nn.SiLU(),
+        )
+        self.backBone = nn.ModuleList([
+            ConditionalSEResBlock(channels, metadata_dim, se_reduction)
+            for _ in range(n_blocks)
+        ])
+        self.policyHead = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, 73, kernel_size=1, bias=True),
+            nn.Flatten(),
+        )
+        self.valueHead = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.SiLU(),
+            nn.Flatten(),
+            nn.Linear(64, 256),
+            nn.SiLU(),
+            nn.Linear(256, 3),
+        )
+        self.movesLeftHead = make_moves_left_head(moves_left_loss, channels)
+        self.register_buffer("static_valid", _build_attention_policy_action_map()[4])
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1:] != (INPUT_PLANES_LEGACY, 8, 8):
+            raise ValueError(f"expected (B,19,8,8), got {tuple(x.shape)}")
+        metadata = self.metadata_encoder(x[:, 12:, 0, 0])
+        features = self.startBlock(x[:, :12])
+        for block in self.backBone:
+            features = block(features, metadata)
+        return features
+
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
+        features = self.encode(x)
+        policy = self.policyHead(features)
+        value = self.valueHead(features)
+        if not return_aux:
+            return value, policy
+        tokens = features.flatten(2).transpose(1, 2)
+        if self.moves_left_loss == "negbinom":
+            mu, alpha = self.movesLeftHead(tokens)
+            return value, policy, {"moves_left_mu": mu, "moves_left_alpha": alpha}
+        return value, policy, {"moves_left_scaled": self.movesLeftHead(tokens)}
+
+    def parameter_count(self) -> int:
+        return sum(parameter.numel() for parameter in self.parameters())
 
 
 # ---------------------------------------------------------------------------
@@ -835,12 +956,38 @@ class PaperGABSelfAttention(nn.Module):
         y = F.gelu(self.sm3(y))
         y = self.ln2(y).view(batch, self.num_heads, self.gab_gen_size)
         bias = torch.einsum("bhi,oi->bho", y, self.gab_weight)
-        return bias.view(batch * self.num_heads, 64, 64)
+        return bias.view(batch, self.num_heads, 64, 64)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """MHA-equivalent attention expressed through PyTorch SDPA.
+
+        Keeping the published ``nn.MultiheadAttention`` parameter layout
+        preserves existing checkpoints exactly. Splitting its packed QKV
+        projection ourselves avoids PyTorch 2.6 Inductor's broken
+        ``MultiheadAttention + per-head float mask`` compilation path and lets
+        SDPA select the best CUDA attention kernel directly.
+        """
+        batch, sequence, embed_dim = x.shape
+        head_dim = embed_dim // self.num_heads
+        qkv = F.linear(x, self.attention.in_proj_weight)
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        def split_heads(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.view(
+                batch, sequence, self.num_heads, head_dim
+            ).transpose(1, 2)
+
+        query = split_heads(query)
+        key = split_heads(key)
+        value = split_heads(value)
         bias = self._gab_bias(x)
-        output, _ = self.attention(x, x, x, need_weights=False, attn_mask=bias)
-        return output
+        attended = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=bias, dropout_p=0.0,
+        )
+        attended = attended.transpose(1, 2).contiguous().view(
+            batch, sequence, embed_dim
+        )
+        return F.linear(attended, self.attention.out_proj.weight)
 
 
 class PaperChessformerFiLMBlock(nn.Module):
@@ -887,7 +1034,15 @@ class PaperChessformerPolicyHead(nn.Module):
         # Paper order is Q, R, B, N. Q promotions use the base traversal in
         # our 73-plane action encoding; N/B/R occupy its dedicated planes.
         self.promotion_projection = nn.Linear(policy_dim, 4, bias=False)
-        self.scale = policy_dim ** -0.5
+        # Tensor scales avoid a PyTorch 2.6 Inductor matcher bug which mistakes
+        # linear-output * Python-float patterns for weight-only quantization.
+        # They are architectural constants, so they need not enter checkpoints.
+        self.register_buffer(
+            "scale", torch.tensor(policy_dim ** -0.5), persistent=False
+        )
+        self.register_buffer(
+            "promotion_scale", torch.tensor(policy_dim ** 0.5), persistent=False
+        )
 
         mapping = _build_attention_policy_action_map()
         self.register_buffer("action_from", mapping[0])
@@ -901,6 +1056,11 @@ class PaperChessformerPolicyHead(nn.Module):
             mapping[3][underpromotion_mask]
         ]
         self.register_buffer("underpromotion_index", underpromotion_index)
+        # Kept out of checkpoints: it is entirely determined by the fixed
+        # 4672-action map. A boolean buffer lets compiled inference apply the
+        # promotion additions without a per-forward dtype cast.
+        self.register_buffer("underpromotion_mask", underpromotion_mask,
+                             persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         source = self.from_projection(x)
@@ -908,12 +1068,15 @@ class PaperChessformerPolicyHead(nn.Module):
         pair_logits = torch.einsum("bid,bjd->bij", source, destination) * self.scale
         logits = pair_logits[:, self.action_from, self.action_to]
 
-        underpromotion_mask = self.promotion_piece >= 0
         # The reference code obtains promotion biases from destination features
         # and rescales them by sqrt(head_dim) before adding to the base score.
-        promo = self.promotion_projection(destination) * math.sqrt(source.shape[-1])
+        promo = self.promotion_projection(destination) * self.promotion_scale
         promo_bonus = promo[:, self.action_to, self.underpromotion_index]
-        logits = logits + promo_bonus * underpromotion_mask.to(logits.dtype).unsqueeze(0)
+        promo_bonus = torch.where(
+            self.underpromotion_mask.unsqueeze(0), promo_bonus,
+            torch.zeros_like(promo_bonus),
+        )
+        logits = logits + promo_bonus
         return logits.masked_fill(~self.static_valid.unsqueeze(0), -1e4)
 
 
